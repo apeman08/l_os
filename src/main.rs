@@ -28,6 +28,12 @@ pub extern "C" fn _start() -> ! {
     for i in 0..11 {
         println!("{}: Larp OS 0.0.2", i);
     }
+
+    l_os::init();
+
+    unsafe {
+        *(0xdeadbeef as *mut u8) = 42;
+    }
     
     #[cfg(test)]
     test_main();
