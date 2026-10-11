@@ -6,6 +6,8 @@
 
 use core::panic::PanicInfo;
 
+use l_os::gdt;
+
 mod vga_buffer;
 mod serial;
 
@@ -30,10 +32,13 @@ pub extern "C" fn _start() -> ! {
     }
 
     l_os::init();
+    gdt::init();
 
-    unsafe {
-        *(0xdeadbeef as *mut u8) = 42;
+    fn stack_overflow() {
+        stack_overflow();
     }
+
+    stack_overflow();
     
     #[cfg(test)]
     test_main();
