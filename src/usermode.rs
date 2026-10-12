@@ -1,20 +1,22 @@
-//! Ring 3 execution: one user process at a time, entered with `iretq`, left
-//! via `int 0x80` (exit), a fault, or a timer-enforced time budget.
+//! Ring 3 processes: building address spaces, loading programs, and the
+//! `run`/`run_all` entry points. Scheduling lives in `sched.rs`.
 //!
-//! Current limits (see docs/THREAT_MODEL.md): a single process, no scheduler,
-//! frames are never freed (each run leaks a few frames), programs are raw
-//! machine code copied into one page. Isolation rests on page tables
-//! (supervisor-only kernel pages), ring 3 privilege checks, and syscall
-//! argument validation; it has had only the tests in `tests/usermode.rs`.
+//! Current limits (see docs/THREAT_MODEL.md): programs are raw machine code
+//! copied into one page (no ELF loader), at most `sched::MAX_PROCS` processes,
+//! no blocking IPC. Isolation rests on separate page tables (kernel pages
+//! supervisor-only), ring 3 privilege checks, and syscall argument validation;
+//! it is exercised by `tests/usermode.rs` and `tests/processes.rs`.
 
 use crate::memory::{self, Memory};
+use crate::sched::{self, Process};
+use alloc::{boxed::Box, vec::Vec};
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use l_core::{caps::Caps, policy::NetPolicy, syscall::Outcome};
 use spin::Mutex;
 use x86_64::{
-    VirtAddr,
     structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB},
+    VirtAddr,
 };
 
 pub const USER_CODE_ADDR: u64 = 0x_7000_0000_0000;
@@ -26,45 +28,11 @@ const USER_STACK_PAGES: u64 = 2;
 pub static POLICY: Mutex<NetPolicy> = Mutex::new(NetPolicy::new());
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
-static IN_USER: AtomicBool = AtomicBool::new(false);
-static DEADLINE_TICK: AtomicU64 = AtomicU64::new(0);
-static CURRENT_CAPS: AtomicU32 = AtomicU32::new(0);
+static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 
 global_asm!(
     r#"
     .section .text
-    // u64 enter_user_mode(rip=rdi, rsp=rsi, cs=rdx, ss=rcx)
-    // Saves callee-saved registers and the kernel stack pointer, then drops to
-    // ring 3 with IF=1 and IOPL=0. Returns (via return_to_kernel) the Outcome.
-    .global enter_user_mode
-enter_user_mode:
-    push rbx
-    push rbp
-    push r12
-    push r13
-    push r14
-    push r15
-    mov qword ptr [rip + L_KERNEL_RSP], rsp
-    push rcx
-    push rsi
-    push 0x202
-    push rdx
-    push rdi
-    iretq
-
-    // never returns to its caller: unwinds to the caller of enter_user_mode.
-    .global return_to_kernel
-return_to_kernel:
-    mov rsp, qword ptr [rip + L_KERNEL_RSP]
-    mov rax, rdi
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbp
-    pop rbx
-    ret
-
     // int 0x80 entry. rax = number, rdi/rsi/rdx = args. Result in rax; every
     // other register is preserved.
     .global syscall_entry
@@ -94,150 +62,171 @@ syscall_entry:
     pop rdx
     pop rcx
     iretq
-
-    .section .bss
-    .align 8
-L_KERNEL_RSP:
-    .quad 0
 "#
 );
 
 unsafe extern "C" {
-    fn enter_user_mode(rip: u64, rsp: u64, cs: u64, ss: u64) -> u64;
-    fn return_to_kernel(raw_outcome: u64) -> !;
     pub fn syscall_entry();
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunError {
-    /// Another user process is already running.
+    /// Processes are already running (re-entrancy).
     Busy,
     TooLarge,
+    TooMany,
     /// Memory manager missing or out of frames.
     NoMemory,
 }
 
+pub struct Spec<'a> {
+    pub program: &'a [u8],
+    pub caps: Caps,
+    pub budget_ticks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessResult {
+    pub outcome: Outcome,
+    pub finished_tick: u64,
+}
+
 pub fn current_caps() -> Caps {
-    Caps::from_bits(CURRENT_CAPS.load(Ordering::Relaxed))
+    sched::current_caps()
 }
 
 pub fn user_process_active() -> bool {
-    IN_USER.load(Ordering::Relaxed)
+    sched::process_active()
 }
 
 /// Terminate the running user process from kernel context (fault or exit).
 /// Never returns to the interrupted user code.
 pub fn terminate_current(outcome: Outcome) -> ! {
-    if !IN_USER.load(Ordering::Relaxed) {
-        panic!("ring-3 event ({:?}) with no user process running", outcome);
-    }
-    // SAFETY: IN_USER is only set between `enter_user_mode` and its return, so
-    // L_KERNEL_RSP holds the stack pointer saved by that call and the frame it
-    // points to is still live.
-    unsafe { return_to_kernel(outcome.to_raw()) }
+    sched::exit_current(outcome)
 }
 
-/// Called by the timer ISR after EOI. Kills the process if it overran.
-pub fn enforce_deadline(interrupted_from_user: bool) {
-    if interrupted_from_user
-        && IN_USER.load(Ordering::Relaxed)
-        && crate::time::ticks() >= DEADLINE_TICK.load(Ordering::Relaxed)
-    {
-        terminate_current(Outcome::Timeout);
+/// Build the address space of one process. On any failure everything already
+/// allocated for it is released again.
+fn build_process(mem: &mut Memory, spec: &Spec) -> Result<Box<Process>, RunError> {
+    let l4 = memory::create_address_space(mem).map_err(|_| RunError::NoMemory)?;
+    match populate(mem, l4, spec) {
+        Ok(()) => {
+            let id = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+            Ok(Process::new(id, spec.caps, spec.budget_ticks, l4, USER_CODE_ADDR, USER_STACK_TOP))
+        }
+        Err(e) => {
+            memory::destroy_address_space(mem, l4);
+            Err(e)
+        }
     }
 }
 
-fn map_page(mem: &mut Memory, addr: u64, flags: PageTableFlags) -> Result<Page, RunError> {
-    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
-    let frame = mem.frames.allocate_frame().ok_or(RunError::NoMemory)?;
+fn populate(mem: &mut Memory, l4: x86_64::structures::paging::PhysFrame, spec: &Spec) -> Result<(), RunError> {
+    // SAFETY: `l4` was just created by create_address_space and is not active.
+    let mut mapper = unsafe { memory::mapper_for(l4) };
     let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-    // SAFETY: the user virtual range is reserved for the single user process
-    // and unmapped; the frame is freshly allocated and exclusively ours.
-    unsafe { mem.mapper.map_to_with_table_flags(page, frame, flags, parent, &mut mem.frames) }
-        .map_err(|_| RunError::NoMemory)?
-        .flush();
-    Ok(page)
+    let off = memory::phys_offset();
+
+    let mut map = |addr: u64, flags: PageTableFlags, init: Option<&[u8]>| -> Result<(), RunError> {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+        let frame = mem.frames.allocate_frame().ok_or(RunError::NoMemory)?; // zeroed
+        if let Some(bytes) = init {
+            // SAFETY: the frame is exclusively ours and mapped at the physical
+            // offset; bytes.len() <= 4096 was checked by the caller. This goes
+            // through the kernel's mapping, never through user addresses.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    (off + frame.start_address().as_u64()).as_mut_ptr::<u8>(),
+                    bytes.len(),
+                );
+            }
+        }
+        // SAFETY: the target virtual page is unmapped in this fresh address
+        // space and the frame is not mapped anywhere else.
+        unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut mem.frames) }
+            .map_err(|_| RunError::NoMemory)?
+            .ignore(); // not the active address space: nothing to flush
+        Ok(())
+    };
+
+    // Code: readable + executable, never writable (W^X).
+    map(USER_CODE_ADDR, PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE, Some(spec.program))?;
+    // Stack: writable, never executable.
+    let stack_base = USER_STACK_TOP - USER_STACK_PAGES * 4096;
+    let rw = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+    for i in 0..USER_STACK_PAGES {
+        map(stack_base + i * 4096, rw, None)?;
+    }
+    Ok(())
 }
 
-/// Run `program` (raw x86_64 machine code, entered at its first byte) in ring
-/// 3 with exactly `caps`, for at most `budget_ticks` timer ticks.
-pub fn run(program: &[u8], caps: Caps, budget_ticks: u64) -> Result<Outcome, RunError> {
+/// Run several programs concurrently (preemptive round-robin) until all have
+/// ended, each in its own address space with exactly its `caps` and a budget
+/// of `budget_ticks` CPU ticks. Results are in the order of `specs`.
+pub fn run_all(specs: &[Spec]) -> Result<Vec<ProcessResult>, RunError> {
     use x86_64::instructions::interrupts;
 
-    if program.is_empty() || program.len() > 4096 {
+    if specs.len() > sched::MAX_PROCS {
+        return Err(RunError::TooMany);
+    }
+    if specs.iter().any(|s| s.program.is_empty() || s.program.len() > 4096) {
         return Err(RunError::TooLarge);
     }
     if RUNNING.swap(true, Ordering::SeqCst) {
         return Err(RunError::Busy);
     }
-    let result = run_inner(program, caps, budget_ticks);
+    let result = run_all_inner(specs);
     RUNNING.store(false, Ordering::SeqCst);
-    // The int-gate/fault paths that ended the process left IF cleared.
     interrupts::enable();
     result
 }
 
-fn run_inner(program: &[u8], caps: Caps, budget_ticks: u64) -> Result<Outcome, RunError> {
-    let stack_base = USER_STACK_TOP - USER_STACK_PAGES * 4096;
-    let (code_page, stack_pages);
+fn run_all_inner(specs: &[Spec]) -> Result<Vec<ProcessResult>, RunError> {
+    use x86_64::instructions::interrupts;
+
+    let mut procs: Vec<Box<Process>> = Vec::with_capacity(specs.len());
     {
         let mut guard = memory::MEMORY.lock();
         let mem = guard.as_mut().ok_or(RunError::NoMemory)?;
-
-        let rw_user = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-        code_page = map_page(mem, USER_CODE_ADDR, rw_user)?;
-        let s0 = map_page(mem, stack_base, rw_user | PageTableFlags::NO_EXECUTE)?;
-        let s1 = map_page(mem, stack_base + 4096, rw_user | PageTableFlags::NO_EXECUTE)?;
-        stack_pages = [s0, s1];
-
-        // SAFETY: the pages were just mapped writable and are exclusively ours;
-        // zeroing first ensures no stale data from earlier use of the frame.
-        unsafe {
-            core::ptr::write_bytes(USER_CODE_ADDR as *mut u8, 0, 4096);
-            core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_ADDR as *mut u8, program.len());
-            core::ptr::write_bytes(stack_base as *mut u8, 0, (USER_STACK_PAGES * 4096) as usize);
+        for spec in specs {
+            match build_process(mem, spec) {
+                Ok(p) => procs.push(p),
+                Err(e) => {
+                    for p in procs {
+                        memory::destroy_address_space(mem, p.l4);
+                    }
+                    return Err(e);
+                }
+            }
         }
-        // Code becomes read-only + executable (W^X).
-        let rx_user = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-        // SAFETY: the page is mapped; only its flags change.
-        unsafe { mem.mapper.update_flags(code_page, rx_user) }
-            .map_err(|_| RunError::NoMemory)?
-            .flush();
     }
 
-    let (user_cs, user_ss) = crate::gdt::user_selectors();
-    CURRENT_CAPS.store(caps.bits(), Ordering::Relaxed);
-    DEADLINE_TICK.store(crate::time::ticks().saturating_add(budget_ticks), Ordering::Relaxed);
-    IN_USER.store(true, Ordering::SeqCst);
-    // SAFETY: the code page is mapped user-executable, the stack top is the end
-    // of the mapped user stack, and the selectors are the ring-3 descriptors in
-    // the loaded GDT. The TSS holds a valid ring-0 stack for the way back.
-    let raw = unsafe {
-        enter_user_mode(USER_CODE_ADDR, USER_STACK_TOP, user_cs.0 as u64, user_ss.0 as u64)
-    };
-    IN_USER.store(false, Ordering::SeqCst);
-    CURRENT_CAPS.store(0, Ordering::Relaxed);
+    // The scheduler switches stacks and CR3, so interrupts stay off until the
+    // last process is gone (processes themselves run with IF=1 via iretq).
+    let finished = interrupts::without_interrupts(|| sched::run_until_idle(procs));
 
-    // Tear down: wipe and unmap. (Frames are not returned to an allocator yet.)
+    let mut results = Vec::with_capacity(finished.len());
     let mut guard = memory::MEMORY.lock();
-    if let Some(mem) = guard.as_mut() {
-        // SAFETY: the pages are still mapped writable (stack) / need a flag
-        // change (code); the process no longer runs.
-        unsafe {
-            let rw = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-            if let Ok(f) = mem.mapper.update_flags(code_page, rw) {
-                f.flush();
-            }
-            core::ptr::write_bytes(USER_CODE_ADDR as *mut u8, 0, 4096);
-            core::ptr::write_bytes(stack_base as *mut u8, 0, (USER_STACK_PAGES * 4096) as usize);
+    for p in finished {
+        results.push(ProcessResult {
+            // A process that never recorded an outcome is treated as killed.
+            outcome: p.outcome().unwrap_or(Outcome::GeneralProtection),
+            finished_tick: p.finished_tick(),
+        });
+        if let Some(mem) = guard.as_mut() {
+            memory::destroy_address_space(mem, p.l4);
         }
-        for page in [code_page, stack_pages[0], stack_pages[1]] {
-            if let Ok((_, flush)) = mem.mapper.unmap(page) {
-                flush.flush();
-            }
-        }
+        // `p` (and its kernel stack) is dropped here.
     }
-    Ok(Outcome::from_raw(raw))
+    Ok(results)
+}
+
+/// Run one program; see [`run_all`].
+pub fn run(program: &[u8], caps: Caps, budget_ticks: u64) -> Result<Outcome, RunError> {
+    let mut r = run_all(&[Spec { program, caps, budget_ticks }])?;
+    Ok(r.remove(0).outcome)
 }
 
 // ------------------------------------------------------------ test programs
@@ -270,7 +259,7 @@ macro_rules! user_programs {
 user_programs!(
     prog_hello, prog_write_nocap, prog_read_kernel, prog_write_kernel, prog_privileged, prog_spin,
     prog_badptr_heap, prog_badptr_kernel_half, prog_net_443, prog_net_80, prog_net_8443,
-    prog_ud2, prog_div0,
+    prog_ud2, prog_div0, prog_stack_11, prog_stack_22, prog_stack_overflow, prog_syscall_table,
 );
 
 global_asm!(
@@ -404,5 +393,58 @@ USER_prog_div0_START:
     xor ecx, ecx
     div ecx
 USER_prog_div0_END:
+
+    // Isolation probe: store VALUE in the stack page, yield 8 times (so the
+    // other process runs and writes ITS value to the same virtual address),
+    // then exit with whatever is in memory now. Equals VALUE iff isolated.
+    .macro STACKPROG name, val
+    PROG \name
+USER_\name\()_START:
+    mov dword ptr [rsp - 8], \val
+    mov ecx, 8
+1:  mov eax, 3
+    int 0x80
+    dec ecx
+    jnz 1b
+    mov edi, dword ptr [rsp - 8]
+    mov eax, 0
+    int 0x80
+USER_\name\()_END:
+    .endm
+    STACKPROG prog_stack_11, 11
+    STACKPROG prog_stack_22, 22
+
+    // Runs off the bottom of its stack -> #PF on an unmapped page.
+    PROG prog_stack_overflow
+USER_prog_stack_overflow_START:
+1:  push rax
+    jmp 1b
+USER_prog_stack_overflow_END:
+
+    // Table-driven write() probe. The kernel appends, right after this code,
+    // a table: u64 count, then count * (u64 ptr, u64 len). Exit code = number
+    // of calls the kernel ACCEPTED (non-negative result).
+    PROG prog_syscall_table
+USER_prog_syscall_table_START:
+    lea rbx, [rip + USER_prog_syscall_table_END]
+    mov r12, qword ptr [rbx]
+    add rbx, 8
+    xor r13d, r13d
+1:  test r12, r12
+    jz 2f
+    mov eax, 1
+    mov rdi, qword ptr [rbx]
+    mov rsi, qword ptr [rbx + 8]
+    int 0x80
+    test rax, rax
+    js 3f
+    inc r13
+3:  add rbx, 16
+    dec r12
+    jmp 1b
+2:  mov rdi, r13
+    mov eax, 0
+    int 0x80
+USER_prog_syscall_table_END:
 "#
 );

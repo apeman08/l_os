@@ -168,7 +168,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
     // After EOI and with no locks held: a runaway user process may be killed.
-    crate::usermode::enforce_deadline(from_user(&stack_frame));
+    crate::sched::on_tick(from_user(&stack_frame));
 }
 
 extern "x86-interrupt" fn  breakpoint_handler(stack_frame: InterruptStackFrame) {

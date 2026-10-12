@@ -19,6 +19,12 @@ static ALLOCATED: Mutex<FrameBitmap<TRACKED_FRAMES_WORDS>> = Mutex::new(FrameBit
 static FRAMES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
 static FRAMES_FREED: AtomicU64 = AtomicU64::new(0);
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
+static KERNEL_L4: AtomicU64 = AtomicU64::new(0);
+static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+/// Level-4 slot reserved for user mappings (virtual 0x7000_0000_0000..).
+/// The kernel must never map anything inside it.
+pub const USER_L4_INDEX: usize = 224;
 
 pub struct BootInfoFrameAllocator {
     memory_map: &'static MemoryMap,
@@ -118,6 +124,8 @@ pub unsafe fn init(physical_memory_offset: VirtAddr, memory_map: &'static Memory
         panic!("memory::init called twice (would alias the level 4 page table)");
     }
     let (l4_frame, _) = Cr3::read();
+    KERNEL_L4.store(l4_frame.start_address().as_u64(), Ordering::SeqCst);
+    PHYS_OFFSET.store(physical_memory_offset.as_u64(), Ordering::SeqCst);
     let virt = physical_memory_offset + l4_frame.start_address().as_u64();
     // SAFETY: the complete physical memory is mapped at `physical_memory_offset`
     // (caller contract) and the INITIALIZED guard ensures this is the only
@@ -146,4 +154,105 @@ pub fn usable_bytes(memory_map: &MemoryMap) -> u64 {
         .filter(|r| r.region_type == MemoryRegionType::Usable)
         .map(|r| r.range.end_addr() - r.range.start_addr())
         .sum()
+}
+
+/// The level-4 table the kernel itself runs on.
+pub fn kernel_l4() -> PhysFrame {
+    PhysFrame::containing_address(PhysAddr::new(KERNEL_L4.load(Ordering::SeqCst)))
+}
+
+pub fn phys_offset() -> VirtAddr {
+    VirtAddr::new(PHYS_OFFSET.load(Ordering::SeqCst))
+}
+
+fn table_ptr(frame: PhysFrame) -> *mut PageTable {
+    (phys_offset() + frame.start_address().as_u64()).as_mut_ptr::<PageTable>()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct OutOfFrames;
+
+/// Create a fresh address space: a new level-4 table that shares every kernel
+/// mapping (copied entries; all kernel pages are supervisor-only) and has an
+/// empty, private user slot.
+pub fn create_address_space(mem: &mut Memory) -> Result<PhysFrame, OutOfFrames> {
+    use x86_64::structures::paging::page_table::PageTableEntry;
+
+    let new = mem.frames.allocate_frame().ok_or(OutOfFrames)?;
+    // SAFETY: both frames are valid page-table frames mapped at the
+    // physical-memory offset; the new one is exclusively ours and zeroed, the
+    // kernel table is only read.
+    unsafe {
+        let src = &*table_ptr(kernel_l4());
+        let dst = &mut *table_ptr(new);
+        for i in 0..512 {
+            dst[i] = src[i].clone();
+        }
+        assert!(
+            dst[USER_L4_INDEX].is_unused(),
+            "kernel mapped something in the user L4 slot"
+        );
+        dst[USER_L4_INDEX] = PageTableEntry::new();
+    }
+    Ok(new)
+}
+
+/// Build a mapper that edits the page tables rooted at `l4`.
+///
+/// # Safety
+/// `l4` must be a table created by [`create_address_space`], and no other
+/// reference to it may be live while the mapper is used.
+pub unsafe fn mapper_for(l4: PhysFrame) -> OffsetPageTable<'static> {
+    // SAFETY: forwarded caller contract; offset is the bootloader's mapping.
+    unsafe { OffsetPageTable::new(&mut *table_ptr(l4), phys_offset()) }
+}
+
+/// Free every frame of the private user half (leaf frames and the table
+/// frames above them), then the level-4 table itself. Must not be called
+/// while `l4` is the active CR3 or while the process can still run.
+pub fn destroy_address_space(mem: &mut Memory, l4: PhysFrame) {
+    use x86_64::structures::paging::FrameDeallocator;
+
+    // SAFETY: table frames are valid and mapped at the physical offset. Entries
+    // are read before their frames are freed; the address space is dead, so no
+    // one else references these frames.
+    unsafe {
+        let l4t = &mut *table_ptr(l4);
+        if !l4t[USER_L4_INDEX].is_unused() {
+            let l3f = l4t[USER_L4_INDEX].frame().expect("user L4 entry is not a plain table");
+            let l3 = &*table_ptr(l3f);
+            for e3 in l3.iter().filter(|e| !e.is_unused()) {
+                let l2f = e3.frame().expect("huge page in user space");
+                let l2 = &*table_ptr(l2f);
+                for e2 in l2.iter().filter(|e| !e.is_unused()) {
+                    let l1f = e2.frame().expect("huge page in user space");
+                    let l1 = &*table_ptr(l1f);
+                    for e1 in l1.iter().filter(|e| !e.is_unused()) {
+                        mem.frames.deallocate_frame(e1.frame().expect("bad user leaf"));
+                    }
+                    mem.frames.deallocate_frame(l1f);
+                }
+                mem.frames.deallocate_frame(l2f);
+            }
+            mem.frames.deallocate_frame(l3f);
+        }
+        mem.frames.deallocate_frame(l4);
+    }
+}
+
+/// Run `f` with a read-only view of the *currently active* page tables.
+/// Only for use with interrupts disabled (syscall/ISR context).
+pub fn with_active_tables<R>(f: impl FnOnce(&OffsetPageTable) -> R) -> Option<R> {
+    use x86_64::registers::control::Cr3;
+
+    let (active, _) = Cr3::read();
+    if active == kernel_l4() {
+        return None; // syscalls only make sense on a process's tables
+    }
+    // SAFETY: interrupts are off, so nothing else touches the tables; a
+    // process's tables are never referenced by another live `&mut` while that
+    // process is running (builders and destroyers run only for non-running
+    // address spaces).
+    let mapper = unsafe { OffsetPageTable::new(&mut *table_ptr(active), phys_offset()) };
+    Some(f(&mapper))
 }

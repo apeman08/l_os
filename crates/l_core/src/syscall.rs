@@ -12,6 +12,8 @@ pub const SYS_WRITE: u64 = 1;
 /// `net_check(host_ptr, host_len, port)`: needs `Cap::Net`; returns the policy
 /// decision. It does not open a connection (there is no network stack yet).
 pub const SYS_NET_CHECK: u64 = 2;
+/// `yield()`: let another ready process run.
+pub const SYS_YIELD: u64 = 3;
 
 pub const ERR_NO_CAP: i64 = -1;
 pub const ERR_BAD_POINTER: i64 = -2;

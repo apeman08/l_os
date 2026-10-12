@@ -17,6 +17,10 @@ name = "usermode"
 harness = true
 
 [[test]]
+name = "processes"
+harness = true
+
+[[test]]
 name = "should_panic"
 harness = false
 

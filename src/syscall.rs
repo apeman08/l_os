@@ -2,8 +2,7 @@
 //! untrusted: capabilities are checked first, then every pointer is validated
 //! against the page tables before the kernel dereferences it.
 
-use crate::memory::MEMORY;
-use crate::usermode;
+use crate::{memory, sched, usermode};
 use l_core::{
     caps::Cap,
     syscall::{self as abi, Outcome},
@@ -14,27 +13,29 @@ use x86_64::{
 };
 
 /// True if every byte of `[ptr, ptr+len)` is in user space and every page it
-/// touches is mapped present *and* user-accessible in the current tables.
+/// touches is mapped present *and* user-accessible in the running process's
+/// page tables.
 fn user_buffer_ok(ptr: u64, len: u64) -> bool {
     if !abi::range_in_user_space(ptr, len) {
         return false;
     }
-    let guard = MEMORY.lock();
-    let Some(mem) = guard.as_ref() else { return false };
     let first = ptr & !0xfff;
     let last = (ptr + len - 1) & !0xfff;
-    let mut page = first;
-    loop {
-        match mem.mapper.translate(VirtAddr::new(page)) {
-            TranslateResult::Mapped { flags, .. }
-                if flags.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE) => {}
-            _ => return false,
+    memory::with_active_tables(|tables| {
+        let mut page = first;
+        loop {
+            match tables.translate(VirtAddr::new(page)) {
+                TranslateResult::Mapped { flags, .. }
+                    if flags.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE) => {}
+                _ => return false,
+            }
+            if page == last {
+                return true;
+            }
+            page += 4096;
         }
-        if page == last {
-            return true;
-        }
-        page += 4096;
-    }
+    })
+    .unwrap_or(false)
 }
 
 /// Copy `len` validated user bytes into `out[..len]`.
@@ -43,8 +44,8 @@ fn copy_from_user(ptr: u64, len: u64, out: &mut [u8]) -> bool {
         return false;
     }
     // SAFETY: user_buffer_ok verified the whole range is mapped and readable
-    // in the active address space; single CPU with interrupts disabled in the
-    // int gate, so the mapping cannot change underneath us.
+    // in the active address space (the calling process's); single CPU with
+    // interrupts disabled in the int gate, so the mapping cannot change.
     unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr(), len as usize) };
     true
 }
@@ -58,6 +59,10 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     }
     let caps = usermode::current_caps();
     match num {
+        abi::SYS_YIELD => {
+            sched::yield_current();
+            0
+        }
         abi::SYS_EXIT => usermode::terminate_current(Outcome::Exited(a0 as u16)),
         abi::SYS_WRITE => {
             if !caps.has(Cap::Console) {
