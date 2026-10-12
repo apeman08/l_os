@@ -52,6 +52,10 @@ harness = false
 name = "exception_bound_range"
 harness = false
 
+[[test]]
+name = "double_free"
+harness = false
+
 [dependencies]
 l_core = { path = "crates/l_core" }
 bootloader = { version = "0.9", features = ["map_physical_memory"] }

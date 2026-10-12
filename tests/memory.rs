@@ -12,7 +12,7 @@ use bootloader::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use x86_64::{
     VirtAddr,
-    structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Translate},
+    structures::paging::{FrameAllocator, FrameDeallocator, Mapper, Page, PageTableFlags, Translate},
 };
 
 entry_point!(main);
@@ -88,4 +88,30 @@ fn frames_are_distinct() {
     let b = mem.frames.allocate_frame().unwrap();
     assert_ne!(a, b);
     assert!(a.start_address().as_u64() >= 0x1000);
+}
+
+#[test_case]
+fn freed_frames_are_reused_and_wiped() {
+    let mut guard = l_os::memory::MEMORY.lock();
+    let mem = guard.as_mut().unwrap();
+    let before = l_os::memory::frames_in_use();
+    let f = mem.frames.allocate_frame().unwrap();
+    assert_eq!(l_os::memory::frames_in_use(), before + 1);
+
+    // Write a recognizable pattern through the physical-memory mapping.
+    let off = mem.mapper.phys_offset();
+    let p = (off + f.start_address().as_u64()).as_mut_ptr::<u64>();
+    // SAFETY: the frame is ours and mapped at the physical-memory offset.
+    unsafe { for i in 0..512 { p.add(i).write(0xdead_beef_dead_beef); } }
+
+    // SAFETY: nothing maps or references the frame.
+    unsafe { mem.frames.deallocate_frame(f) };
+    assert_eq!(l_os::memory::frames_in_use(), before);
+
+    let g = mem.frames.allocate_frame().unwrap();
+    assert_eq!(g, f, "most recently freed frame is reused first");
+    // SAFETY: the frame is ours again.
+    unsafe { for i in 0..512 { assert_eq!(p.add(i).read(), 0, "frame must be zeroed on reuse"); } }
+    // SAFETY: nothing maps or references the frame.
+    unsafe { mem.frames.deallocate_frame(g) };
 }

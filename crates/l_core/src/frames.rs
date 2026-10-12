@@ -51,6 +51,76 @@ impl Cursor {
     }
 }
 
+/// Tracks which frame numbers are currently handed out, so a double free or
+/// a free of a never-allocated frame is detected instead of corrupting memory.
+pub struct FrameBitmap<const WORDS: usize> {
+    words: [u64; WORDS],
+}
+
+impl<const WORDS: usize> FrameBitmap<WORDS> {
+    pub const CAPACITY: u64 = (WORDS as u64) * 64;
+
+    pub const fn new() -> Self {
+        Self { words: [0; WORDS] }
+    }
+
+    /// Mark `frame_number` allocated. `false` if out of range or already allocated.
+    pub fn mark_allocated(&mut self, frame_number: u64) -> bool {
+        if frame_number >= Self::CAPACITY {
+            return false;
+        }
+        let (w, b) = ((frame_number / 64) as usize, frame_number % 64);
+        if self.words[w] >> b & 1 == 1 {
+            return false;
+        }
+        self.words[w] |= 1 << b;
+        true
+    }
+
+    /// Mark free. `false` if out of range or it was not allocated (double free).
+    pub fn mark_free(&mut self, frame_number: u64) -> bool {
+        if frame_number >= Self::CAPACITY {
+            return false;
+        }
+        let (w, b) = ((frame_number / 64) as usize, frame_number % 64);
+        if self.words[w] >> b & 1 == 0 {
+            return false;
+        }
+        self.words[w] &= !(1 << b);
+        true
+    }
+
+    pub fn is_allocated(&self, frame_number: u64) -> bool {
+        frame_number < Self::CAPACITY && self.words[(frame_number / 64) as usize] >> (frame_number % 64) & 1 == 1
+    }
+}
+
+#[test]
+fn bitmap_detects_double_free_and_range() {
+    let mut m = FrameBitmap::<2>::new(); // 128 frames
+    assert!(!m.mark_free(5)); // never allocated
+    assert!(m.mark_allocated(5));
+    assert!(!m.mark_allocated(5)); // double allocate
+    assert!(m.is_allocated(5));
+    assert!(m.mark_free(5));
+    assert!(!m.mark_free(5)); // double free
+    assert!(!m.is_allocated(5));
+    assert!(m.mark_allocated(127));
+    assert!(!m.mark_allocated(128)); // out of range
+    assert!(!m.mark_free(128));
+    assert!(!m.is_allocated(u64::MAX));
+}
+
+#[test]
+fn bitmap_neighbours_are_independent() {
+    let mut m = FrameBitmap::<1>::new();
+    assert!(m.mark_allocated(63));
+    assert!(!m.is_allocated(62));
+    assert!(m.mark_allocated(0));
+    assert!(m.mark_free(63));
+    assert!(m.is_allocated(0));
+}
+
 #[test]
 fn cursor_skips_unusable_and_exhausts() {
     let regions = [
