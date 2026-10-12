@@ -16,7 +16,7 @@ use crate::{gdt, memory};
 use alloc::{boxed::Box, vec, vec::Vec};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
-use l_core::{caps::Caps, syscall::Outcome};
+use l_core::{handles::HandleTable, syscall::Outcome};
 use spin::Mutex;
 use x86_64::{
     registers::control::{Cr3, Cr3Flags},
@@ -67,12 +67,14 @@ unsafe extern "C" {
 enum State {
     Ready,
     Running,
+    /// Waiting for a message on this endpoint.
+    BlockedRecv(u16),
     Zombie,
 }
 
 pub struct Process {
     pub id: u32,
-    caps: Caps,
+    handles: HandleTable,
     state: State,
     pub(crate) l4: PhysFrame,
     kstack: Box<[u8]>,
@@ -86,7 +88,7 @@ pub struct Process {
 impl Process {
     /// Create a process that will start executing in ring 3 at `entry` with
     /// stack pointer `user_sp` when first scheduled.
-    pub fn new(id: u32, caps: Caps, budget_ticks: u64, l4: PhysFrame, entry: u64, user_sp: u64) -> Box<Process> {
+    pub fn new(id: u32, handles: HandleTable, budget_ticks: u64, l4: PhysFrame, entry: u64, user_sp: u64) -> Box<Process> {
         let mut kstack = vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
         let (user_cs, user_ss) = gdt::user_selectors();
         let top = (kstack.as_mut_ptr() as u64 + KERNEL_STACK_SIZE as u64) & !0xf;
@@ -111,7 +113,7 @@ impl Process {
         }
         Box::new(Process {
             id,
-            caps,
+            handles,
             state: State::Ready,
             l4,
             kstack,
@@ -154,6 +156,34 @@ impl Scheduler {
     fn select_next(&self, after: usize) -> Option<usize> {
         let n = self.procs.len();
         (1..=n).map(|k| (after + k) % n).find(|&i| self.procs[i].state == State::Ready)
+    }
+
+    /// Nothing can run any more. Processes still blocked will never be woken
+    /// (the only wake-ups come from other processes), so end them.
+    fn kill_blocked(&mut self) {
+        let now = crate::time::ticks();
+        for p in self.procs.iter_mut().filter(|p| matches!(p.state, State::BlockedRecv(_))) {
+            p.state = State::Zombie;
+            p.outcome = Some(Outcome::Deadlock);
+            p.finished_tick = now;
+        }
+    }
+
+    /// Choose what runs after the current process stopped being runnable.
+    fn next_after_stop(&mut self, cur: usize) -> Target {
+        match self.select_next(cur) {
+            Some(next) => {
+                self.procs[next].state = State::Running;
+                self.current = Some(next);
+                self.target(next)
+            }
+            None => {
+                self.kill_blocked();
+                assert!(self.boot_waiting, "last process stopped but nobody is waiting");
+                self.current = None;
+                Target::Boot
+            }
+        }
     }
 
     fn target(&self, idx: usize) -> Target {
@@ -240,6 +270,37 @@ pub fn yield_current() {
     unsafe { perform_switch(save, target) };
 }
 
+/// Block the current process until a message may be available on `endpoint`,
+/// run something else meanwhile, and return once woken. Callers re-check.
+pub fn block_on_recv(endpoint: u16) {
+    let (save, target) = {
+        let mut s = SCHED.lock();
+        let Some(cur) = s.current else { return };
+        s.procs[cur].state = State::BlockedRecv(endpoint);
+        let target = s.next_after_stop(cur);
+        (&raw mut s.procs[cur].saved_rsp, target)
+    };
+    // SAFETY: as in yield_current. If nothing else could run, the process was
+    // turned into a zombie by kill_blocked and is never resumed.
+    unsafe { perform_switch(save, target) };
+}
+
+/// Make every process waiting on `endpoint` runnable again.
+pub fn wake_endpoint(endpoint: u16) {
+    for p in SCHED.lock().procs.iter_mut() {
+        if p.state == State::BlockedRecv(endpoint) {
+            p.state = State::Ready;
+        }
+    }
+}
+
+/// Run `f` on the running process's handle table.
+pub fn with_handles<R>(f: impl FnOnce(&mut HandleTable) -> R) -> Option<R> {
+    let mut s = SCHED.lock();
+    let cur = s.current?;
+    Some(f(&mut s.procs[cur].handles))
+}
+
 /// End the current process and never return to it.
 pub fn exit_current(outcome: Outcome) -> ! {
     let (save, target) = {
@@ -254,18 +315,7 @@ pub fn exit_current(outcome: Outcome) -> ! {
             p.outcome = Some(outcome);
             p.finished_tick = crate::time::ticks();
         }
-        let target = match s.select_next(cur) {
-            Some(next) => {
-                s.procs[next].state = State::Running;
-                s.current = Some(next);
-                s.target(next)
-            }
-            None => {
-                assert!(s.boot_waiting, "last process ended but nobody is waiting");
-                s.current = None;
-                Target::Boot
-            }
-        };
+        let target = s.next_after_stop(cur);
         (&raw mut s.procs[cur].saved_rsp, target)
     };
     // SAFETY: as in yield_current; the zombie's stack is never resumed, and it
@@ -307,11 +357,6 @@ pub fn on_tick(interrupted_user_code: bool) {
 
 pub fn process_active() -> bool {
     SCHED.lock().current.is_some()
-}
-
-pub fn current_caps() -> Caps {
-    let s = SCHED.lock();
-    s.current.map(|c| s.procs[c].caps).unwrap_or(Caps::NONE)
 }
 
 pub fn scheduler_busy() -> bool {

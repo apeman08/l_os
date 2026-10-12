@@ -12,7 +12,11 @@ use crate::sched::{self, Process};
 use alloc::{boxed::Box, vec::Vec};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use l_core::{caps::Caps, policy::NetPolicy, syscall::Outcome};
+use l_core::{
+    handles::{HandleTable, Object, Rights},
+    policy::NetPolicy,
+    syscall::Outcome,
+};
 use spin::Mutex;
 use x86_64::{
     structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB},
@@ -33,8 +37,8 @@ static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 global_asm!(
     r#"
     .section .text
-    // int 0x80 entry. rax = number, rdi/rsi/rdx = args. Result in rax; every
-    // other register is preserved.
+    // int 0x80 entry. rax = number, rdi/rsi/rdx/r10/r8 = args a0..a4. Result in
+    // rax; every other register is preserved.
     .global syscall_entry
 syscall_entry:
     push rcx
@@ -47,6 +51,8 @@ syscall_entry:
     push r11
     sub rsp, 8              // 16-byte alignment for the call
     cld
+    mov r9, r8              // a4
+    mov r8, r10             // a3
     mov rcx, rdx            // a2
     mov rdx, rsi            // a1
     mov rsi, rdi            // a0
@@ -75,13 +81,18 @@ pub enum RunError {
     Busy,
     TooLarge,
     TooMany,
+    /// A handle in the spec is invalid (too many, or names a missing endpoint).
+    BadHandles,
     /// Memory manager missing or out of frames.
     NoMemory,
 }
 
+/// What to start: code, the handles the process is born with (slot order =
+/// handle values 0, 1, 2, ... in a fresh table), and its CPU budget. A process
+/// has no authority beyond these handles.
 pub struct Spec<'a> {
     pub program: &'a [u8],
-    pub caps: Caps,
+    pub handles: &'a [(Object, Rights)],
     pub budget_ticks: u64,
 }
 
@@ -89,10 +100,6 @@ pub struct Spec<'a> {
 pub struct ProcessResult {
     pub outcome: Outcome,
     pub finished_tick: u64,
-}
-
-pub fn current_caps() -> Caps {
-    sched::current_caps()
 }
 
 pub fn user_process_active() -> bool {
@@ -108,11 +115,20 @@ pub fn terminate_current(outcome: Outcome) -> ! {
 /// Build the address space of one process. On any failure everything already
 /// allocated for it is released again.
 fn build_process(mem: &mut Memory, spec: &Spec) -> Result<Box<Process>, RunError> {
+    let mut table = HandleTable::new();
+    for &(object, rights) in spec.handles {
+        if let Object::Endpoint(id) = object {
+            if !crate::ipc::exists(id) {
+                return Err(RunError::BadHandles);
+            }
+        }
+        table.insert(object, rights).map_err(|_| RunError::BadHandles)?;
+    }
     let l4 = memory::create_address_space(mem).map_err(|_| RunError::NoMemory)?;
     match populate(mem, l4, spec) {
         Ok(()) => {
             let id = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-            Ok(Process::new(id, spec.caps, spec.budget_ticks, l4, USER_CODE_ADDR, USER_STACK_TOP))
+            Ok(Process::new(id, table, spec.budget_ticks, l4, USER_CODE_ADDR, USER_STACK_TOP))
         }
         Err(e) => {
             memory::destroy_address_space(mem, l4);
@@ -178,6 +194,7 @@ pub fn run_all(specs: &[Spec]) -> Result<Vec<ProcessResult>, RunError> {
         return Err(RunError::Busy);
     }
     let result = run_all_inner(specs);
+    crate::ipc::reset(); // endpoints do not outlive the group that used them
     RUNNING.store(false, Ordering::SeqCst);
     interrupts::enable();
     result
@@ -224,8 +241,8 @@ fn run_all_inner(specs: &[Spec]) -> Result<Vec<ProcessResult>, RunError> {
 }
 
 /// Run one program; see [`run_all`].
-pub fn run(program: &[u8], caps: Caps, budget_ticks: u64) -> Result<Outcome, RunError> {
-    let mut r = run_all(&[Spec { program, caps, budget_ticks }])?;
+pub fn run(program: &[u8], handles: &[(Object, Rights)], budget_ticks: u64) -> Result<Outcome, RunError> {
+    let mut r = run_all(&[Spec { program, handles, budget_ticks }])?;
     Ok(r.remove(0).outcome)
 }
 
@@ -260,6 +277,8 @@ user_programs!(
     prog_hello, prog_write_nocap, prog_read_kernel, prog_write_kernel, prog_privileged, prog_spin,
     prog_badptr_heap, prog_badptr_kernel_half, prog_net_443, prog_net_80, prog_net_8443,
     prog_ud2, prog_div0, prog_stack_11, prog_stack_22, prog_stack_overflow, prog_syscall_table,
+    prog_use_after_close, prog_forged_handle, prog_send_console_write, prog_send_console_nothing,
+    prog_send_console_amplify, prog_recv_and_write, prog_recv_only, prog_send_plain, prog_recv_wrong_right,
 );
 
 global_asm!(
@@ -275,8 +294,9 @@ global_asm!(
     PROG prog_hello
 USER_prog_hello_START:
     mov eax, 1
-    lea rdi, [rip + 2f]
-    mov esi, 18
+    xor edi, edi
+    lea rsi, [rip + 2f]
+    mov edx, 18
     int 0x80
     mov rdi, rax
     mov eax, 0
@@ -288,8 +308,9 @@ USER_prog_hello_END:
     PROG prog_write_nocap
 USER_prog_write_nocap_START:
     mov eax, 1
-    lea rdi, [rip + 2f]
-    mov esi, 2
+    xor edi, edi
+    lea rsi, [rip + 2f]
+    mov edx, 2
     int 0x80
     neg rax
     mov rdi, rax
@@ -337,8 +358,9 @@ USER_prog_spin_END:
     PROG prog_badptr_heap
 USER_prog_badptr_heap_START:
     mov eax, 1
-    movabs rdi, 0x444444440000
-    mov esi, 8
+    xor edi, edi
+    movabs rsi, 0x444444440000
+    mov edx, 8
     int 0x80
     neg rax
     mov rdi, rax
@@ -350,8 +372,9 @@ USER_prog_badptr_heap_END:
     PROG prog_badptr_kernel_half
 USER_prog_badptr_kernel_half_START:
     mov eax, 1
-    movabs rdi, 0xffff800000000000
-    mov esi, 8
+    xor edi, edi
+    movabs rsi, 0xffff800000000000
+    mov edx, 8
     int 0x80
     neg rax
     mov rdi, rax
@@ -364,9 +387,10 @@ USER_prog_badptr_kernel_half_END:
     PROG \name
 USER_\name\()_START:
     mov eax, 2
-    lea rdi, [rip + 2f]
-    mov esi, 11
-    mov edx, \port
+    xor edi, edi
+    lea rsi, [rip + 2f]
+    mov edx, 11
+    mov r10d, \port
     int 0x80
     neg rax
     mov rdi, rax
@@ -433,8 +457,9 @@ USER_prog_syscall_table_START:
 1:  test r12, r12
     jz 2f
     mov eax, 1
-    mov rdi, qword ptr [rbx]
-    mov rsi, qword ptr [rbx + 8]
+    xor edi, edi
+    mov rsi, qword ptr [rbx]
+    mov rdx, qword ptr [rbx + 8]
     int 0x80
     test rax, rax
     js 3f
@@ -446,5 +471,125 @@ USER_prog_syscall_table_START:
     mov eax, 0
     int 0x80
 USER_prog_syscall_table_END:
+
+    // close(0), then write(0, ...): the closed handle must be dead. exit(-result)
+    PROG prog_use_after_close
+USER_prog_use_after_close_START:
+    mov eax, 4
+    xor edi, edi
+    int 0x80
+    mov eax, 1
+    xor edi, edi
+    lea rsi, [rip + 2f]
+    mov edx, 2
+    int 0x80
+    neg rax
+    mov rdi, rax
+    mov eax, 0
+    int 0x80
+2:  .ascii "hi"
+USER_prog_use_after_close_END:
+
+    // write() through a handle value the process was never given (slot 1, gen 5)
+    PROG prog_forged_handle
+USER_prog_forged_handle_START:
+    mov eax, 1
+    mov edi, 0x501
+    lea rsi, [rip + 2f]
+    mov edx, 2
+    int 0x80
+    neg rax
+    mov rdi, rax
+    mov eax, 0
+    int 0x80
+2:  .ascii "hi"
+USER_prog_forged_handle_END:
+
+    // Parent: send(ep=handle 1, "hi!\n", xfer=handle 0, mask=\mask); exit(-result)
+    .macro SENDPROG name, mask
+    PROG \name
+USER_\name\()_START:
+    mov eax, 5
+    mov edi, 1
+    lea rsi, [rip + 2f]
+    mov edx, 4
+    xor r10d, r10d
+    mov r8d, \mask
+    int 0x80
+    neg rax
+    mov rdi, rax
+    mov eax, 0
+    int 0x80
+2:  .ascii "hi!\n"
+USER_\name\()_END:
+    .endm
+    SENDPROG prog_send_console_write, 1       // mask = WRITE
+    SENDPROG prog_send_console_nothing, 4     // mask = SEND only: console right is stripped
+    SENDPROG prog_send_console_amplify, 31    // mask = everything: must not add rights
+
+    // Child: recv(ep=handle 0) -> packed result; write(received handle, buf, len);
+    // exit(result of write)
+    PROG prog_recv_and_write
+USER_prog_recv_and_write_START:
+    mov eax, 6
+    xor edi, edi
+    lea rsi, [rsp - 128]
+    mov edx, 64
+    int 0x80
+    mov rbx, rax
+    shr rbx, 32
+    movzx edx, ax
+    mov rdi, rbx
+    lea rsi, [rsp - 128]
+    mov eax, 1
+    int 0x80
+    mov rdi, rax
+    mov eax, 0
+    int 0x80
+USER_prog_recv_and_write_END:
+
+    // Child that only waits for a message: exit(len) (blocks forever if none)
+    PROG prog_recv_only
+USER_prog_recv_only_START:
+    mov eax, 6
+    xor edi, edi
+    lea rsi, [rsp - 128]
+    mov edx, 64
+    int 0x80
+    movzx edi, ax
+    mov eax, 0
+    int 0x80
+USER_prog_recv_only_END:
+
+    // send("hi!\n") without any transfer: exit(-result)
+    PROG prog_send_plain
+USER_prog_send_plain_START:
+    mov eax, 5
+    xor edi, edi
+    lea rsi, [rip + 2f]
+    mov edx, 4
+    mov r10, -1
+    xor r8d, r8d
+    int 0x80
+    neg rax
+    mov rdi, rax
+    mov eax, 0
+    int 0x80
+2:  .ascii "hi!\n"
+USER_prog_send_plain_END:
+
+    // recv() on handle 0 (used with a SEND-only endpoint handle): exit(-result)
+    PROG prog_recv_wrong_right
+USER_prog_recv_wrong_right_START:
+    mov eax, 6
+    xor edi, edi
+    lea rsi, [rsp - 128]
+    mov edx, 64
+    int 0x80
+    neg rax
+    mov rdi, rax
+    mov eax, 0
+    int 0x80
+USER_prog_recv_wrong_right_END:
 "#
 );

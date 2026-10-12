@@ -57,25 +57,27 @@ fn run_line(line: &str) {
 }
 
 fn run_program(name: &str) {
-    use l_core::{caps::{Cap, Caps}, syscall::Outcome};
+    use l_core::{handles::{Object, Rights}, syscall::Outcome};
 
-    // Each demo gets only the capabilities it needs; `evil` and `spin` get none.
-    let (program, caps, budget) = match name {
-        "hello" => (usermode::prog_hello(), Caps::NONE.with(Cap::Console), 18),
-        "evil" => (usermode::prog_read_kernel(), Caps::NONE, 18),
-        "spin" => (usermode::prog_spin(), Caps::NONE, 18),
+    // Each demo gets only the handles it needs; `evil` and `spin` get none.
+    const CONSOLE: &[(Object, Rights)] = &[(Object::Console, Rights::WRITE)];
+    let (program, handles, budget) = match name {
+        "hello" => (usermode::prog_hello(), CONSOLE, 18),
+        "evil" => (usermode::prog_read_kernel(), &[][..], 18),
+        "spin" => (usermode::prog_spin(), &[][..], 18),
         _ => {
             println!("run: unknown program '{}' (hello | evil | spin)", name);
             return;
         }
     };
-    match usermode::run(program, caps, budget) {
+    match usermode::run(program, handles, budget) {
         Ok(Outcome::Exited(code)) => println!("[process exited with code {}]", code),
         Ok(Outcome::PageFault) => println!("[process killed: illegal memory access (page fault)]"),
         Ok(Outcome::GeneralProtection) => println!("[process killed: protection fault]"),
         Ok(Outcome::InvalidOpcode) => println!("[process killed: invalid instruction]"),
         Ok(Outcome::DivideError) => println!("[process killed: divide error]"),
         Ok(Outcome::OtherFault) => println!("[process killed: CPU exception]"),
+        Ok(Outcome::Deadlock) => println!("[process killed: blocked forever]"),
         Ok(Outcome::Timeout) => println!("[process killed: exceeded its time budget]"),
         Err(e) => println!("run failed: {:?}", e),
     }

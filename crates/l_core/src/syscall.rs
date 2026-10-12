@@ -7,18 +7,30 @@
 use crate::policy::{Decision, DenyReason};
 
 pub const SYS_EXIT: u64 = 0;
-/// `write(ptr, len)`: needs `Cap::Console`.
+/// `write(console_handle, ptr, len)`: handle needs `Rights::WRITE`.
 pub const SYS_WRITE: u64 = 1;
-/// `net_check(host_ptr, host_len, port)`: needs `Cap::Net`; returns the policy
-/// decision. It does not open a connection (there is no network stack yet).
+/// `net_check(net_handle, host_ptr, host_len, port)`: handle needs `Rights::USE`;
+/// returns the policy decision. It does not open a connection (no network stack yet).
 pub const SYS_NET_CHECK: u64 = 2;
 /// `yield()`: let another ready process run.
 pub const SYS_YIELD: u64 = 3;
+/// `close(handle)`
+pub const SYS_CLOSE: u64 = 4;
+/// `send(endpoint, ptr, len, xfer_handle|NO_HANDLE, rights_mask)`: endpoint needs
+/// `SEND`; a transferred handle needs `GRANT` and arrives with rights ∩ mask.
+pub const SYS_SEND: u64 = 5;
+/// `recv(endpoint, ptr, max_len)`: endpoint needs `RECV`; blocks while empty.
+/// Result: `len | has_handle << 16 | handle << 32`.
+pub const SYS_RECV: u64 = 6;
 
-pub const ERR_NO_CAP: i64 = -1;
+/// Not a live handle in the caller's table (also: forged, closed, stale).
+pub const ERR_BAD_HANDLE: i64 = -1;
 pub const ERR_BAD_POINTER: i64 = -2;
 pub const ERR_INVALID: i64 = -3;
 pub const ERR_NO_SYSCALL: i64 = -4;
+pub const ERR_WOULD_BLOCK: i64 = -5;
+pub const ERR_NO_RIGHTS: i64 = -6;
+pub const ERR_TABLE_FULL: i64 = -7;
 pub const DENIED_NO_GRANT: i64 = -10;
 pub const DENIED_EXPIRED: i64 = -11;
 pub const DENIED_INVALID_DESTINATION: i64 = -12;
@@ -59,6 +71,8 @@ pub enum Outcome {
     DivideError,
     /// Any other CPU exception raised by the process (alignment, FPU, overflow, ...).
     OtherFault,
+    /// Blocked forever: nothing left that could wake it.
+    Deadlock,
     /// Killed because it ran past its time budget.
     Timeout,
 }
@@ -72,6 +86,7 @@ impl Outcome {
             Outcome::InvalidOpcode => 0x1_0003,
             Outcome::DivideError => 0x1_0004,
             Outcome::OtherFault => 0x1_0005,
+            Outcome::Deadlock => 0x1_0006,
             Outcome::Timeout => 0x1_00ff,
         }
     }
@@ -85,6 +100,7 @@ impl Outcome {
             0x1_0003 => Outcome::InvalidOpcode,
             0x1_0004 => Outcome::DivideError,
             0x1_0005 => Outcome::OtherFault,
+            0x1_0006 => Outcome::Deadlock,
             0x1_00ff => Outcome::Timeout,
             _ => Outcome::GeneralProtection,
         }
@@ -99,7 +115,7 @@ mod tests {
     fn outcome_roundtrip() {
         for o in [
             Outcome::Exited(0), Outcome::Exited(7), Outcome::Exited(u16::MAX), Outcome::PageFault,
-            Outcome::GeneralProtection, Outcome::InvalidOpcode, Outcome::DivideError, Outcome::OtherFault, Outcome::Timeout,
+            Outcome::GeneralProtection, Outcome::InvalidOpcode, Outcome::DivideError, Outcome::OtherFault, Outcome::Deadlock, Outcome::Timeout,
         ] {
             assert_eq!(Outcome::from_raw(o.to_raw()), o);
         }

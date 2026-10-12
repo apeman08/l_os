@@ -9,8 +9,8 @@
 use bootloader::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use l_core::{
-    caps::{Cap, Caps},
-    syscall::{ERR_BAD_POINTER, ERR_NO_CAP, Outcome},
+    handles::{Object, Rights},
+    syscall::{ERR_BAD_HANDLE, ERR_BAD_POINTER, Outcome},
 };
 use l_os::usermode::{self, POLICY};
 
@@ -29,11 +29,13 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 const BUDGET: u64 = 18; // ~1 s
-const NET: Caps = Caps::NONE.with(Cap::Net);
-const CONSOLE: Caps = Caps::NONE.with(Cap::Console);
+type Handles = &'static [(Object, Rights)];
+const NONE: Handles = &[];
+const NET: Handles = &[(Object::NetClient, Rights::USE)];
+const CONSOLE: Handles = &[(Object::Console, Rights::WRITE)];
 
-fn run(p: &[u8], caps: Caps) -> Outcome {
-    usermode::run(p, caps, BUDGET).expect("run failed")
+fn run(p: &[u8], handles: Handles) -> Outcome {
+    usermode::run(p, handles, BUDGET).expect("run failed")
 }
 
 #[test_case]
@@ -44,34 +46,34 @@ fn hello_runs_in_ring3_and_syscalls_work() {
 
 #[test_case]
 fn no_capability_means_no_console() {
-    assert_eq!(run(usermode::prog_write_nocap(), Caps::NONE), Outcome::Exited((-ERR_NO_CAP) as u16));
+    assert_eq!(run(usermode::prog_write_nocap(), NONE), Outcome::Exited((-ERR_BAD_HANDLE) as u16));
 }
 
 #[test_case]
 fn user_cannot_read_kernel_memory() {
-    assert_eq!(run(usermode::prog_read_kernel(), Caps::NONE), Outcome::PageFault);
+    assert_eq!(run(usermode::prog_read_kernel(), NONE), Outcome::PageFault);
 }
 
 #[test_case]
 fn user_cannot_write_kernel_memory() {
-    assert_eq!(run(usermode::prog_write_kernel(), Caps::NONE), Outcome::PageFault);
+    assert_eq!(run(usermode::prog_write_kernel(), NONE), Outcome::PageFault);
 }
 
 #[test_case]
 fn privileged_instruction_is_rejected() {
-    assert_eq!(run(usermode::prog_privileged(), Caps::NONE), Outcome::GeneralProtection);
+    assert_eq!(run(usermode::prog_privileged(), NONE), Outcome::GeneralProtection);
 }
 
 #[test_case]
 fn invalid_opcode_and_div0_kill_only_the_process() {
-    assert_eq!(run(usermode::prog_ud2(), Caps::NONE), Outcome::InvalidOpcode);
-    assert_eq!(run(usermode::prog_div0(), Caps::NONE), Outcome::DivideError);
+    assert_eq!(run(usermode::prog_ud2(), NONE), Outcome::InvalidOpcode);
+    assert_eq!(run(usermode::prog_div0(), NONE), Outcome::DivideError);
 }
 
 #[test_case]
 fn runaway_process_is_killed_by_time_budget() {
     let start = l_os::time::ticks();
-    let out = usermode::run(usermode::prog_spin(), Caps::NONE, 5).unwrap();
+    let out = usermode::run(usermode::prog_spin(), NONE, 5).unwrap();
     assert_eq!(out, Outcome::Timeout);
     assert!(l_os::time::ticks() - start >= 5);
 }
@@ -87,7 +89,7 @@ fn syscall_rejects_pointers_into_kernel_memory() {
 #[test_case]
 fn kernel_survives_and_keeps_working_after_kills() {
     for _ in 0..3 {
-        assert_eq!(run(usermode::prog_read_kernel(), Caps::NONE), Outcome::PageFault);
+        assert_eq!(run(usermode::prog_read_kernel(), NONE), Outcome::PageFault);
     }
     assert_eq!(run(usermode::prog_hello(), CONSOLE), Outcome::Exited(18));
     // Timer still ticks => interrupts and PIC are healthy after abandoned handlers.
@@ -101,7 +103,7 @@ fn kernel_survives_and_keeps_working_after_kills() {
 fn net_check_default_deny_then_allow_revoke_expiry() {
     POLICY.lock().revoke_all();
     // No Cap::Net: refused before the policy is even consulted.
-    assert_eq!(run(usermode::prog_net_443(), Caps::NONE), Outcome::Exited((-ERR_NO_CAP) as u16));
+    assert_eq!(run(usermode::prog_net_443(), NONE), Outcome::Exited((-ERR_BAD_HANDLE) as u16));
     // Cap::Net but no grant: denied (DENIED_NO_GRANT = -10).
     assert_eq!(run(usermode::prog_net_443(), NET), Outcome::Exited(10));
 
@@ -120,6 +122,6 @@ fn net_check_default_deny_then_allow_revoke_expiry() {
 #[test_case]
 fn empty_and_oversize_programs_are_rejected() {
     let big = [0x90u8; 5000];
-    assert_eq!(usermode::run(&big, Caps::NONE, BUDGET), Err(usermode::RunError::TooLarge));
-    assert_eq!(usermode::run(&[], Caps::NONE, BUDGET), Err(usermode::RunError::TooLarge));
+    assert_eq!(usermode::run(&big, NONE, BUDGET), Err(usermode::RunError::TooLarge));
+    assert_eq!(usermode::run(&[], NONE, BUDGET), Err(usermode::RunError::TooLarge));
 }

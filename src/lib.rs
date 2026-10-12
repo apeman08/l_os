@@ -18,6 +18,7 @@ pub mod frames;
 pub mod memory;
 pub mod allocator;
 pub mod input;
+pub mod ipc;
 pub mod shell;
 pub mod sched;
 pub mod syscall;

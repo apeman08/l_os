@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use bootloader::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use l_core::{
-    caps::{Cap, Caps},
+    handles::{Object, Rights},
     syscall::{Outcome, USER_SPACE_END},
 };
 use l_os::usermode::{self, Spec, USER_CODE_ADDR, USER_STACK_TOP};
@@ -30,10 +30,12 @@ fn panic(info: &PanicInfo) -> ! {
     l_os::test_panic_handler(info)
 }
 
-const CONSOLE: Caps = Caps::NONE.with(Cap::Console);
+type Handles = &'static [(Object, Rights)];
+const NONE: Handles = &[];
+const CONSOLE: Handles = &[(Object::Console, Rights::WRITE)];
 
-fn spec(program: &[u8], caps: Caps, budget_ticks: u64) -> Spec<'_> {
-    Spec { program, caps, budget_ticks }
+fn spec<'a>(program: &'a [u8], handles: &'a [(Object, Rights)], budget_ticks: u64) -> Spec<'a> {
+    Spec { program, handles, budget_ticks }
 }
 
 #[test_case]
@@ -41,8 +43,8 @@ fn two_processes_do_not_share_memory() {
     // Both write a different value to the SAME virtual address, interleave via
     // yield, and read it back. Shared memory would make one see the other's value.
     let r = usermode::run_all(&[
-        spec(usermode::prog_stack_11(), Caps::NONE, 100),
-        spec(usermode::prog_stack_22(), Caps::NONE, 100),
+        spec(usermode::prog_stack_11(), NONE, 100),
+        spec(usermode::prog_stack_22(), NONE, 100),
     ])
     .unwrap();
     assert_eq!(r[0].outcome, Outcome::Exited(11));
@@ -55,7 +57,7 @@ fn many_processes_interleave_and_stay_isolated() {
         usermode::prog_stack_11(), usermode::prog_stack_22(), usermode::prog_stack_11(), usermode::prog_stack_22(),
         usermode::prog_stack_11(), usermode::prog_stack_22(), usermode::prog_stack_11(), usermode::prog_stack_22(),
     ];
-    let specs: Vec<Spec> = progs.iter().map(|p| spec(p, Caps::NONE, 100)).collect();
+    let specs: Vec<Spec> = progs.iter().map(|p| spec(p, NONE, 100)).collect();
     let r = usermode::run_all(&specs).unwrap();
     for (i, res) in r.iter().enumerate() {
         assert_eq!(res.outcome, Outcome::Exited(if i % 2 == 0 { 11 } else { 22 }));
@@ -65,7 +67,7 @@ fn many_processes_interleave_and_stay_isolated() {
 #[test_case]
 fn too_many_processes_rejected() {
     let p = usermode::prog_stack_11();
-    let specs: Vec<Spec> = (0..9).map(|_| spec(p, Caps::NONE, 10)).collect();
+    let specs: Vec<Spec> = (0..9).map(|_| spec(p, NONE, 10)).collect();
     assert_eq!(usermode::run_all(&specs).err(), Some(usermode::RunError::TooMany));
 }
 
@@ -74,7 +76,7 @@ fn spinning_process_is_preempted_so_others_finish() {
     // The spinner never yields. If scheduling were cooperative, hello could
     // not finish before the spinner's budget (18 ticks) runs out.
     let r = usermode::run_all(&[
-        spec(usermode::prog_spin(), Caps::NONE, 18),
+        spec(usermode::prog_spin(), NONE, 18),
         spec(usermode::prog_hello(), CONSOLE, 100),
     ])
     .unwrap();
@@ -86,10 +88,10 @@ fn spinning_process_is_preempted_so_others_finish() {
 #[test_case]
 fn a_crashing_process_does_not_disturb_others() {
     let r = usermode::run_all(&[
-        spec(usermode::prog_read_kernel(), Caps::NONE, 100),
-        spec(usermode::prog_stack_11(), Caps::NONE, 100),
-        spec(usermode::prog_privileged(), Caps::NONE, 100),
-        spec(usermode::prog_stack_22(), Caps::NONE, 100),
+        spec(usermode::prog_read_kernel(), NONE, 100),
+        spec(usermode::prog_stack_11(), NONE, 100),
+        spec(usermode::prog_privileged(), NONE, 100),
+        spec(usermode::prog_stack_22(), NONE, 100),
     ])
     .unwrap();
     assert_eq!(r[0].outcome, Outcome::PageFault);
@@ -101,8 +103,8 @@ fn a_crashing_process_does_not_disturb_others() {
 #[test_case]
 fn two_spinners_both_hit_their_budgets() {
     let r = usermode::run_all(&[
-        spec(usermode::prog_spin(), Caps::NONE, 6),
-        spec(usermode::prog_spin(), Caps::NONE, 9),
+        spec(usermode::prog_spin(), NONE, 6),
+        spec(usermode::prog_spin(), NONE, 9),
     ])
     .unwrap();
     assert_eq!(r[0].outcome, Outcome::Timeout);
@@ -115,10 +117,10 @@ fn no_frames_leak_across_runs() {
     usermode::run(usermode::prog_hello(), CONSOLE, 100).unwrap();
     let before = l_os::memory::frames_in_use();
     for _ in 0..60 {
-        usermode::run(usermode::prog_read_kernel(), Caps::NONE, 100).unwrap();
+        usermode::run(usermode::prog_read_kernel(), NONE, 100).unwrap();
         let r = usermode::run_all(&[
-            spec(usermode::prog_stack_11(), Caps::NONE, 100),
-            spec(usermode::prog_stack_22(), Caps::NONE, 100),
+            spec(usermode::prog_stack_11(), NONE, 100),
+            spec(usermode::prog_stack_22(), NONE, 100),
         ])
         .unwrap();
         assert_eq!(r[0].outcome, Outcome::Exited(11));
@@ -129,8 +131,8 @@ fn no_frames_leak_across_runs() {
 #[test_case]
 fn user_stack_overflow_kills_only_the_process() {
     let r = usermode::run_all(&[
-        spec(usermode::prog_stack_overflow(), Caps::NONE, 100),
-        spec(usermode::prog_stack_11(), Caps::NONE, 100),
+        spec(usermode::prog_stack_overflow(), NONE, 100),
+        spec(usermode::prog_stack_11(), NONE, 100),
     ])
     .unwrap();
     assert_eq!(r[0].outcome, Outcome::PageFault);

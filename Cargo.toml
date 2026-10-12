@@ -22,6 +22,10 @@ name = "processes"
 harness = true
 
 [[test]]
+name = "capabilities"
+harness = true
+
+[[test]]
 name = "should_panic"
 harness = false
 
