@@ -21,10 +21,12 @@ pub mod input;
 pub mod shell;
 pub mod sched;
 pub mod syscall;
+pub mod cpu;
 pub mod time;
 pub mod usermode;
 
 pub fn init() {
+    cpu::init();
     interrupts::idt_init();
     gdt::init();
     unsafe {interrupts::PICS.lock().initialize()};

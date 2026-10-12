@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [package.metadata.bootimage]
-test-args = ["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-serial", "stdio", "-display", "none"]
+run-args = ["-cpu", "max"]
+test-args = ["-cpu", "max", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-serial", "stdio", "-display", "none"]
 test-success-exit-code = 33
 test-timeout = 300
 
@@ -58,6 +59,14 @@ harness = false
 
 [[test]]
 name = "double_free"
+harness = false
+
+[[test]]
+name = "smap_violation"
+harness = false
+
+[[test]]
+name = "smep_violation"
 harness = false
 
 [dependencies]

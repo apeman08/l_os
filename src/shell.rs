@@ -37,6 +37,9 @@ fn execute(cmd: Command<'_>) {
             println!("  storage:    no storage driver exists; nothing is read or written");
             println!("  isolation:  ring 3 demo programs only (single process, no scheduler);");
             println!("              shell and kernel still share ring 0; see docs/THREAT_MODEL.md");
+            println!("  cpu:        SMEP {}, SMAP {}",
+                if crate::cpu::smep_enabled() { "on" } else { "off" },
+                if crate::cpu::smap_enabled() { "on" } else { "off" });
             println!("  telemetry:  none");
         }
         Command::Echo(text) => println!("{}", text),

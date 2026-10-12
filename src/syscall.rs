@@ -46,7 +46,12 @@ fn copy_from_user(ptr: u64, len: u64, out: &mut [u8]) -> bool {
     // SAFETY: user_buffer_ok verified the whole range is mapped and readable
     // in the active address space (the calling process's); single CPU with
     // interrupts disabled in the int gate, so the mapping cannot change.
-    unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr(), len as usize) };
+    // The SMAP window covers exactly this copy (a plain memcpy of validated memory).
+    unsafe {
+        crate::cpu::with_user_access(|| {
+            core::ptr::copy_nonoverlapping(ptr as *const u8, out.as_mut_ptr(), len as usize)
+        })
+    };
     true
 }
 

@@ -15,7 +15,7 @@ def main():
     tmp = tempfile.mkdtemp()
     sock_path, dump = os.path.join(tmp, "mon.sock"), os.path.join(tmp, "vga.bin")
     q = subprocess.Popen(["qemu-system-x86_64", "-drive", f"format=raw,file={IMG}",
-                          "-display", "none", "-serial", "null", "-no-reboot",
+                          "-cpu", "max", "-display", "none", "-serial", "null", "-no-reboot",
                           "-monitor", f"unix:{sock_path},server,nowait"])
     try:
         for _ in range(100):
@@ -30,21 +30,25 @@ def main():
             for ch in s:
                 mon("sendkey " + KEYNAMES.get(ch, ch)); time.sleep(0.05)
         time.sleep(3)
-        type_("help\n"); type_("echo hix\b\n"); type_("bogus\n")
-        type_("help me\n"); type_("uptime\n"); type_("security\n")
-        type_("run hello\n"); type_("run evil\n"); type_("run spin\n"); time.sleep(2); type_("run nope\n")
-        time.sleep(1)
-        mon(f'pmemsave 0xb8000 4000 "{dump}"'); time.sleep(1)
-        d = open(dump, "rb").read()
+        snaps = []
+        def snap():
+            """Dump the VGA text buffer; the screen only holds 25 rows, so
+            several snapshots are taken and checked together."""
+            mon(f'pmemsave 0xb8000 4000 "{dump}"'); time.sleep(1)
+            d = open(dump, "rb").read()
+            snaps.extend("".join(chr(d[(r*80+c)*2]) if 32 <= d[(r*80+c)*2] < 127 else "." for c in range(80)).rstrip()
+                         for r in range(25))
+        type_("help\n"); type_("echo hix\b\n"); type_("bogus\n"); type_("help me\n"); snap()
+        type_("uptime\n"); type_("security\n"); snap()
+        type_("run hello\n"); type_("run evil\n"); snap()
+        type_("run spin\n"); time.sleep(2); type_("run nope\n"); snap()
     finally:
         q.terminate(); q.wait()
-    rows = ["".join(chr(d[(r*80+c)*2]) if 32 <= d[(r*80+c)*2] < 127 else "." for c in range(80)).rstrip()
-            for r in range(25)]
-    screen = "\n".join(rows)
-    print(screen)
-    expected = ["l_os> echo hi", "\nhi\n", "unknown command: bogus",
-                "help: unexpected arguments", "ticks (~", "no NIC driver", "ring 3",
-                "hello from ring 3", "[process exited with code 18]", "illegal memory access",
+    screen = "\n".join(snaps)
+    print("\n".join(snaps[-25:]))
+    expected = ["l_os> echo hi", "\nhi\n", "unknown command: bogus", "help: unexpected arguments",
+                "ticks (~", "no NIC driver", "ring 3", "SMEP on, SMAP on", "hello from ring 3",
+                "[process exited with code 18]", "illegal memory access",
                 "exceeded its time budget", "unknown program 'nope'"]
     missing = [e for e in expected if e not in screen]
     if missing:
