@@ -35,8 +35,40 @@ pub const SYS_READ_KEY: u64 = 9;
 /// `sysinfo(system_handle, what)`: 0 = ticks since boot, 1 = CPU feature bits.
 pub const SYS_SYSINFO: u64 = 10;
 
+/// `random(random_handle, ptr, len)`: fill a user buffer with hardware randomness
+/// (at most 256 bytes per call); fails if no hardware generator works.
+pub const SYS_RANDOM: u64 = 11;
+/// `net_connect(net_handle, host_ptr, host_len, port)`: open a TCP connection to
+/// `host:port`. Needs a `NetClient` handle AND a live grant for exactly that
+/// destination (and, for names, for the DNS resolver). Returns a socket handle.
+pub const SYS_NET_CONNECT: u64 = 12;
+/// `sock_send(sock, ptr, len)`: returns bytes accepted (>0).
+pub const SYS_SOCK_SEND: u64 = 13;
+/// `sock_recv(sock, ptr, max_len)`: returns bytes read; 0 = connection closed.
+pub const SYS_SOCK_RECV: u64 = 14;
+/// `netctl(manager, op, ptr, len, arg)`: management by the trusted shell.
+pub const SYS_NETCTL: u64 = 15;
+
+pub const NETCTL_STATUS: u64 = 0;
+pub const NETCTL_DEVICE: u64 = 1;
+pub const NETCTL_GRANT: u64 = 2;
+pub const NETCTL_REVOKE: u64 = 3;
+pub const NETCTL_REVOKE_ALL: u64 = 4;
+pub const NETCTL_LIST: u64 = 5;
+pub const NETCTL_STATS: u64 = 6;
+pub const NETCTL_SET_RESOLVER: u64 = 7;
+pub const NETCTL_GET_RESOLVER: u64 = 8;
+
+pub const NET_STATUS_PRESENT: u64 = 1;
+pub const NET_STATUS_UP: u64 = 2;
+
+pub const MAX_RANDOM_LEN: u64 = 256;
+
 pub const SYSINFO_TICKS: u64 = 0;
 pub const SYSINFO_CPU: u64 = 1;
+/// Wall-clock seconds since the Unix epoch from the RTC, or an error if the
+/// RTC is unreadable or implausible.
+pub const SYSINFO_WALL_CLOCK: u64 = 2;
 pub const CPU_SMEP: u64 = 1;
 pub const CPU_SMAP: u64 = 2;
 
@@ -54,12 +86,29 @@ pub const ERR_TABLE_FULL: i64 = -7;
 pub const ERR_NO_SLOT: i64 = -8;
 /// Not a child of the caller (or already reaped).
 pub const ERR_NOT_CHILD: i64 = -9;
+/// DNS lookup needed but the resolver itself is not authorized.
+pub const DENIED_DNS_RESOLVER: i64 = -13;
+pub const ERR_NO_DEVICE: i64 = -14;
+pub const ERR_DNS_FAILED: i64 = -15;
+pub const ERR_CONNECT_FAILED: i64 = -16;
+pub const ERR_TIMEOUT: i64 = -17;
+/// The authorization for this connection ended (revoked or expired).
+pub const ERR_REVOKED: i64 = -18;
+pub const ERR_NO_ENTROPY: i64 = -19;
+pub const ERR_NO_CLOCK: i64 = -20;
 pub const DENIED_NO_GRANT: i64 = -10;
 pub const DENIED_EXPIRED: i64 = -11;
 pub const DENIED_INVALID_DESTINATION: i64 = -12;
 
 pub const MAX_WRITE_LEN: u64 = 256;
 pub const MAX_HOST_ARG_LEN: u64 = 253;
+
+/// Top of every process's stack (the stack grows down from here).
+pub const USER_STACK_TOP: u64 = 0x_7000_0010_0000;
+/// Program arguments live at a fixed spot in the top stack page: a
+/// little-endian u64 length followed by that many bytes.
+pub const ARGS_ADDR: u64 = USER_STACK_TOP - 512;
+pub const ARGS_MAX: usize = 500;
 
 /// First address that is not user space (canonical lower half ends here).
 pub const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;

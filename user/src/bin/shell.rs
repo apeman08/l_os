@@ -110,7 +110,7 @@ fn run_program(out: &mut Console, name: &str) {
     let write_only = Rights::WRITE.bits() as u64;
     let grants: &[(u64, u64)] = if needs_console { &[(h::CONSOLE, write_only)] } else { &[] };
 
-    let pid = spawn(h::SPAWNER, id, grants, CHILD_BUDGET_TICKS);
+    let pid = spawn(h::SPAWNER, id, grants, &[], CHILD_BUDGET_TICKS);
     if pid < 0 {
         println!(out, "run failed (error {})", pid);
         return;

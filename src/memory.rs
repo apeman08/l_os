@@ -49,6 +49,60 @@ impl BootInfoFrameAllocator {
     }
 }
 
+impl BootInfoFrameAllocator {
+    /// Next frame straight from the boot memory map (never from the free list).
+    fn take_fresh(&mut self) -> Option<u64> {
+        let map = self.memory_map;
+        self.cursor.next_frame(|i| {
+            map.iter().nth(i).map(|r| Region {
+                start: r.range.start_addr(),
+                end: r.range.end_addr(),
+                usable: r.region_type == MemoryRegionType::Usable,
+            })
+        })
+    }
+
+    /// Mark `addr` allocated and hand out a zeroed frame; `None` if it lies
+    /// beyond the tracked range (>4 GiB), which is refused rather than lost.
+    fn claim(&mut self, addr: u64) -> Option<PhysFrame> {
+        if !ALLOCATED.lock().mark_allocated(addr / 4096) {
+            assert!(addr / 4096 >= FrameBitmap::<TRACKED_FRAMES_WORDS>::CAPACITY, "frame handed out twice");
+            return None;
+        }
+        // SAFETY: the frame was just taken exclusively; stale data (including
+        // the free-list pointer) must not leak to the next owner.
+        unsafe { core::ptr::write_bytes(self.frame_ptr(addr), 0, 4096) };
+        FRAMES_ALLOCATED.fetch_add(1, Ordering::Relaxed);
+        Some(PhysFrame::containing_address(PhysAddr::new(addr)))
+    }
+
+    /// Allocate `n` physically contiguous, zeroed frames (for DMA rings).
+    /// Frames that do not fit a run are returned to the free list.
+    pub fn allocate_contiguous(&mut self, n: usize) -> Option<PhysFrame> {
+        use x86_64::structures::paging::FrameDeallocator as _;
+        let mut run: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(n);
+        while run.len() < n {
+            let addr = self.take_fresh()?;
+            if let Some(&last) = run.last() {
+                if addr != last + 4096 {
+                    // Break in contiguity: give the partial run back, restart.
+                    for a in run.drain(..) {
+                        let f = self.claim(a)?;
+                        // SAFETY: claimed just above and never mapped anywhere.
+                        unsafe { self.deallocate_frame(f) };
+                    }
+                }
+            }
+            run.push(addr);
+        }
+        let first = run[0];
+        for a in run {
+            self.claim(a)?;
+        }
+        Some(PhysFrame::containing_address(PhysAddr::new(first)))
+    }
+}
+
 // SAFETY: a frame is returned only if it is marked free in the bitmap (or was
 // never handed out by the cursor); marking it allocated happens before it is
 // returned, so no frame is returned twice.
@@ -61,26 +115,9 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
             self.free_head = unsafe { (self.frame_ptr(addr) as *const u64).read() };
             addr
         } else {
-            let map = self.memory_map;
-            self.cursor.next_frame(|i| {
-                map.iter().nth(i).map(|r| Region {
-                    start: r.range.start_addr(),
-                    end: r.range.end_addr(),
-                    usable: r.region_type == MemoryRegionType::Usable,
-                })
-            })?
+            self.take_fresh()?
         };
-        if !ALLOCATED.lock().mark_allocated(addr / 4096) {
-            // Beyond the tracked range (>4 GiB): refuse rather than lose track.
-            // (A frame already marked allocated would be an allocator bug.)
-            assert!(addr / 4096 >= FrameBitmap::<TRACKED_FRAMES_WORDS>::CAPACITY, "frame handed out twice");
-            return None;
-        }
-        // SAFETY: the frame was just taken exclusively; stale data (including
-        // the free-list pointer) must not leak to the next owner.
-        unsafe { core::ptr::write_bytes(self.frame_ptr(addr), 0, 4096) };
-        FRAMES_ALLOCATED.fetch_add(1, Ordering::Relaxed);
-        Some(PhysFrame::containing_address(PhysAddr::new(addr)))
+        self.claim(addr)
     }
 }
 

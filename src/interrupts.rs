@@ -40,6 +40,10 @@ lazy_static! {
         idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+        // PCI interrupt lines the virtio NIC may be routed to (QEMU: 10 or 11).
+        idt[PIC_1_OFFSET + 9].set_handler_fn(nic_irq9);
+        idt[PIC_1_OFFSET + 10].set_handler_fn(nic_irq10);
+        idt[PIC_1_OFFSET + 11].set_handler_fn(nic_irq11);
         idt
     };
 }
@@ -171,7 +175,28 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
     // After EOI and with no locks held: a runaway user process may be killed.
+    crate::sched::wake_net();
     crate::sched::on_tick(from_user(&stack_frame));
+}
+
+fn nic_interrupt(irq: u8) {
+    // Reading the device's ISR register acknowledges it; then let waiting
+    // processes poll the stack (the stack itself is never touched here).
+    if crate::virtio_net::acknowledge_irq() {
+        crate::sched::wake_net();
+    }
+    // SAFETY: EOI for the vector currently being serviced.
+    unsafe { PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET + irq) };
+}
+
+extern "x86-interrupt" fn nic_irq9(_: InterruptStackFrame) {
+    nic_interrupt(9);
+}
+extern "x86-interrupt" fn nic_irq10(_: InterruptStackFrame) {
+    nic_interrupt(10);
+}
+extern "x86-interrupt" fn nic_irq11(_: InterruptStackFrame) {
+    nic_interrupt(11);
 }
 
 extern "x86-interrupt" fn  breakpoint_handler(stack_frame: InterruptStackFrame) {

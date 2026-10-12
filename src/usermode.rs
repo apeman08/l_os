@@ -26,7 +26,7 @@ use x86_64::{
 };
 
 pub const USER_CODE_ADDR: u64 = 0x_7000_0000_0000;
-pub const USER_STACK_TOP: u64 = 0x_7000_0010_0000;
+pub use l_core::syscall::{ARGS_ADDR, ARGS_MAX, USER_STACK_TOP};
 pub const USER_STACK_PAGES: u64 = 8;
 /// ELF segments must lie in `[USER_IMAGE_START, USER_IMAGE_END)`; one unmapped
 /// guard page separates the image from the stack.
@@ -52,7 +52,10 @@ macro_rules! user_elfs {
     };
 }
 
-user_elfs!(shell, hello_rs, spawn_probe, key_probe, fault_write_code, fault_exec_stack, fault_write_rodata);
+user_elfs!(
+    shell, hello_rs, spawn_probe, key_probe, fault_write_code, fault_exec_stack, fault_write_rodata,
+    tcp_probe, tcp_hold, revoker,
+);
 
 global_asm!(
     r#"
@@ -125,6 +128,8 @@ pub struct Spec<'a> {
     pub program: Program<'a>,
     pub handles: &'a [(Object, Rights)],
     pub budget_ticks: u64,
+    /// Copied to [`ARGS_ADDR`] in the new process (at most [`ARGS_MAX`] bytes).
+    pub args: &'a [u8],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,14 +191,18 @@ fn build_process(
     handles: &[(Object, Rights)],
     budget_ticks: u64,
     parent: Option<u32>,
+    args: &[u8],
 ) -> Result<Box<Process>, RunError> {
+    if args.len() > ARGS_MAX {
+        return Err(RunError::TooLarge);
+    }
     let table = build_table(handles)?;
     let l4 = memory::create_address_space(mem).map_err(|_| RunError::NoMemory)?;
-    match populate(mem, l4, program) {
+    match populate(mem, l4, program, args) {
         Ok(entry) => {
             let id = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-            // 8 bytes below the top: the ABI expects rsp % 16 == 8 at function entry.
-            Ok(Process::new(id, parent, table, budget_ticks, l4, entry, USER_STACK_TOP - 8))
+            // Just below the arguments; rsp % 16 == 8 as the ABI expects at function entry.
+            Ok(Process::new(id, parent, table, budget_ticks, l4, entry, ARGS_ADDR - 8))
         }
         Err(e) => {
             memory::destroy_address_space(mem, l4);
@@ -209,7 +218,7 @@ fn map_page(
     addr: u64,
     flags: PageTableFlags,
     init: &[u8],
-) -> Result<(), RunError> {
+) -> Result<PhysFrame, RunError> {
     let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
     let frame: PhysFrame = mem.frames.allocate_frame().ok_or(RunError::NoMemory)?; // zeroed
@@ -231,11 +240,11 @@ fn map_page(
     unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut mem.frames) }
         .map_err(|_| RunError::NoMemory)?
         .ignore(); // not the active address space: nothing to flush
-    Ok(())
+    Ok(frame)
 }
 
 /// Map the program image and the stack; returns the entry address.
-fn populate(mem: &mut Memory, l4: PhysFrame, program: Program) -> Result<u64, RunError> {
+fn populate(mem: &mut Memory, l4: PhysFrame, program: Program, args: &[u8]) -> Result<u64, RunError> {
     // SAFETY: `l4` was just created by create_address_space and is not active.
     let mut mapper = unsafe { memory::mapper_for(l4) };
     let user = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
@@ -280,7 +289,17 @@ fn populate(mem: &mut Memory, l4: PhysFrame, program: Program) -> Result<u64, Ru
     let rw = user | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
     let stack_base = USER_STACK_TOP - USER_STACK_PAGES * 4096;
     for i in 0..USER_STACK_PAGES {
-        map_page(mem, &mut mapper, stack_base + i * 4096, rw, &[])?;
+        let frame = map_page(mem, &mut mapper, stack_base + i * 4096, rw, &[])?;
+        if i == USER_STACK_PAGES - 1 {
+            // Arguments go into the top page, through the kernel's mapping.
+            let base = (memory::phys_offset() + frame.start_address().as_u64() + (ARGS_ADDR % 4096)).as_mut_ptr::<u8>();
+            // SAFETY: the frame is exclusively ours; ARGS_ADDR % 4096 + 8 +
+            // ARGS_MAX stays inside the 4096-byte page (checked by the caller).
+            unsafe {
+                (base as *mut u64).write_unaligned(args.len() as u64);
+                core::ptr::copy_nonoverlapping(args.as_ptr(), base.add(8), args.len());
+            }
+        }
     }
     Ok(entry)
 }
@@ -292,12 +311,13 @@ pub fn spawn_child(
     program: Program,
     handles: &[(Object, Rights)],
     budget_ticks: u64,
+    args: &[u8],
 ) -> Result<u32, i64> {
     use l_core::syscall::{ERR_INVALID, ERR_NO_SLOT, ERR_TABLE_FULL};
 
     let mut guard = memory::MEMORY.lock();
     let mem = guard.as_mut().ok_or(ERR_INVALID)?;
-    let proc = build_process(mem, program, handles, budget_ticks, Some(parent_pid)).map_err(|e| match e {
+    let proc = build_process(mem, program, handles, budget_ticks, Some(parent_pid), args).map_err(|e| match e {
         RunError::BadHandles => ERR_TABLE_FULL,
         _ => ERR_INVALID,
     })?;
@@ -328,7 +348,7 @@ pub fn run_all(specs: &[Spec]) -> Result<Vec<ProcessResult>, RunError> {
     if specs.len() > sched::MAX_PROCS {
         return Err(RunError::TooMany);
     }
-    if specs.iter().any(|s| matches!(s.program, Program::Raw(c) if c.is_empty() || c.len() > 4096)) {
+    if specs.iter().any(|s| s.args.len() > ARGS_MAX || matches!(s.program, Program::Raw(c) if c.is_empty() || c.len() > 4096)) {
         return Err(RunError::TooLarge);
     }
     if RUNNING.swap(true, Ordering::SeqCst) {
@@ -350,7 +370,7 @@ fn run_all_inner(specs: &[Spec]) -> Result<Vec<ProcessResult>, RunError> {
         let mut guard = memory::MEMORY.lock();
         let mem = guard.as_mut().ok_or(RunError::NoMemory)?;
         for spec in specs {
-            match build_process(mem, spec.program, spec.handles, spec.budget_ticks, None) {
+            match build_process(mem, spec.program, spec.handles, spec.budget_ticks, None, spec.args) {
                 Ok(p) => {
                     ids.push(p.id);
                     procs.push(p);
@@ -386,7 +406,7 @@ fn run_all_inner(specs: &[Spec]) -> Result<Vec<ProcessResult>, RunError> {
 
 /// Run one program; see [`run_all`].
 pub fn run(program: &[u8], handles: &[(Object, Rights)], budget_ticks: u64) -> Result<Outcome, RunError> {
-    let mut r = run_all(&[Spec { program: Program::Raw(program), handles, budget_ticks }])?;
+    let mut r = run_all(&[Spec { program: Program::Raw(program), handles, budget_ticks, args: &[] }])?;
     Ok(r.remove(0).outcome)
 }
 

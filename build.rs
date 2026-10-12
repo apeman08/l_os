@@ -36,7 +36,13 @@ fn main() {
             // Position-independent code because the user window is far above
             // 4 GiB (the target's small code model cannot reach it); the
             // output stays a static, non-relocated ET_EXEC.
-            format!("-C link-arg=-T{} -C relocation-model=pic -C link-arg=--no-pie", link_script.display()),
+            format!(
+                "-C link-arg=-T{} -C relocation-model=pic -C link-arg=--no-pie {}",
+                link_script.display(),
+                // The target has no SSE: force the portable (constant-time)
+                // software backends of the RustCrypto crates.
+                r#"--cfg curve25519_dalek_backend="serial" --cfg polyval_force_soft --cfg aes_force_soft --cfg chacha20_force_soft --cfg poly1305_force_soft --cfg sha2_backend="soft" --cfg ghash_force_soft"#
+            ),
         )
         .args(["build", "--release", "--locked", "--bins", "--manifest-path"])
         .arg(user.join("Cargo.toml"))
@@ -46,7 +52,7 @@ fn main() {
         .arg(&target_dir)
         .args([
             "-Zjson-target-spec",
-            "-Zbuild-std=core,compiler_builtins",
+            "-Zbuild-std=core,alloc,compiler_builtins",
             "-Zbuild-std-features=compiler-builtins-mem",
         ]);
     let output = cmd.output().expect("failed to launch cargo for the user programs");

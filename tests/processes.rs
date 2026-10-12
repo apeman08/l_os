@@ -35,7 +35,7 @@ const NONE: Handles = &[];
 const CONSOLE: Handles = &[(Object::Console, Rights::WRITE)];
 
 fn spec<'a>(program: &'a [u8], handles: &'a [(Object, Rights)], budget_ticks: u64) -> Spec<'a> {
-    Spec { program: Program::Raw(program), handles, budget_ticks }
+    Spec { program: Program::Raw(program), handles, budget_ticks, args: &[] }
 }
 
 #[test_case]

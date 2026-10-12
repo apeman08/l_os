@@ -49,32 +49,55 @@ impl Drop for Server {
     }
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// Unique per test process and per call (parallel tests must never share a
+/// port), and verified free right now.
+fn pick_port() -> u16 {
+    use std::sync::atomic::Ordering;
+    let _ = NEXT_PORT.compare_exchange(0, 20000 + (std::process::id() % 20000) as u16, Ordering::SeqCst, Ordering::SeqCst);
+    loop {
+        let p = NEXT_PORT.fetch_add(1, Ordering::SeqCst);
+        if p < 1024 || p > 60000 {
+            NEXT_PORT.store(20000, Ordering::SeqCst);
+            continue;
+        }
+        if TcpListener::bind(("127.0.0.1", p)).is_ok() {
+            return p;
+        }
+    }
 }
 
 /// Start `openssl s_server` serving a status page over TLS.
 pub fn s_server(cert: &str, key: &str, version_flag: &str) -> Server {
-    let port = free_port();
     let dir = fixtures();
-    let child = Command::new("openssl")
-        .args(["s_server", "-accept", &port.to_string(), "-cert"])
-        .arg(dir.join(cert))
-        .arg("-key")
-        .arg(dir.join(key))
-        .args([version_flag, "-www", "-quiet"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("openssl s_server");
-    let server = Server { child, port };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "s_server did not start");
-        std::thread::sleep(Duration::from_millis(50));
+    for _attempt in 0..5 {
+        let port = pick_port();
+        let child = Command::new("openssl")
+            .args(["s_server", "-accept", &port.to_string(), "-cert"])
+            .arg(dir.join(cert))
+            .arg("-key")
+            .arg(dir.join(key))
+            .args([version_flag, "-www", "-quiet"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("openssl s_server");
+        let mut server = Server { child, port };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(Some(_)) = server.child.try_wait() {
+                break; // died (port taken?): try another port
+            }
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return server;
+            }
+            assert!(Instant::now() < deadline, "s_server did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
-    server
+    panic!("could not start s_server");
 }
 
 pub fn connect_tcp(port: u16) -> Tcp {

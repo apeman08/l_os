@@ -124,7 +124,12 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64,
         }
         abi::SYS_EXIT => usermode::terminate_current(Outcome::Exited(a0 as u16)),
         abi::SYS_CLOSE => match sched::with_handles(|t| t.close(a0)) {
-            Some(Ok(())) => 0,
+            Some(Ok(object)) => {
+                if let (Object::Socket(slot), Some(pid)) = (object, sched::current_pid()) {
+                    crate::net::close(slot, pid, false);
+                }
+                0
+            }
             Some(Err(e)) => handle_err(e),
             None => abi::ERR_BAD_HANDLE,
         },
@@ -136,6 +141,11 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64,
         abi::SYS_WAIT => sys_wait(a0),
         abi::SYS_READ_KEY => sys_read_key(a0),
         abi::SYS_SYSINFO => sys_sysinfo(a0, a1),
+        abi::SYS_RANDOM => sys_random(a0, a1, a2),
+        abi::SYS_NET_CONNECT => sys_net_connect(a0, a1, a2, a3),
+        abi::SYS_SOCK_SEND => sys_sock_send(a0, a1, a2),
+        abi::SYS_SOCK_RECV => sys_sock_recv(a0, a1, a2),
+        abi::SYS_NETCTL => sys_netctl(a0, a1, a2, a3, a4),
         _ => abi::ERR_NO_SYSCALL,
     }
 }
@@ -290,11 +300,19 @@ fn sys_sysinfo(handle: u64, what: u64) -> i64 {
             (if crate::cpu::smep_enabled() { abi::CPU_SMEP } else { 0 }
                 | if crate::cpu::smap_enabled() { abi::CPU_SMAP } else { 0 }) as i64
         }
+        abi::SYSINFO_WALL_CLOCK => match crate::rtc::unix_time() {
+            Some(t) => t as i64,
+            None => abi::ERR_NO_CLOCK,
+        },
         _ => abi::ERR_INVALID,
     }
 }
 
-fn sys_spawn(spawner: u64, program: u64, grants_ptr: u64, grants_len: u64, budget: u64) -> i64 {
+fn sys_spawn(spawner: u64, program: u64, grants_ptr: u64, packed: u64, budget: u64) -> i64 {
+    // `packed`: low 8 bits = number of grants, the rest = length of the
+    // argument bytes that follow the grant list in the same user buffer.
+    let grants_len = packed & 0xff;
+    let args_len = packed >> 8;
     let mask = match lookup(spawner, Rights::USE) {
         Ok((Object::Spawner(mask), _)) => mask,
         Ok(_) => return abi::ERR_NO_RIGHTS,
@@ -305,15 +323,17 @@ fn sys_spawn(spawner: u64, program: u64, grants_ptr: u64, grants_len: u64, budge
         return abi::ERR_NO_RIGHTS;
     }
     let Some(image) = usermode::builtin(program as u16) else { return abi::ERR_INVALID };
-    if grants_len > abi::MAX_SPAWN_GRANTS || budget == 0 {
+    if grants_len > abi::MAX_SPAWN_GRANTS || budget == 0 || args_len as usize > usermode::ARGS_MAX {
         return abi::ERR_INVALID;
     }
-    // Read the grant list: (parent_handle, rights_mask) pairs of u64.
-    let mut raw = [0u8; abi::MAX_SPAWN_GRANTS as usize * 16];
-    let bytes = grants_len as usize * 16;
+    // Read the grant list ((parent_handle, rights_mask) pairs of u64) and the
+    // arguments that follow it.
+    let mut raw = [0u8; abi::MAX_SPAWN_GRANTS as usize * 16 + usermode::ARGS_MAX];
+    let bytes = grants_len as usize * 16 + args_len as usize;
     if bytes > 0 && !copy_from_user(grants_ptr, bytes as u64, &mut raw) {
         return abi::ERR_BAD_POINTER;
     }
+    let args_start = grants_len as usize * 16;
     // Derive every grant from the parent's own table: needs GRANT, only narrows.
     let mut granted = [(Object::Console, Rights::NONE); abi::MAX_SPAWN_GRANTS as usize];
     for i in 0..grants_len as usize {
@@ -328,7 +348,7 @@ fn sys_spawn(spawner: u64, program: u64, grants_ptr: u64, grants_len: u64, budge
     let Some(parent) = sched::current_pid() else { return abi::ERR_BAD_HANDLE };
     // A child can never be given more CPU time than its parent has left.
     let budget = budget.min(sched::current_remaining_budget());
-    match usermode::spawn_child(parent, image, &granted[..grants_len as usize], budget) {
+    match usermode::spawn_child(parent, image, &granted[..grants_len as usize], budget, &raw[args_start..args_start + args_len as usize]) {
         Ok(pid) => pid as i64,
         Err(e) => e,
     }
@@ -347,5 +367,220 @@ fn sys_wait(pid: u64) -> i64 {
             }
             sched::Reap::StillRunning => sched::block_on_child(pid),
         }
+    }
+}
+
+fn sys_random(handle: u64, ptr: u64, len: u64) -> i64 {
+    match lookup(handle, Rights::READ) {
+        Ok((Object::Random, _)) => {}
+        Ok(_) => return abi::ERR_NO_RIGHTS,
+        Err(e) => return e,
+    }
+    if len == 0 || len > abi::MAX_RANDOM_LEN {
+        return abi::ERR_INVALID;
+    }
+    let mut buf = [0u8; abi::MAX_RANDOM_LEN as usize];
+    if !crate::rng::fill(&mut buf[..len as usize]) {
+        return abi::ERR_NO_ENTROPY; // never substitute weaker bytes
+    }
+    if !copy_to_user(ptr, &buf[..len as usize]) {
+        return abi::ERR_BAD_POINTER;
+    }
+    len as i64
+}
+
+fn sys_net_connect(handle: u64, ptr: u64, len: u64, port: u64) -> i64 {
+    match lookup(handle, Rights::USE) {
+        Ok((Object::NetClient, _)) => {}
+        Ok(_) => return abi::ERR_NO_RIGHTS,
+        Err(e) => return e,
+    }
+    if len == 0 || len > abi::MAX_HOST_ARG_LEN || port == 0 || port > u16::MAX as u64 {
+        return abi::ERR_INVALID;
+    }
+    let mut buf = [0u8; abi::MAX_HOST_ARG_LEN as usize];
+    if !copy_from_user(ptr, len, &mut buf) {
+        return abi::ERR_BAD_POINTER;
+    }
+    let Ok(host) = core::str::from_utf8(&buf[..len as usize]) else { return abi::ERR_INVALID };
+    let Some(pid) = sched::current_pid() else { return abi::ERR_BAD_HANDLE };
+
+    // The policy check, DNS, bring-up and the TCP handshake all happen inside.
+    let slot = match crate::net::connect(host, port as u16, pid) {
+        Ok(slot) => slot,
+        Err(e) => return e,
+    };
+    match sched::with_handles(|t| t.insert(Object::Socket(slot), Rights::READ.union(Rights::WRITE))) {
+        Some(Ok(h)) => h as i64,
+        _ => {
+            crate::net::close(slot, pid, true);
+            abi::ERR_TABLE_FULL
+        }
+    }
+}
+
+const SOCK_IO_MAX: usize = 2048;
+
+fn socket_slot(handle: u64, needed: Rights) -> Result<u16, i64> {
+    match lookup(handle, needed) {
+        Ok((Object::Socket(slot), _)) => Ok(slot),
+        Ok(_) => Err(abi::ERR_NO_RIGHTS),
+        Err(e) => Err(e),
+    }
+}
+
+fn sys_sock_send(handle: u64, ptr: u64, len: u64) -> i64 {
+    let slot = match socket_slot(handle, Rights::WRITE) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    if len == 0 || len > SOCK_IO_MAX as u64 {
+        return abi::ERR_INVALID;
+    }
+    let mut buf = [0u8; SOCK_IO_MAX];
+    if !copy_from_user(ptr, len, &mut buf) {
+        return abi::ERR_BAD_POINTER;
+    }
+    let Some(pid) = sched::current_pid() else { return abi::ERR_BAD_HANDLE };
+    match crate::net::send(slot, pid, &buf[..len as usize]) {
+        Ok(n) => n as i64,
+        Err(e) => e,
+    }
+}
+
+fn sys_sock_recv(handle: u64, ptr: u64, max_len: u64) -> i64 {
+    let slot = match socket_slot(handle, Rights::READ) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    if max_len == 0 || max_len > SOCK_IO_MAX as u64 {
+        return abi::ERR_INVALID;
+    }
+    if !user_buffer_writable(ptr, max_len) {
+        return abi::ERR_BAD_POINTER;
+    }
+    let mut buf = [0u8; SOCK_IO_MAX];
+    let Some(pid) = sched::current_pid() else { return abi::ERR_BAD_HANDLE };
+    match crate::net::recv(slot, pid, &mut buf[..max_len as usize]) {
+        Ok(0) => 0,
+        Ok(n) => {
+            if !copy_to_user(ptr, &buf[..n]) {
+                return abi::ERR_BAD_POINTER;
+            }
+            n as i64
+        }
+        Err(e) => e,
+    }
+}
+
+/// Copy `text` into the user buffer (truncated to `len`); returns bytes written.
+fn put_text(ptr: u64, len: u64, text: &str) -> i64 {
+    let n = text.len().min(len as usize);
+    if n == 0 {
+        return 0;
+    }
+    if copy_to_user(ptr, &text.as_bytes()[..n]) { n as i64 } else { abi::ERR_BAD_POINTER }
+}
+
+fn sys_netctl(handle: u64, op: u64, ptr: u64, len: u64, arg: u64) -> i64 {
+    match lookup(handle, Rights::USE) {
+        Ok((Object::NetManager, _)) => {}
+        Ok(_) => return abi::ERR_NO_RIGHTS,
+        Err(e) => return e,
+    }
+    // Operations that take a host string in (ptr, len).
+    let read_host = |buf: &mut [u8; 253]| -> Result<usize, i64> {
+        if len == 0 || len > 253 {
+            return Err(abi::ERR_INVALID);
+        }
+        if !copy_from_user(ptr, len, buf) {
+            return Err(abi::ERR_BAD_POINTER);
+        }
+        Ok(len as usize)
+    };
+    match op {
+        abi::NETCTL_STATUS => {
+            let st = crate::net::status();
+            ((st.nic_present as u64 * abi::NET_STATUS_PRESENT) | (st.nic_up as u64 * abi::NET_STATUS_UP)) as i64
+        }
+        abi::NETCTL_DEVICE => match crate::net::describe_device(arg as usize) {
+            Some(line) => put_text(ptr, len, &line),
+            None => abi::ERR_INVALID,
+        },
+        abi::NETCTL_GRANT => {
+            let mut buf = [0u8; 253];
+            let n = match read_host(&mut buf) {
+                Ok(n) => n,
+                Err(e) => return e,
+            };
+            let Ok(host) = core::str::from_utf8(&buf[..n]) else { return abi::ERR_INVALID };
+            let (port, duration) = ((arg & 0xffff) as u16, arg >> 16);
+            let expires = if duration == 0 { None } else { Some(crate::time::ticks().saturating_add(duration)) };
+            match usermode::POLICY.lock().grant(host, port, expires) {
+                Ok(()) => 0,
+                Err(l_core::policy::PolicyError::TableFull) => abi::ERR_TABLE_FULL,
+                Err(_) => abi::ERR_INVALID,
+            }
+        }
+        abi::NETCTL_REVOKE => {
+            let mut buf = [0u8; 253];
+            let n = match read_host(&mut buf) {
+                Ok(n) => n,
+                Err(e) => return e,
+            };
+            let Ok(host) = core::str::from_utf8(&buf[..n]) else { return abi::ERR_INVALID };
+            let existed = usermode::POLICY.lock().revoke(host, (arg & 0xffff) as u16);
+            crate::net::policy_changed(); // resets connections that lost their grant
+            existed as i64
+        }
+        abi::NETCTL_REVOKE_ALL => {
+            usermode::POLICY.lock().revoke_all();
+            crate::net::policy_changed();
+            0
+        }
+        abi::NETCTL_LIST => {
+            let now = crate::time::ticks();
+            // Format while holding the lock, write to user memory after releasing it.
+            let text = {
+                let policy = usermode::POLICY.lock();
+                policy.grants().nth(arg as usize).map(|(host, port, expires)| match expires {
+                    None => alloc::format!("{}:{} until revoked", host, port),
+                    Some(t) => alloc::format!(
+                        "{}:{} for {} more s",
+                        host,
+                        port,
+                        l_core::time::approx_seconds(t.saturating_sub(now))
+                    ),
+                })
+            };
+            match text {
+                Some(text) => put_text(ptr, len, &text),
+                None => abi::ERR_INVALID,
+            }
+        }
+        abi::NETCTL_STATS => {
+            let (tx, rx) = crate::virtio_net::counters();
+            ((tx & 0xffff_ffff) | (rx & 0x7fff_ffff) << 32) as i64
+        }
+        abi::NETCTL_SET_RESOLVER => {
+            let mut buf = [0u8; 253];
+            let n = match read_host(&mut buf) {
+                Ok(n) => n,
+                Err(e) => return e,
+            };
+            let Some(ip) = core::str::from_utf8(&buf[..n]).ok().and_then(crate::net::parse_ipv4) else {
+                return abi::ERR_INVALID;
+            };
+            if arg == 0 || arg > u16::MAX as u64 {
+                return abi::ERR_INVALID;
+            }
+            crate::net::set_resolver(ip, arg as u16);
+            0
+        }
+        abi::NETCTL_GET_RESOLVER => {
+            let (ip, port) = crate::net::resolver();
+            put_text(ptr, len, &alloc::format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port))
+        }
+        _ => abi::ERR_INVALID,
     }
 }

@@ -76,6 +76,8 @@ enum State {
     BlockedWait(u32),
     /// Waiting for a keyboard scancode (woken by the keyboard interrupt).
     BlockedKey,
+    /// Waiting for network progress (woken by the NIC interrupt and the timer).
+    BlockedNet,
     Zombie,
 }
 
@@ -190,8 +192,9 @@ impl Scheduler {
             .find(|&i| matches!(&self.slots[i], Some(p) if p.state == State::Ready))
     }
 
-    fn any_blocked_on_key(&self) -> bool {
-        self.slots.iter().flatten().any(|p| p.state == State::BlockedKey)
+    /// Processes waiting for something only an interrupt can provide.
+    fn any_blocked_on_interrupt(&self) -> bool {
+        self.slots.iter().flatten().any(|p| matches!(p.state, State::BlockedKey | State::BlockedNet))
     }
 
     /// Wake parents waiting for a process that has become a zombie.
@@ -241,7 +244,7 @@ impl Scheduler {
                 self.current = Some(next);
                 return Stop::Switch(self.target(next));
             }
-            if self.any_blocked_on_key() {
+            if self.any_blocked_on_interrupt() {
                 return Stop::Idle;
             }
             if self.kill_unwakeable() {
@@ -397,6 +400,20 @@ pub fn block_on_key() {
     block_current(State::BlockedKey);
 }
 
+/// Wait for network progress (NIC interrupt or the next timer tick).
+pub fn block_on_net() {
+    block_current(State::BlockedNet);
+}
+
+/// NIC interrupt / timer hook: let network waiters poll again.
+pub fn wake_net() {
+    for p in SCHED.lock().slots.iter_mut().flatten() {
+        if p.state == State::BlockedNet {
+            p.state = State::Ready;
+        }
+    }
+}
+
 /// Wait for child `pid` to end.
 pub fn block_on_child(pid: u32) {
     block_current(State::BlockedWait(pid));
@@ -475,6 +492,11 @@ pub fn reap_child(parent_pid: u32, child_pid: u32) -> Reap {
 
 /// End the current process and never return to it.
 pub fn exit_current(outcome: Outcome) -> ! {
+    // Release kernel resources it still holds (open sockets) before it becomes
+    // a zombie, so a connection cannot outlive its owner.
+    if let Some(pid) = current_pid() {
+        crate::net::release_owner(pid);
+    }
     let (cur, save, stop) = {
         let mut s = SCHED.lock();
         let cur = match s.current {

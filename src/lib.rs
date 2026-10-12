@@ -16,6 +16,11 @@ pub mod interrupts;
 pub mod gdt;
 pub mod frames;
 pub mod memory;
+pub mod net;
+pub mod rng;
+pub mod rtc;
+pub mod pci;
+pub mod virtio_net;
 pub mod allocator;
 pub mod input;
 pub mod ipc;
@@ -66,7 +71,7 @@ pub fn run_shell_forever() -> ! {
     let mut quick_failures = 0;
     loop {
         let started = time::ticks();
-        match run_all(&[Spec { program: shell_program(), handles: &handles, budget_ticks: u64::MAX }]) {
+        match run_all(&[Spec { program: shell_program(), handles: &handles, budget_ticks: u64::MAX, args: &[] }]) {
             Ok(results) => println!("\n[shell ended: {:?}; restarting]", results[0].outcome),
             Err(e) => {
                 println!("\ncannot start the shell: {:?}", e);

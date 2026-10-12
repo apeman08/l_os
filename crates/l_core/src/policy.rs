@@ -167,6 +167,14 @@ impl NetPolicy {
         }
     }
 
+    /// Current grants as `(host, port, expires_at)`, in table order.
+    pub fn grants(&self) -> impl Iterator<Item = (&str, u16, Option<u64>)> {
+        self.grants.iter().flatten().map(|g| {
+            // Hosts are validated ASCII, so this cannot fail.
+            (core::str::from_utf8(g.host.as_bytes()).unwrap_or(""), g.port, g.expires_at)
+        })
+    }
+
     pub fn grant_count(&self) -> usize {
         self.grants.iter().flatten().count()
     }
@@ -178,6 +186,7 @@ impl NetPolicy {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use Decision::{Allow, Deny};
 
@@ -279,6 +288,16 @@ mod tests {
         // Freeing a slot makes room again.
         assert!(p.revoke("host.example", 1000));
         p.grant("other.example", 1, None).unwrap();
+    }
+
+    #[test]
+    fn grants_lists_normalized_entries() {
+        let mut p = NetPolicy::new();
+        p.grant("Example.COM", 443, Some(9)).unwrap();
+        p.grant("10.0.2.2", 80, None).unwrap();
+        let mut v: std::vec::Vec<_> = p.grants().collect();
+        v.sort();
+        assert_eq!(v, std::vec![("10.0.2.2", 80, None), ("example.com", 443, Some(9))]);
     }
 
     #[test]

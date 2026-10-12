@@ -34,7 +34,7 @@ const CONSOLE: (Object, Rights) = (Object::Console, Rights::WRITE);
 
 fn run_elf(name: &str, handles: &[(Object, Rights)], budget: u64) -> Outcome {
     let image = user_elf(name).expect("image exists");
-    let spec = Spec { program: Program::Elf(image), handles, budget_ticks: budget };
+    let spec = Spec { program: Program::Elf(image), handles, budget_ticks: budget, args: &[] };
     usermode::run_all(&[spec]).expect("run_all").remove(0).outcome
 }
 
@@ -80,7 +80,7 @@ fn corrupt_images_are_rejected_without_side_effects() {
         ("huge memsz", huge_memsz),
         ("truncated", truncated),
     ] {
-        let spec = Spec { program: Program::Elf(&image), handles: &[], budget_ticks: 10 };
+        let spec = Spec { program: Program::Elf(&image), handles: &[], budget_ticks: 10, args: &[] };
         assert_eq!(usermode::run_all(&[spec]).err(), Some(RunError::BadImage), "{name}");
     }
     assert_eq!(l_os::memory::frames_in_use(), before, "rejected images must not leak frames");

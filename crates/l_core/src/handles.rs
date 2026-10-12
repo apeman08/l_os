@@ -24,6 +24,14 @@ pub enum Object {
     System,
     /// May start built-in programs whose id bit is set in the mask.
     Spawner(u16),
+    /// Manage network authorizations (grant/revoke/list) and inspect the NIC.
+    /// Only the trusted shell holds this; programs never get it.
+    NetManager,
+    /// An open, authorized TCP connection (kernel socket slot). Never
+    /// delegable: it is created without `GRANT`.
+    Socket(u16),
+    /// Hardware random numbers.
+    Random,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,11 +123,18 @@ impl HandleTable {
         Ok((e.object, e.rights))
     }
 
-    pub fn close(&mut self, handle: u64) -> Result<(), HandleError> {
+    /// Close a handle and return the object it named (so the caller can release
+    /// the resource behind it).
+    pub fn close(&mut self, handle: u64) -> Result<Object, HandleError> {
         let index = self.resolve(handle)?;
-        self.slots[index] = None;
+        let object = self.slots[index].take().map(|e| e.object).ok_or(HandleError::Invalid)?;
         self.generation[index] = self.generation[index].wrapping_add(1);
-        Ok(())
+        Ok(object)
+    }
+
+    /// Every object currently held (used to release sockets when a process ends).
+    pub fn objects(&self) -> impl Iterator<Item = Object> + '_ {
+        self.slots.iter().flatten().map(|e| e.object)
     }
 
     /// What may be handed to another process: the entry must carry `GRANT`;
@@ -173,7 +188,7 @@ mod tests {
     fn closed_handle_is_dead_and_reuse_does_not_resurrect_it() {
         let mut t = HandleTable::new();
         let old = t.insert(Object::Console, W).unwrap();
-        t.close(old).unwrap();
+        assert_eq!(t.close(old).unwrap(), Object::Console);
         assert_eq!(t.lookup(old, Rights::NONE), Err(HandleError::Invalid));
         assert_eq!(t.close(old), Err(HandleError::Invalid)); // double close
         let new = t.insert(Object::NetClient, Rights::USE).unwrap(); // reuses slot 0

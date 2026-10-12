@@ -89,15 +89,68 @@ macro_rules! println {
     ($c:expr, $($arg:tt)*) => {{ $crate::print!($c, "{}\n", format_args!($($arg)*)); }};
 }
 
-pub fn spawn(spawner: u64, program: u64, grants: &[(u64, u64)], budget_ticks: u64) -> i64 {
-    // (handle, mask) pairs laid out as consecutive u64s.
-    let mut buf = [0u64; abi::MAX_SPAWN_GRANTS as usize * 2];
+/// Start a built-in program. `grants` are `(my_handle, rights_mask)` pairs the
+/// child receives (narrowed); `args` is copied to the child's argument area.
+pub fn spawn(spawner: u64, program: u64, grants: &[(u64, u64)], args: &[u8], budget_ticks: u64) -> i64 {
+    let mut buf = [0u8; abi::MAX_SPAWN_GRANTS as usize * 16 + abi::ARGS_MAX];
     let n = grants.len().min(abi::MAX_SPAWN_GRANTS as usize);
     for (i, (h, m)) in grants.iter().take(n).enumerate() {
-        buf[2 * i] = *h;
-        buf[2 * i + 1] = *m;
+        buf[16 * i..16 * i + 8].copy_from_slice(&h.to_le_bytes());
+        buf[16 * i + 8..16 * i + 16].copy_from_slice(&m.to_le_bytes());
     }
-    syscall(abi::SYS_SPAWN, spawner, program, buf.as_ptr() as u64, n as u64, budget_ticks)
+    let a = args.len().min(abi::ARGS_MAX);
+    buf[16 * n..16 * n + a].copy_from_slice(&args[..a]);
+    syscall(abi::SYS_SPAWN, spawner, program, buf.as_ptr() as u64, (n as u64) | ((a as u64) << 8), budget_ticks)
+}
+
+/// The bytes this program was started with (empty if none).
+pub fn args() -> &'static [u8] {
+    // SAFETY: the kernel maps the top stack page of every process and writes a
+    // length (<= ARGS_MAX) followed by the bytes at ARGS_ADDR before the first
+    // instruction runs; nothing else in the program writes there.
+    unsafe {
+        let len = (abi::ARGS_ADDR as *const u64).read_unaligned() as usize;
+        let len = len.min(abi::ARGS_MAX);
+        core::slice::from_raw_parts((abi::ARGS_ADDR + 8) as *const u8, len)
+    }
+}
+
+pub fn close(handle: u64) -> i64 {
+    syscall(abi::SYS_CLOSE, handle, 0, 0, 0, 0)
+}
+
+/// Hardware random bytes (the whole buffer or an error).
+pub fn random(random: u64, buf: &mut [u8]) -> i64 {
+    let mut done = 0;
+    for chunk in buf.chunks_mut(abi::MAX_RANDOM_LEN as usize) {
+        let r = syscall(abi::SYS_RANDOM, random, chunk.as_mut_ptr() as u64, chunk.len() as u64, 0, 0);
+        if r < 0 {
+            return r;
+        }
+        done += r;
+    }
+    done
+}
+
+/// Open an authorized TCP connection; returns a socket handle or a negative error.
+pub fn net_connect(net: u64, host: &str, port: u16) -> i64 {
+    syscall(abi::SYS_NET_CONNECT, net, host.as_ptr() as u64, host.len() as u64, port as u64, 0)
+}
+
+/// Send some bytes (returns how many were accepted, > 0).
+pub fn sock_send(sock: u64, data: &[u8]) -> i64 {
+    let n = data.len().min(2048);
+    syscall(abi::SYS_SOCK_SEND, sock, data.as_ptr() as u64, n as u64, 0, 0)
+}
+
+/// Receive bytes; 0 means the peer closed the connection.
+pub fn sock_recv(sock: u64, buf: &mut [u8]) -> i64 {
+    let n = buf.len().min(2048);
+    syscall(abi::SYS_SOCK_RECV, sock, buf.as_mut_ptr() as u64, n as u64, 0, 0)
+}
+
+pub fn netctl(manager: u64, op: u64, ptr: u64, len: u64, arg: u64) -> i64 {
+    syscall(abi::SYS_NETCTL, manager, op, ptr, len, arg)
 }
 
 pub fn wait(pid: u64) -> i64 {
