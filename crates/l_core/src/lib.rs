@@ -16,4 +16,5 @@ pub mod policy;
 pub mod shell;
 pub mod syscall;
 pub mod url;
+pub mod theme;
 pub mod time;
