@@ -6,7 +6,15 @@ Larp OS (`l_os`) is an early research kernel. It has **limited process isolation
 ## Rules for contributors
 - No telemetry, no hidden network access, no background checks. Network and storage features must be denied by default and enforced by the kernel, not by application-level flags.
 - Every `unsafe` block needs a `// SAFETY:` comment stating its invariants. Keep `unsafe` to hardware/kernel boundaries.
-- No `unwrap()`/`expect()` on untrusted runtime input without a stated invariant. (Existing code still has some on initialization paths, e.g. UART init, VGA `write_fmt`, `init_memory`; not reachable from untrusted input.)
+- No `unwrap()`/`expect()` on untrusted runtime input without a stated invariant. 
+  Inventory (`grep -rn "unwrap()\|expect(\|panic!(" src`, checked 2026-10-12, non-test code):
+  - `src/serial.rs` UART init `expect`: boot-time only, no external input.
+  - `src/lib.rs` `init_memory` (`expect` x2): boot-time; failure means no usable memory/heap.
+  - `src/memory.rs` double-`init` `panic!`: programming-error guard.
+  - `src/usermode.rs` / `src/syscall.rs` `panic!` on ring-3 event/syscall with no user process: invariant, can only be hit by kernel code issuing `int 0x80`.
+  - `src/interrupts.rs`: deliberate fail-stop `panic!` for ring-0 exceptions.
+  - Output paths (`print!`, serial) no longer `unwrap`/`expect`.
+  Nothing on this list takes user input as its panic condition.
 - Do not write custom cryptography or TLS. Evaluate every dependency for `no_std`, allocation needs, `unsafe`, maintenance, and license before adding.
 - Never disable certificate validation or add silent HTTPS→HTTP fallback.
 - Do not claim guarantees (e.g. "RAM-only means no traces", "zeroized means gone") that the platform cannot provide.

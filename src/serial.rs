@@ -14,7 +14,8 @@ pub fn _print(args: ::core::fmt::Arguments) {
     use x86_64::instructions::interrupts;
 
     interrupts::without_interrupts(|| {
-        SERIAL1.lock().write_fmt(args).expect("Printing to serial failed");
+        // A write error must not turn into a panic (this runs on the panic path too).
+        let _ = SERIAL1.lock().write_fmt(args);
     });
 }
 
@@ -33,4 +34,14 @@ macro_rules! serial_println {
     ($fmt:expr) => ($crate::serial_print!(concat!($fmt, "\n")));
     ($fmt:expr, $($arg:tt)*) => ($crate::serial_print!(
         concat!($fmt, "\n"), $($arg)*));
+}
+/// Serial output from a panic path; never blocks on the port lock.
+pub fn emergency_print(args: ::core::fmt::Arguments) {
+    use core::fmt::Write;
+
+    x86_64::instructions::interrupts::disable();
+    // SAFETY: panicking is terminal and interrupts are off; see
+    // `vga_buffer::emergency_print`.
+    unsafe { SERIAL1.force_unlock() };
+    let _ = SERIAL1.lock().write_fmt(args);
 }

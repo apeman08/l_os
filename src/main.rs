@@ -9,7 +9,8 @@ use core::panic::PanicInfo;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    l_os::println!("{}", info);
+    l_os::serial::emergency_print(format_args!("KERNEL PANIC: {}\n", info));
+    l_os::vga_buffer::emergency_print(format_args!("\nKERNEL PANIC: {}\n", info));
     l_os::hlt_loop();
 }
 
