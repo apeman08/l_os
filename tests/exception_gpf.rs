@@ -5,8 +5,9 @@ use core::fmt::Write;
 use core::panic::PanicInfo;
 use l_os::{exit_qemu, serial_print, serial_println, QemuExitCode};
 
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+bootloader_api::entry_point!(main, config = &l_os::BOOTLOADER_CONFIG);
+
+fn main(_boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     serial_print!("{}...\t", "exception_gpf");
     l_os::init();
     // SAFETY: loading a selector beyond the GDT limit into DS raises #GP; DS is not used afterwards.

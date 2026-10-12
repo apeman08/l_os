@@ -36,17 +36,56 @@ pub fn init() {
     pci::enumerate();
     interrupts::idt_init();
     gdt::init();
-    unsafe {interrupts::PICS.lock().initialize()};
+    // SAFETY: remaps the PICs to the vectors the IDT (loaded above) handles,
+    // then unmasks only lines with a handler. UEFI firmware leaves every PIC
+    // line masked (the BIOS used to leave timer and keyboard on), so the lines
+    // the kernel relies on are enabled explicitly: IRQ0 timer, IRQ1 keyboard,
+    // IRQ2 cascade. Everything else stays masked, as it effectively was.
+    unsafe {
+        let mut pics = interrupts::PICS.lock();
+        pics.initialize();
+        pics.write_masks(0b1111_1000, 0b1111_1111);
+    }
     x86_64::instructions::interrupts::enable();
 }
 
+/// Virtual address at which the bootloader maps all physical memory
+/// (level-4 slot 32). Fixed so that it can never land on a slot the kernel
+/// uses itself (heap: slot 136, user window: slot 224).
+pub const PHYSICAL_MEMORY_OFFSET: u64 = 0x_1000_0000_0000;
+
+/// Highest address the bootloader may pick for its dynamic mappings (kernel
+/// stack, boot info, framebuffer): everything stays below level-4 slot 128,
+/// i.e. below [`allocator::HEAP_START`] and the user slot
+/// ([`memory::USER_L4_INDEX`]).
+pub const DYNAMIC_RANGE_END: u64 = 0x_3fff_ffff_f000;
+
+/// Boot configuration shared by the kernel and every test kernel; pass it to
+/// `bootloader_api::entry_point!(main, config = &l_os::BOOTLOADER_CONFIG)`.
+pub const BOOTLOADER_CONFIG: bootloader_api::BootloaderConfig = {
+    use bootloader_api::config::Mapping;
+    let mut config = bootloader_api::BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::FixedAddress(PHYSICAL_MEMORY_OFFSET));
+    config.mappings.dynamic_range_end = Some(DYNAMIC_RANGE_END);
+    // Same as bootloader 0.9's default (512 pages); 0.11 would give 80 KiB.
+    config.kernel_stack_size = 512 * 4096;
+    config
+};
+
 /// Set up paging access, the frame allocator and the kernel heap.
-pub fn init_memory(boot_info: &'static bootloader::BootInfo) {
+pub fn init_memory(boot_info: &'static mut bootloader_api::BootInfo) {
     use x86_64::VirtAddr;
-    // SAFETY: values come straight from the bootloader's BootInfo, which was
-    // built with `map_physical_memory`; this is called once during boot.
+    let boot_info: &'static bootloader_api::BootInfo = boot_info;
+    let offset = boot_info
+        .physical_memory_offset
+        .into_option()
+        .expect("bootloader did not map physical memory (BOOTLOADER_CONFIG not used?)");
+    assert_eq!(offset, PHYSICAL_MEMORY_OFFSET, "physical memory mapped at an unexpected offset");
+    // SAFETY: values come straight from the bootloader's BootInfo; the config
+    // above makes it map all physical memory at `offset`, and the regions it
+    // reports as usable are unused. This is called once during boot.
     unsafe {
-        memory::init(VirtAddr::new(boot_info.physical_memory_offset), &boot_info.memory_map);
+        memory::init(VirtAddr::new(offset), &boot_info.memory_regions);
     }
     let mut guard = memory::MEMORY.lock();
     let mem = guard.as_mut().expect("memory initialized above");
@@ -134,10 +173,10 @@ pub fn test_panic_handler(info: &PanicInfo) -> ! {
 
 // Entry point for `cargo test`
 #[cfg(test)]
-bootloader::entry_point!(test_kernel_main);
+bootloader_api::entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
 
 #[cfg(test)]
-fn test_kernel_main(_boot_info: &'static bootloader::BootInfo) -> ! {
+fn test_kernel_main(_boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     init();
     test_main();
     hlt_loop();

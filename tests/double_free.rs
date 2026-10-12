@@ -5,9 +5,9 @@ use core::fmt::Write;
 use core::panic::PanicInfo;
 use l_os::{exit_qemu, serial_print, serial_println, QemuExitCode};
 
-bootloader::entry_point!(main);
+bootloader_api::entry_point!(main, config = &l_os::BOOTLOADER_CONFIG);
 
-fn main(boot_info: &'static bootloader::BootInfo) -> ! {
+fn main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     use x86_64::structures::paging::{FrameAllocator, FrameDeallocator};
 
     serial_print!("{}...\t", "double_free");

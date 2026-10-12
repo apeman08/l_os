@@ -19,8 +19,9 @@ fn main() -> ExitCode {
 
     let mut config = BootConfig::default();
     // The kernel owns COM1: test output and the console mirror go there, and
-    // the bootloader's log lines would mix into it.
-    config.serial_logging = false;
+    // the bootloader's log lines would mix into it. L_OS_BOOT_LOG=1 turns them
+    // on for debugging boot problems (e.g. a bootloader panic before the kernel).
+    config.serial_logging = std::env::var_os("L_OS_BOOT_LOG").is_some_and(|v| v == "1");
 
     match UefiBoot::new(&kernel).set_boot_config(&config).create_disk_image(&out) {
         Ok(()) => ExitCode::SUCCESS,

@@ -8,16 +8,16 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, vec::Vec};
-use bootloader::{BootInfo, entry_point};
+use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use x86_64::{
     VirtAddr,
     structures::paging::{FrameAllocator, FrameDeallocator, Mapper, Page, PageTableFlags, Translate},
 };
 
-entry_point!(main);
+entry_point!(main, config = &l_os::BOOTLOADER_CONFIG);
 
-fn main(boot_info: &'static BootInfo) -> ! {
+fn main(boot_info: &'static mut BootInfo) -> ! {
     l_os::init();
     l_os::init_memory(boot_info);
     test_main();

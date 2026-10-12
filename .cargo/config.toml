@@ -7,4 +7,5 @@ build-std-features = ["compiler-builtins-mem"]
 build-std = ["core", "compiler_builtins", "alloc"]
 
 [target.'cfg(target_os = "none")']
-runner = "bootimage runner"
+# Builds a UEFI image (tools/image) and boots it in QEMU; see the script.
+runner = "scripts/qemu_runner.sh"

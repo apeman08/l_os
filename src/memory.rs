@@ -1,10 +1,10 @@
 //! Paging and physical frame management.
 //!
-//! The bootloader (feature `map_physical_memory`) maps all physical memory at
-//! a fixed virtual offset; the kernel uses that to walk and edit page tables.
+//! The bootloader maps all physical memory at a fixed virtual offset
+//! (`crate::BOOTLOADER_CONFIG`); the kernel uses that to walk and edit page tables.
 
 use crate::frames::{Cursor, FrameBitmap, Region};
-use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
+use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::{
@@ -27,7 +27,7 @@ static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
 pub const USER_L4_INDEX: usize = 224;
 
 pub struct BootInfoFrameAllocator {
-    memory_map: &'static MemoryMap,
+    memory_map: &'static [MemoryRegion],
     cursor: Cursor,
     /// Physical address of the first free frame; each free frame stores the
     /// address of the next one in its first 8 bytes (0 = end of list).
@@ -40,7 +40,7 @@ impl BootInfoFrameAllocator {
     /// The caller must guarantee that every region marked `Usable` in
     /// `memory_map` is really unused, that the map outlives the allocator, and
     /// that all physical memory is mapped at `phys_offset`.
-    pub unsafe fn init(memory_map: &'static MemoryMap, phys_offset: VirtAddr) -> Self {
+    pub unsafe fn init(memory_map: &'static [MemoryRegion], phys_offset: VirtAddr) -> Self {
         Self { memory_map, cursor: Cursor::new(), free_head: 0, phys_offset }
     }
 
@@ -54,11 +54,7 @@ impl BootInfoFrameAllocator {
     fn take_fresh(&mut self) -> Option<u64> {
         let map = self.memory_map;
         self.cursor.next_frame(|i| {
-            map.iter().nth(i).map(|r| Region {
-                start: r.range.start_addr(),
-                end: r.range.end_addr(),
-                usable: r.region_type == MemoryRegionType::Usable,
-            })
+            map.get(i).map(|r| Region { start: r.start, end: r.end, usable: r.kind == MemoryRegionKind::Usable })
         })
     }
 
@@ -154,7 +150,7 @@ pub static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 /// # Safety
 /// `physical_memory_offset` must be the offset at which the bootloader mapped
 /// all physical memory, and `memory_map` must be the bootloader's map.
-pub unsafe fn init(physical_memory_offset: VirtAddr, memory_map: &'static MemoryMap) {
+pub unsafe fn init(physical_memory_offset: VirtAddr, memory_map: &'static [MemoryRegion]) {
     use x86_64::registers::control::Cr3;
 
     if INITIALIZED.swap(true, Ordering::SeqCst) {
@@ -185,11 +181,11 @@ pub fn frames_in_use() -> u64 {
 }
 
 /// Total bytes in regions the bootloader reports as usable.
-pub fn usable_bytes(memory_map: &MemoryMap) -> u64 {
+pub fn usable_bytes(memory_map: &[MemoryRegion]) -> u64 {
     memory_map
         .iter()
-        .filter(|r| r.region_type == MemoryRegionType::Usable)
-        .map(|r| r.range.end_addr() - r.range.start_addr())
+        .filter(|r| r.kind == MemoryRegionKind::Usable)
+        .map(|r| r.end - r.start)
         .sum()
 }
 

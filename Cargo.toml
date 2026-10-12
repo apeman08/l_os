@@ -8,12 +8,6 @@ build = "build.rs"
 # Tests that need host-side servers: run via scripts/net_tests.sh
 net-tests = []
 
-[package.metadata.bootimage]
-run-args = ["-cpu", "max", "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0,disable-modern=on"]
-test-args = ["-cpu", "max", "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0,disable-modern=on", "-object", "filter-dump,id=f0,netdev=n0,file=target/net-trace.pcap", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-serial", "stdio", "-display", "none"]
-test-success-exit-code = 33
-test-timeout = 300
-
 [[test]]
 name = "memory"
 harness = true
@@ -103,7 +97,7 @@ harness = false
 
 [dependencies]
 l_core = { path = "crates/l_core" }
-bootloader = { version = "0.9", features = ["map_physical_memory"] }
+bootloader_api = "=0.11.17"
 linked_list_allocator = "0.10.6"
 smoltcp = { version = "=0.14.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
 volatile = "0.2.6"

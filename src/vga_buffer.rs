@@ -1,3 +1,9 @@
+//! Text console: an 80x25 character grid.
+//!
+//! Since the switch to UEFI boot (bootloader 0.11) there is no VGA text mode:
+//! the grid lives in ordinary memory and every console output is mirrored to
+//! COM1, which is where it can be seen until the framebuffer console exists.
+
 use volatile::Volatile;
 use core::fmt;
 use lazy_static::lazy_static;
@@ -7,7 +13,7 @@ lazy_static! {
     pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer {
         column_position: 0,
         color_code: ColorCode::new(Color::Yellow, Color::Black),
-        buffer: unsafe { &mut *{0xb8000 as *mut Buffer} },
+        buffer: Buffer::blank(),
     });
 }
 
@@ -57,10 +63,17 @@ struct Buffer {
     chars: [[Volatile<ScreenChar>; BUFFER_WIDTH]; BUFFER_HEIGHT]
 }
 
+impl Buffer {
+    fn blank() -> Self {
+        let blank = ScreenChar { ascii_character: b' ', color_code: ColorCode::new(Color::Yellow, Color::Black) };
+        Buffer { chars: core::array::from_fn(|_| core::array::from_fn(|_| Volatile::new(blank))) }
+    }
+}
+
 pub struct Writer {
     column_position: usize,
     color_code: ColorCode,
-    buffer: &'static mut Buffer
+    buffer: Buffer
 }
 
 impl fmt::Write for Writer {
@@ -159,6 +172,9 @@ pub fn _print(args: fmt::Arguments) {
         // Writer::write_str never fails; ignore the Result rather than panic.
         let _ = WRITER.lock().write_fmt(args);
     });
+    // Mirror to COM1 (lock order: console writer, then serial; never nested
+    // the other way round).
+    crate::serial::_print(args);
 }
 
 /// Print from a panic path: never blocks on the VGA lock.
@@ -173,14 +189,19 @@ pub fn emergency_print(args: fmt::Arguments) {
     // hold the guard; interrupts are off, so nothing else can race with us.
     unsafe { WRITER.force_unlock() };
     let _ = WRITER.lock().write_fmt(args);
+    crate::serial::emergency_print(args);
 }
 
 pub fn backspace() {
     x86_64::instructions::interrupts::without_interrupts(|| WRITER.lock().backspace());
+    // Terminal-style erase on the mirror.
+    crate::serial::_print(format_args!("\x08 \x08"));
 }
 
 pub fn clear_screen() {
     x86_64::instructions::interrupts::without_interrupts(|| WRITER.lock().clear_screen());
+    // ANSI "erase display, cursor home" on the mirror.
+    crate::serial::_print(format_args!("\x1b[2J\x1b[H"));
 }
 
 //Tests

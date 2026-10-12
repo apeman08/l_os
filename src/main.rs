@@ -21,9 +21,9 @@ fn panic(info: &PanicInfo) -> ! {
     l_os::test_panic_handler(info)
 }
 
-bootloader::entry_point!(kernel_main);
+bootloader_api::entry_point!(kernel_main, config = &l_os::BOOTLOADER_CONFIG);
 
-fn kernel_main(boot_info: &'static bootloader::BootInfo) -> ! {
+fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     l_os::init();
     l_os::init_memory(boot_info);
 
