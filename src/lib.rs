@@ -59,13 +59,28 @@ pub fn run_shell_forever() -> ! {
         (Object::System, Rights::READ),
         (Object::Spawner((1u16 << PROGRAM_COUNT) - 1), Rights::USE),
     ];
+    // A shell that dies right after starting would be restarted in a tight loop;
+    // give up after a few very short runs in a row.
+    const MIN_HEALTHY_TICKS: u64 = 18; // about one second
+    const MAX_QUICK_FAILURES: u32 = 3;
+    let mut quick_failures = 0;
     loop {
+        let started = time::ticks();
         match run_all(&[Spec { program: shell_program(), handles: &handles, budget_ticks: u64::MAX }]) {
             Ok(results) => println!("\n[shell ended: {:?}; restarting]", results[0].outcome),
             Err(e) => {
                 println!("\ncannot start the shell: {:?}", e);
                 hlt_loop();
             }
+        }
+        if time::ticks() - started < MIN_HEALTHY_TICKS {
+            quick_failures += 1;
+            if quick_failures >= MAX_QUICK_FAILURES {
+                println!("the shell keeps failing right after start; not restarting again");
+                hlt_loop();
+            }
+        } else {
+            quick_failures = 0;
         }
     }
 }
