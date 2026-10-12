@@ -1,21 +1,44 @@
 #!/usr/bin/env python3
-"""Boot the real kernel image in QEMU, type commands via the QEMU monitor and
-assert on the VGA text buffer. This exercises the actual kernel, not host code.
+"""Boot the real kernel image in QEMU (UEFI), type commands via the QEMU monitor
+and assert on the console output. This exercises the actual kernel, not host code.
 
-Usage: cargo bootimage && python3 -I scripts/qemu_shell_smoke.py
-Needs: qemu-system-x86_64. Characters are mapped to keys for the kernel's German layout.
+Since the switch to UEFI there is no VGA text buffer to read; the kernel mirrors
+every console write to COM1, which QEMU writes to a file here. The text is
+rendered like a terminal (backspace erases, ANSI sequences are dropped).
+
+Usage: scripts/build_image.sh && python3 -I scripts/qemu_shell_smoke.py
+Needs: qemu-system-x86_64 and OVMF (see scripts/ovmf_path.sh; OVMF_FD overrides).
+Characters are mapped to keys for the kernel's German layout.
 """
-import os, socket, subprocess, sys, tempfile, time
+import os, re, socket, subprocess, sys, tempfile, time
 
-IMG = "target/x86_64-l_os/debug/bootimage-l_os.bin"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+IMG = os.path.join(ROOT, "target/x86_64-l_os/debug/l_os-uefi.img")
 # The kernel uses the German layout (De105Key): the US y/z keys are swapped.
 KEYNAMES = {" ": "spc", "\n": "ret", "\b": "backspace", "y": "z", "z": "y", "_": "shift-slash", ":": "shift-dot", ".": "dot", "/": "shift-7"}
+ANSI = re.compile(r"\x1b(\[[0-9;=?]*[A-Za-z]|[()][0-9A-Za-z])")
+
+def ovmf():
+    return subprocess.run([os.path.join(ROOT, "scripts/ovmf_path.sh")], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+def render(raw):
+    """Serial bytes -> screen lines (backspace erases, escape sequences dropped)."""
+    lines = [""]
+    for ch in ANSI.sub("", raw.decode("latin-1")).replace("\r", ""):
+        if ch == "\n": lines.append("")
+        elif ch == "\b": lines[-1] = lines[-1][:-1]
+        else: lines[-1] += ch if 32 <= ord(ch) < 127 else "."
+    return lines
 
 def main():
     tmp = tempfile.mkdtemp()
-    sock_path, dump = os.path.join(tmp, "mon.sock"), os.path.join(tmp, "vga.bin")
-    q = subprocess.Popen(["qemu-system-x86_64", "-drive", f"format=raw,file={IMG}",
-                          "-cpu", "max", "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0,disable-modern=on", "-display", "none", "-serial", "null", "-no-reboot",
+    sock_path, serial = os.path.join(tmp, "mon.sock"), os.path.join(tmp, "serial.log")
+    q = subprocess.Popen(["qemu-system-x86_64", "-drive", f"if=none,id=disk0,format=raw,file={IMG},snapshot=on",
+                          # bootindex: OVMF then connects only the disk and leaves the NIC alone.
+                          "-device", "ide-hd,drive=disk0,bootindex=0", "-bios", ovmf(),
+                          "-vga", "none", "-device", "VGA,xres=1024,yres=768",
+                          "-cpu", "max", "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0,disable-modern=on", "-display", "none", "-serial", f"file:{serial}", "-no-reboot",
                           "-monitor", f"unix:{sock_path},server,nowait"])
     try:
         for _ in range(100):
@@ -29,15 +52,17 @@ def main():
         def type_(s):
             for ch in s:
                 mon("sendkey " + KEYNAMES.get(ch, ch)); time.sleep(0.05)
-        time.sleep(3)
         snaps = []
         def snap():
-            """Dump the VGA text buffer; the screen only holds 25 rows, so
-            several snapshots are taken and checked together."""
-            mon(f'pmemsave 0xb8000 4000 "{dump}"'); time.sleep(1)
-            d = open(dump, "rb").read()
-            snaps.extend("".join(chr(d[(r*80+c)*2]) if 32 <= d[(r*80+c)*2] < 127 else "." for c in range(80)).rstrip()
-                         for r in range(25))
+            """Take the console output so far (the serial mirror holds all of it)."""
+            time.sleep(1)
+            snaps[:] = [r.rstrip() for r in render(open(serial, "rb").read())]
+        # UEFI firmware + bootloader take a few seconds; wait for the prompt.
+        for _ in range(60):
+            snap()
+            if any("l_os>" in r for r in snaps): break
+        else:
+            print("FAIL: no shell prompt on the serial console"); sys.exit(1)
         type_("help\n"); type_("echo hix\b\n"); type_("bogus\n"); type_("help me\n"); snap()
         type_("uptime\n"); type_("security\n"); snap()
         type_("run hello\n"); type_("run hello_rs\n"); type_("run evil\n"); snap()
@@ -61,7 +86,7 @@ def main():
                 "10.0.2.2:18080 for", "revoked 10.0.2.2:18080"]
     missing = [e for e in expected if e not in screen]
     if missing:
-        print("---- all captured screens ----")
+        print("---- all captured console output ----")
         print("\n".join(r for r in snaps if r.strip()))
         print("FAIL, missing:", missing); sys.exit(1)
     print("OK")

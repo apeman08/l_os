@@ -8,18 +8,19 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      # Path of the firmware from the Ubuntu `ovmf` package (scripts/ovmf_path.sh
+      # also tries the usual paths when this is unset).
+      OVMF_FD: /usr/share/ovmf/OVMF.fd
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+      - name: Install QEMU and OVMF (UEFI firmware)
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 ovmf
 
       # rust-toolchain.toml pins the nightly and its components.
       - name: Install toolchain
         run: rustup show
-
-      - name: Install bootimage
-        run: cargo install bootimage --locked --version 0.10.5
 
       - name: Host tests (l_core)
         run: scripts/host_tests.sh
@@ -29,7 +30,7 @@ jobs:
 
       - name: Smoke test (real kernel image, driven through the keyboard)
         run: |
-          cargo bootimage
+          scripts/build_image.sh
           python3 -I scripts/qemu_shell_smoke.py
 
       - name: Network and TLS tests (host test servers, QEMU packet capture)
