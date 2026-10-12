@@ -32,6 +32,7 @@ mod hmac;
 mod kx;
 mod verify;
 
+pub use rustls;
 pub use rustls::RootCertStore;
 pub use rustls_pki_types::{CertificateDer, ServerName};
 

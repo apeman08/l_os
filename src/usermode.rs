@@ -54,7 +54,7 @@ macro_rules! user_elfs {
 
 user_elfs!(
     shell, hello_rs, spawn_probe, key_probe, fault_write_code, fault_exec_stack, fault_write_rodata,
-    tcp_probe, tcp_hold, revoker, fetch,
+    tcp_probe, tcp_hold, revoker, fetch, tls_probe,
 );
 
 global_asm!(

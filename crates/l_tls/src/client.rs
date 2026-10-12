@@ -211,6 +211,13 @@ impl<T: Transport> TlsStream<T> {
         Ok(())
     }
 
+    /// Negotiated protocol and cipher suite, e.g. `("TLSv1_3", "TLS13_AES_256_GCM_SHA384")`.
+    pub fn negotiated(&self) -> Option<(String, String)> {
+        let version = self.conn.protocol_version()?;
+        let suite = self.conn.negotiated_cipher_suite()?;
+        Some((alloc::format!("{:?}", version), alloc::format!("{:?}", suite.suite())))
+    }
+
     /// Send application data (encrypted), blocking until it is handed to the transport.
     pub fn write_all(&mut self, data: &[u8]) -> Result<(), Error> {
         for chunk in data.chunks(8 * 1024) {

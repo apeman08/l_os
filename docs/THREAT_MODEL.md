@@ -19,7 +19,7 @@ Hardware bugs (speculative execution, Rowhammer), malicious firmware/BIOS/SMM, a
 
 | Property | Today | Truth |
 |---|---|---|
-| Network denied by default | No NIC driver exists; `NetPolicy` is default-deny and consulted by `SYS_NET_CHECK` | Holds by absence of code. When a driver lands it must be reachable only through a syscall that calls the same check. |
+| Network denied by default | **Enforced**: `NetPolicy` is checked in `net::connect` before DNS, before the NIC is initialized, and on every send/receive; revoke/expiry reset open connections. Default is no grants. | Verified in QEMU: 10 refusal tests and an empty QEMU packet capture for the never-authorized run; functional run produces traffic (so the capture works). The kernel network stack and driver are in the TCB (ring 0), DMA is not isolated (no IOMMU). Only the emulated virtio-net is supported. |
 | RAM-only | No storage driver exists | Holds by absence. No claim about forensic traces: RAM contents, firmware, and emulator disk images are outside our control. |
 | Telemetry | None in code | Source-auditable; the project is small. |
 | Memory safety | Rust; `unsafe` limited to hardware access, page-table edits, asm entry/exit, user-pointer copies, heap init | Kernel bugs in `unsafe` or logic remain possible. `l_core` forbids `unsafe`. |
@@ -32,6 +32,8 @@ Hardware bugs (speculative execution, Rowhammer), malicious firmware/BIOS/SMM, a
 Known weaknesses specific to the process model: budgets depend on the assumed PIT rate; a process killed inside a syscall or ISR is abandoned together with its kernel stack, which is sound only if no lock is held at those points (tested, not proved); a process can fill its own handle table or endpoint queues but not others'; there are at most 8 endpoints per run; all drivers still run in ring 0.
 
 Loader-specific: ELF images are embedded in the kernel and validated by `l_core::elf` (window, alignment, overlap, W^X, entry point, file bounds). They are trusted code from our own build, but the parser treats them as untrusted; `build.rs` runs a nested cargo build with a scrubbed environment, so the build host's toolchain and network (crates.io, locked by `user/Cargo.lock`) are part of the trusted computing base for the user programs.
+
+Network and TLS specifics: a connection needs a `NetClient` handle and an exact `host:port` grant (names also need the DNS resolver granted); only the shell can create grants, after a typed confirmation. TLS is TLS 1.3 only, client only, no fallback; certificate validity depends on an unauthenticated RTC; no revocation checking; the production trust store is the embedded Mozilla root list. The user-space TLS and HTTP code parses attacker-controlled data in ring 3 (a crash kills only `fetch`). A compromised shell is a compromised trusted path: it can grant anything.
 
 ## Principles for upcoming work
 - Enforcement lives in the kernel at a boundary untrusted code cannot bypass (syscalls/IPC capability checks), never in the shell.

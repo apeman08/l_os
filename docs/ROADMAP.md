@@ -18,10 +18,13 @@ Ordered by prerequisite dependency. Each item lists its acceptance check.
 
 - **Phase 2.4/2.5**: user-space build pipeline (`user/`, `build.rs`, validated ELF loader), `spawn`/`wait`, keyboard/system/spawner handles, shell in ring 3. (Deviation from the plan: console and keyboard are kernel objects reachable through handles, not separate service processes.)
 
+- **Phase 3**: PCI, virtio-net, smoltcp, DNS client, policy at the syscall edge, socket handles, `net` shell commands (docs/NETWORK.md).
+- **Phase 4**: hardware RNG, RTC, TLS 1.3 client (`l_tls`), `fetch`.
+
 ## Next
-1. Console/keyboard as real **service processes** behind endpoints (plan 2.4 as written) and focus handling for several consumers.
-2. **Revocation** of delegated handles.
-3. Then Stage C below (PCI, NIC as service, policy at the syscall edge).
+1. Console/keyboard as real **service processes**; **revocation** of delegated handles.
+2. Phase 5 (secrets, optional encrypted storage design) and Phase 6 (text browser, which reuses `https::get`).
+3. Network hardening: per-program grants, IPv6, DHCP only on explicit request, advisory scan in CI.
 
 ## Stage C — networking (blocked on multi-process isolation and capability handles)
 - PCI enumeration; one emulated NIC (e.g. virtio-net or e1000/RTL8139 under QEMU), interface down until authorized.

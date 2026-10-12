@@ -27,7 +27,10 @@ Larp OS (`l_os`) is an early research kernel. It has **tested process isolation 
 - Interrupt handlers lock the global PIC mutex; `print!` disables interrupts around the VGA lock. Terminating a process abandons the interrupt frame it was in; no locks may be held at those points (not formally verified).
 - Heap allocation from interrupt context would deadlock; there is none today, nothing enforces it.
 - Keyboard scancode queue drops input on overflow (by design, counted).
-- `NetPolicy` has no persistence and no runtime interface for a human to grant; `SYS_NET_CHECK` only answers a query.
+- `NetPolicy` has no persistence (grants vanish at reboot, by design) and holds 16 entries. Grants are all-or-nothing per host:port; there is no per-program scoping yet.
+- The network stack (smoltcp) and the virtio-net driver parse untrusted packets in ring 0. The emulated NIC can DMA anywhere (no IOMMU).
+- TLS validity relies on the unauthenticated RTC; no certificate revocation checking.
+- Dependencies of the user programs (rustls, RustCrypto crates, webpki-roots, linked_list_allocator) are fetched at build time and locked in `user/Cargo.lock`; the build is not reproducible and no advisory scan is part of CI yet. `rsa` 0.9 carries RUSTSEC-2023-0071 (private-key timing); only public-key verification is used.
 - Unverified: behavior on real hardware, on UEFI, or with USB keyboards.
 
 ## Reporting

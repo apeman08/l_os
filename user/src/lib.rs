@@ -186,3 +186,39 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     // No allocation or formatting here; just end this process distinctly.
     exit(0xdead)
 }
+
+// ------------------------------------------------------------------ heap
+
+extern crate alloc;
+use linked_list_allocator::LockedHeap;
+
+/// The program-wide allocator. It starts empty: a program that never calls
+/// [`init_heap_memory`] (every program that does not use the `heap!` macro)
+/// gets allocation failures instead of a heap, and maps no heap memory.
+#[global_allocator]
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+/// Hand the allocator its memory. Call once, before the first allocation.
+///
+/// # Safety
+/// `ptr..ptr+size` must be valid, writable memory used for nothing else.
+pub unsafe fn init_heap_memory(ptr: *mut u8, size: usize) {
+    // SAFETY: forwarded contract.
+    unsafe { ALLOCATOR.lock().init(ptr, size) };
+}
+
+/// Give a program a heap of `$size` bytes in its own zeroed `.bss`, and define
+/// `init_heap()` to call first thing in `main`. Programs that do not use this
+/// macro pay nothing: no heap memory is part of their image.
+#[macro_export]
+macro_rules! heap {
+    ($size:expr) => {
+        static mut HEAP_MEMORY: [u8; $size] = [0; $size];
+        pub fn init_heap() {
+            // SAFETY: called once at start; HEAP_MEMORY is used for nothing else.
+            unsafe { $crate::init_heap_memory((&raw mut HEAP_MEMORY).cast::<u8>(), $size) };
+        }
+    };
+}
+
+pub mod https;

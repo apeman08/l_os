@@ -10,6 +10,10 @@ edition = "2024"
 [dependencies]
 l_core = { path = "../crates/l_core" }
 pc-keyboard = "0.7.0"
+l_tls = { path = "../crates/l_tls" }
+linked_list_allocator = "0.10.6"
+webpki-roots = "1"
+rustls-pki-types = { version = "1", default-features = false, features = ["alloc"] }
 
 [profile.release]
 opt-level = "s"

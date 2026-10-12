@@ -17,7 +17,6 @@ use smoltcp::{
     time::Instant,
 };
 use x86_64::{
-    VirtAddr,
     instructions::port::Port,
     structures::paging::{FrameAllocator, PhysFrame},
 };
@@ -265,7 +264,7 @@ impl VirtioNet {
         let mem = guard.as_mut().ok_or(BringUpError::NoMemory)?;
         let result = (|| {
             let mut rxq = setup_queue(io, 0, mem)?;
-            let mut txq = setup_queue(io, 1, mem)?;
+            let txq = setup_queue(io, 1, mem)?;
             let mut rx_bufs = [0u64; RX_BUFS];
             for (i, b) in rx_bufs.iter_mut().enumerate() {
                 *b = alloc_buf(mem)?;

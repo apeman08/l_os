@@ -49,6 +49,11 @@ harness = true
 required-features = ["net-tests"]
 
 [[test]]
+name = "tls"
+harness = true
+required-features = ["net-tests"]
+
+[[test]]
 name = "should_panic"
 harness = false
 

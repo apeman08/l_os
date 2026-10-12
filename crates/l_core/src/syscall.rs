@@ -104,7 +104,7 @@ pub const MAX_WRITE_LEN: u64 = 256;
 pub const MAX_HOST_ARG_LEN: u64 = 253;
 
 /// Top of every process's stack (the stack grows down from here).
-pub const USER_STACK_TOP: u64 = 0x_7000_0010_0000;
+pub const USER_STACK_TOP: u64 = 0x_7000_0100_0000; // 16 MiB above the image base
 /// Program arguments live at a fixed spot in the top stack page: a
 /// little-endian u64 length followed by that many bytes.
 pub const ARGS_ADDR: u64 = USER_STACK_TOP - 512;

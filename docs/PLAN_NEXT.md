@@ -1,6 +1,6 @@
 # Plan: Wie es weitergeht
 
-Stand: Phase 0, Phase 1 und Phase 2 (bis auf Widerruf und echte Dienstprozesse) umgesetzt (siehe „Status“ unten); Rest offen. Grundlage ist `docs/ROADMAP.md`; dieser Plan macht daraus abarbeitbare Aufgaben.
+Stand: Phase 0–4 umgesetzt (Abweichungen und Lücken in der Tabelle unten); Phase 5–6 offen (siehe „Status“ unten); Rest offen. Grundlage ist `docs/ROADMAP.md`; dieser Plan macht daraus abarbeitbare Aufgaben.
 
 ## Leitregeln für jede Aufgabe
 - Test zuerst schreiben, sehen dass er fehlschlägt, dann implementieren (Kernel-Tests in `tests/*.rs`, reine Logik als Host-Test in `crates/l_core`).
@@ -103,4 +103,17 @@ Als unprivilegierter Prozess mit nur `Net`-Anfragerecht, gleicher Freigabeweg wi
 | 2.3 IPC | erledigt | synchron-blockierendes Empfangen, Sender bekommt `WOULD_BLOCK` bei voller Queue |
 | 2.4 Konsole/Tastatur als Dienst | **teilweise** | Rust-Userland-Pipeline, ELF-Loader, `spawn`/`wait` fertig; Tastatur und Konsole sind Kernel-Objekte mit Handles (Fokus = wer das Handle hält), **kein** separater Dienstprozess |
 | 2.5 Shell in Ring 3 | erledigt | Rust-Shell mit Console/Keyboard/System/Spawner-Handles; Absturz → Neustart durch den Kernel |
-| 3 – 6 | offen | unverändert |
+| 3.1 PCI | erledigt | Enumeration beim Boot (nur Config-Space-Lesen) |
+| 3.2 NIC-Entscheidung | erledigt | virtio-net (legacy); Entscheidung und Begründung in `docs/NETWORK.md` |
+| 3.3 NIC als Dienst | **abgewichen** | Treiber und Stack im Kernel (kein IOMMU, 64-Byte-IPC); Netz-Autorität nur über Socket-Handles; TLS in Ring 3 |
+| 3.4 smoltcp | erledigt | 0.14.0, 0BSD, `deny(unsafe_code)` |
+| 3.5 Policy am Syscall-Rand | erledigt | Test mit leerem QEMU-Mitschnitt; Mutation geprüft |
+| 3.6 DNS nur nach Freigabe | erledigt | Name **und** Resolver müssen freigegeben sein |
+| 3.7 Trusted-Path-UI | erledigt | `net status/devices/permissions/request/revoke/resolver`; angefragt ≠ durchgesetzt |
+| 3.8 TCP-Test | erledigt | Echo-Server auf dem Host, abgelehnte Ports, Widerruf, Ablauf |
+| 4.1 Zufall | erledigt | RDSEED/RDRAND ohne Fallback; Qualität nicht prüfbar |
+| 4.2 Uhrzeit | erledigt | CMOS-RTC, Plausibilitätsfenster; nicht authentifiziert |
+| 4.3 TLS-Bibliothek | erledigt | rustls 0.23.45 + eigener Provider-Klebecode auf RustCrypto (Upstream-Provider ist veraltet) |
+| 4.4 TLS-Client + Zertifikatsprüfung | erledigt | Host- und Kernel-Tests für alle Fehlerfälle |
+| 4.5 `fetch` | **teilweise** | Funktioniert gegen lokale TLS-Server mit Test-CA; **nicht** gegen eine öffentliche Seite gezeigt (Sandbox fängt TLS ab) |
+| 5 – 6 | offen | unverändert |
