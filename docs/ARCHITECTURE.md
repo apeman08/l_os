@@ -67,3 +67,7 @@ src/vga_buffer.rs  text console
 src/serial.rs      COM1 (tests)
 src/shell.rs       line editor, parser, commands
 ```
+
+## 5. Font
+
+`crates/l_core/src/font.rs` embeds an 8x16 bitmap font for the framebuffer terminal. The glyphs come from Terminus Font 4.49.1 (`ter-u16n.bdf`, https://terminus-font.sourceforge.net/), copyright (C) 2020 Dimitar Toshkov Zhekov, licensed under the SIL Open Font License 1.1. The licence text is in `crates/l_core/LICENSE-font`. The glyph table `crates/l_core/src/font_data.rs` is generated from the BDF (a one-off conversion script, not kept in the repo) and must not be edited by hand. It covers ASCII, Latin-1, box drawing, block elements and a few symbols, sorted by codepoint; any other codepoint renders as a hollow-box replacement glyph.

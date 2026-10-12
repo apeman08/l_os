@@ -6,6 +6,8 @@ extern crate alloc;
 pub mod cell;
 pub mod dns;
 pub mod elf;
+pub mod font;
+mod font_data;
 pub mod frames;
 pub mod http;
 pub mod handles;
