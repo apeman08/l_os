@@ -1,0 +1,23 @@
+[package]
+name = "l_user"
+version = "0.1.0"
+edition = "2024"
+
+# Ring-3 programs for Larp OS. Built by the kernel's build.rs for the kernel
+# target (never run on the host). Standalone: not part of any workspace.
+[workspace]
+
+[dependencies]
+l_core = { path = "../crates/l_core" }
+pc-keyboard = "0.7.0"
+l_tls = { path = "../crates/l_tls" }
+linked_list_allocator = "0.10.6"
+webpki-roots = "1"
+rustls-pki-types = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+debug = false
+lto = true
+codegen-units = 1

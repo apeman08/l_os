@@ -100,6 +100,23 @@ impl Writer {
         }
     }
 
+    /// Erase the previous character on the bottom row (no-op at column 0).
+    pub fn backspace(&mut self) {
+        if self.column_position == 0 {
+            return;
+        }
+        self.column_position -= 1;
+        let blank = ScreenChar { ascii_character: b' ', color_code: self.color_code };
+        self.buffer.chars[BUFFER_HEIGHT - 1][self.column_position].write(blank);
+    }
+
+    pub fn clear_screen(&mut self) {
+        for row in 0..BUFFER_HEIGHT {
+            self.clear_row(row);
+        }
+        self.column_position = 0;
+    }
+
     fn new_line(&mut self) {
         for row in 1..BUFFER_HEIGHT {
             for col in 0..BUFFER_WIDTH {
@@ -139,8 +156,31 @@ pub fn _print(args: fmt::Arguments) {
     use x86_64::instructions::interrupts;
 
     interrupts::without_interrupts(|| {
-        WRITER.lock().write_fmt(args).unwrap();
+        // Writer::write_str never fails; ignore the Result rather than panic.
+        let _ = WRITER.lock().write_fmt(args);
     });
+}
+
+/// Print from a panic path: never blocks on the VGA lock.
+///
+/// If the panic happened while some code held the writer lock, waiting for it
+/// would deadlock forever. Panicking is terminal, so the lock is forced open.
+pub fn emergency_print(args: fmt::Arguments) {
+    use core::fmt::Write;
+
+    x86_64::instructions::interrupts::disable();
+    // SAFETY: the system is panicking and will not resume the code that may
+    // hold the guard; interrupts are off, so nothing else can race with us.
+    unsafe { WRITER.force_unlock() };
+    let _ = WRITER.lock().write_fmt(args);
+}
+
+pub fn backspace() {
+    x86_64::instructions::interrupts::without_interrupts(|| WRITER.lock().backspace());
+}
+
+pub fn clear_screen() {
+    x86_64::instructions::interrupts::without_interrupts(|| WRITER.lock().clear_screen());
 }
 
 //Tests
@@ -169,5 +209,37 @@ fn test_println_output() {
             let screen_char = writer.buffer.chars[BUFFER_HEIGHT - 2][i].read();
             assert_eq!(char::from(screen_char.ascii_character), c);
         }
+    });
+}
+
+#[test_case]
+fn test_backspace_erases_last_char() {
+    use core::fmt::Write;
+    use x86_64::instructions::interrupts;
+
+    interrupts::without_interrupts(|| {
+        let mut writer = WRITER.lock();
+        writeln!(writer).unwrap();
+        write!(writer, "abc").unwrap();
+        writer.backspace();
+        let row = &writer.buffer.chars[BUFFER_HEIGHT - 1];
+        assert_eq!(char::from(row[1].read().ascii_character), 'b');
+        assert_eq!(char::from(row[2].read().ascii_character), ' ');
+        writer.backspace();
+        writer.backspace();
+        writer.backspace(); // at column 0: must not underflow
+        assert_eq!(writer.column_position, 0);
+    });
+}
+
+#[test_case]
+fn test_emergency_print_survives_held_lock() {
+    use core::fmt::Write;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        // Simulate a panic that interrupted a holder of the lock.
+        core::mem::forget(WRITER.lock());
+        emergency_print(format_args!("emergency output\n"));
+        // And the writer is usable again afterwards.
+        writeln!(WRITER.lock(), "after").unwrap();
     });
 }

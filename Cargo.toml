@@ -2,11 +2,56 @@
 name = "l_os"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
+
+[features]
+# Tests that need host-side servers: run via scripts/net_tests.sh
+net-tests = []
 
 [package.metadata.bootimage]
-test-args = ["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-serial", "stdio", "-display", "none"]
+run-args = ["-cpu", "max", "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0,disable-modern=on"]
+test-args = ["-cpu", "max", "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0,disable-modern=on", "-object", "filter-dump,id=f0,netdev=n0,file=target/net-trace.pcap", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-serial", "stdio", "-display", "none"]
 test-success-exit-code = 33
 test-timeout = 300
+
+[[test]]
+name = "memory"
+harness = true
+
+[[test]]
+name = "usermode"
+harness = true
+
+[[test]]
+name = "processes"
+harness = true
+
+[[test]]
+name = "capabilities"
+harness = true
+
+[[test]]
+name = "userland"
+harness = true
+
+[[test]]
+name = "pci"
+harness = true
+
+[[test]]
+name = "network_denied"
+harness = true
+required-features = ["net-tests"]
+
+[[test]]
+name = "network"
+harness = true
+required-features = ["net-tests"]
+
+[[test]]
+name = "tls"
+harness = true
+required-features = ["net-tests"]
 
 [[test]]
 name = "should_panic"
@@ -16,14 +61,56 @@ harness = false
 name = "stack_overflow"
 harness = false
 
+[[test]]
+name = "exception_invalid_opcode"
+harness = false
+
+[[test]]
+name = "exception_divide_error"
+harness = false
+
+[[test]]
+name = "exception_gpf"
+harness = false
+
+[[test]]
+name = "exception_page_fault"
+harness = false
+
+[[test]]
+name = "exception_nmi"
+harness = false
+
+[[test]]
+name = "exception_overflow"
+harness = false
+
+[[test]]
+name = "exception_bound_range"
+harness = false
+
+[[test]]
+name = "double_free"
+harness = false
+
+[[test]]
+name = "smap_violation"
+harness = false
+
+[[test]]
+name = "smep_violation"
+harness = false
+
 [dependencies]
-bootloader = "0.9"
+l_core = { path = "crates/l_core" }
+bootloader = { version = "0.9", features = ["map_physical_memory"] }
+linked_list_allocator = "0.10.6"
+smoltcp = { version = "=0.14.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
 volatile = "0.2.6"
 spin = "0.5.2"
 x86_64 = "0.15.5"
 uart_16550 = "0.6.0"
 pic8259 = "0.11.0"
-pc-keyboard = "0.7.0"
 
 [dependencies.lazy_static]
 version = "1.0"

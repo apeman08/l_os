@@ -9,7 +9,8 @@ use core::panic::PanicInfo;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    l_os::println!("{}", info);
+    l_os::serial::emergency_print(format_args!("KERNEL PANIC: {}\n", info));
+    l_os::vga_buffer::emergency_print(format_args!("\nKERNEL PANIC: {}\n", info));
     l_os::hlt_loop();
 }
 
@@ -20,22 +21,19 @@ fn panic(info: &PanicInfo) -> ! {
     l_os::test_panic_handler(info)
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    for i in 0..11 {
-        l_os::println!("{}: Larp OS 0.0.2", i);
-    }
+bootloader::entry_point!(kernel_main);
 
+fn kernel_main(boot_info: &'static bootloader::BootInfo) -> ! {
     l_os::init();
+    l_os::init_memory(boot_info);
 
-    use x86_64::registers::control::Cr3;
-
-    let (level_4_page_table, _) = Cr3::read();
-    l_os::println!("Level 4 page table at: {:?}", level_4_page_table.start_address());
-    
     #[cfg(test)]
     test_main();
 
+    #[cfg(not(test))]
+    l_os::run_shell_forever();
+
+    #[cfg(test)]
     l_os::hlt_loop();
 }
 

@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+
+      # rust-toolchain.toml pins the nightly and its components.
+      - name: Install toolchain
+        run: rustup show
+
+      - name: Install bootimage
+        run: cargo install bootimage --locked --version 0.10.5
+
+      - name: Host tests (l_core)
+        run: scripts/host_tests.sh
+
+      - name: Kernel tests (boot in QEMU)
+        run: cargo test
+
+      - name: Smoke test (real kernel image, driven through the keyboard)
+        run: |
+          cargo bootimage
+          python3 -I scripts/qemu_shell_smoke.py
+
+      - name: Network and TLS tests (host test servers, QEMU packet capture)
+        run: scripts/net_tests.sh
