@@ -1,6 +1,6 @@
 # Plan: Wie es weitergeht
 
-Stand: nach Stage B (erste Runde). Grundlage ist `docs/ROADMAP.md`; dieser Plan macht daraus abarbeitbare Aufgaben.
+Stand: Phase 0, Phase 1 und 2.1–2.3 umgesetzt (siehe „Status“ unten); Rest offen. Grundlage ist `docs/ROADMAP.md`; dieser Plan macht daraus abarbeitbare Aufgaben.
 
 ## Leitregeln für jede Aufgabe
 - Test zuerst schreiben, sehen dass er fehlschlägt, dann implementieren (Kernel-Tests in `tests/*.rs`, reine Logik als Host-Test in `crates/l_core`).
@@ -84,3 +84,23 @@ Als unprivilegierter Prozess mit nur `Net`-Anfragerecht, gleicher Freigabeweg wi
 2. **Tastaturlayout:** Soll Deutsch (`De105Key`) bleiben oder umschaltbar werden?
 3. **Syscall-Mechanismus:** `int 0x80` behalten oder auf `syscall/sysret` umstellen (Entscheidung nach 1.3)?
 4. **TLS-Weg:** Soll ich zuerst einen Machbarkeits-Spike für `rustls` ohne `std` machen, bevor Phase 3 Aufwand bindet? (Empfehlung: ja – er entscheidet, ob das Projektziel HTTPS realistisch ist.)
+
+## Status (aktualisiert)
+| Aufgabe | Stand | Anmerkung |
+|---|---|---|
+| 0.1 CI | erledigt | Workflow läuft auf GitHub grün (Läufe für Phase 0, 1.2–1.4, 1.5 verifiziert) |
+| 0.2 Exception-Handler | erledigt | #NMI, #MC, #OF, #BR, #NM, x87/SIMD, #AC; #NMI/#OF/#BR per Test, #MC/#NM/#AC/FPU ohne Testauslöser (Code vorhanden, nicht ausgeführt) |
+| 0.3 Panic ohne VGA-Lock | erledigt | `emergency_print` getestet; der echte Kernel-Panic-Handler selbst ist nicht als Test ausführbar |
+| 0.4 unwrap-Inventar | erledigt | in `SECURITY.md` |
+| 1.1 Frame-Freigabe | erledigt | Bitmap erkennt Doppelfreigabe; nur die ersten 4 GiB RAM werden verfolgt |
+| 1.2 Adressräume | erledigt | |
+| 1.3 Prozesstabelle/Kontext | erledigt | Kernel-Stack pro Prozess; verlassene Stacks beim Kill (s. Threat Model) |
+| 1.4 Preemptiver Scheduler | erledigt | Round-Robin auf PIT-Tick, per Mutation geprüft |
+| 1.5 SMEP/SMAP | erledigt | nur mit `-cpu max`; Status per `security` sichtbar |
+| 1.6 Syscall-/Stack-Tests | erledigt | tabellengetriebener Pointer-Test, kein echtes Fuzzing |
+| 2.1 Handles | erledigt | |
+| 2.2 Delegation/Widerruf | **teilweise** | Delegation mit Abschwächung ja; **Widerruf bereits weitergegebener Handles fehlt** |
+| 2.3 IPC | erledigt | synchron-blockierendes Empfangen, Sender bekommt `WOULD_BLOCK` bei voller Queue |
+| 2.4 Konsole/Tastatur als Dienst | offen | braucht Rust-Userland-Build (nächster Schritt) |
+| 2.5 Shell in Ring 3 | offen | siehe 2.4 |
+| 3 – 6 | offen | unverändert |

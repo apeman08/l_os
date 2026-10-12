@@ -1,7 +1,7 @@
 # Security policy and posture
 
 ## Honest status
-Larp OS (`l_os`) is an early research kernel. It has **limited process isolation (one ring-3 process at a time), a coarse capability check, no network, and no storage**. It must not be used to protect anything real. Compilation or passing tests does not imply security.
+Larp OS (`l_os`) is an early research kernel. It has **tested process isolation for hand-assembled ring-3 programs, capability handles with IPC, no network, and no storage**. The shell and all kernel code still run in ring 0. It must not be used to protect anything real. Compilation or passing tests does not imply security.
 
 ## Rules for contributors
 - No telemetry, no hidden network access, no background checks. Network and storage features must be denied by default and enforced by the kernel, not by application-level flags.
@@ -21,7 +21,7 @@ Larp OS (`l_os`) is an early research kernel. It has **limited process isolation
 
 ## Known weaknesses (current)
 - The shell, input handling and all kernel code run in ring 0; any kernel bug owns the machine.
-- User mode: one process at a time, no SMEP/SMAP, leaked frames, assumed timer rate (see THREAT_MODEL.md).
+- Processes: single CPU, SMEP/SMAP only if the CPU offers them, assumed timer rate, abandoned kernel stacks on kill (see THREAT_MODEL.md).
 - Unhandled exceptions: #NMI, #MC, x87/SIMD, virtualization (they would double fault).
 - Interrupt handlers lock the global PIC mutex; `print!` disables interrupts around the VGA lock. Terminating a process abandons the interrupt frame it was in; no locks may be held at those points (not formally verified).
 - Heap allocation from interrupt context would deadlock; there is none today, nothing enforces it.

@@ -12,13 +12,14 @@ Ordered by prerequisite dependency. Each item lists its acceptance check.
   4. User mode: ring 3, `int 0x80`, per-process capability bits, pointer validation, time budget (`tests/usermode.rs`).
   5. Default-deny `NetPolicy` consulted by `SYS_NET_CHECK` (allow, deny, revoke, expiry tests).
 
-## Next (Stage B follow-ups, in priority order)
-1. **Multiple processes**: separate address spaces (own L4 table per process), scheduler, per-process kernel stacks, frame *free*. *Check:* two processes cannot see each other's memory; killed process memory is reclaimed (no frame leak).
-2. **Enable SMEP/SMAP** (check CPUID, set CR4) and re-run the user-mode suite. Add user stack-overflow and syscall-argument fuzz-style tests.
-3. **Capability handles** instead of bits: kernel objects referenced through per-process tables, with revoke and (explicit) delegation.
-4. Move the shell itself out of ring 0 (it should hold only Console + Keyboard capabilities).
-5. **Remaining exception handlers** (#NMI, #MC, SIMD/x87) and a panic path that does not rely on the VGA lock.
-6. Frame-allocator reclaim of boot-time memory, guard pages for kernel stacks.
+- **Phase 0** (see PLAN_NEXT.md): CI, remaining exception handlers, panic path without lock, unwrap inventory.
+- **Phase 1**: frame free list, per-process address spaces, process table, preemptive scheduler, SMEP/SMAP, pointer/stack-overflow tests.
+- **Phase 2.1-2.3**: capability handles, delegation with attenuation, blocking IPC with deadlock cleanup.
+
+## Next
+1. **User-space build pipeline**: compile Rust programs for ring 3 (second crate, linker script, flat binary embedded in the kernel) and a dynamic `spawn`/`wait` syscall.
+2. Keyboard/console as capability objects; **shell as a ring-3 process** (reusing `l_core::shell`).
+3. Then Stage C below (PCI, NIC as service, policy at the syscall edge).
 
 ## Stage C — networking (blocked on multi-process isolation and capability handles)
 - PCI enumeration; one emulated NIC (e.g. virtio-net or e1000/RTL8139 under QEMU), interface down until authorized.
