@@ -12,6 +12,7 @@ use core::panic::PanicInfo;
 
 pub mod serial;
 pub mod vga_buffer;
+pub mod framebuffer;
 pub mod interrupts;
 pub mod gdt;
 pub mod frames;
@@ -72,9 +73,11 @@ pub const BOOTLOADER_CONFIG: bootloader_api::BootloaderConfig = {
     config
 };
 
-/// Set up paging access, the frame allocator and the kernel heap.
+/// Take over what the bootloader handed over: the framebuffer (kept, not
+/// drawn on yet), then paging access, the frame allocator and the kernel heap.
 pub fn init_memory(boot_info: &'static mut bootloader_api::BootInfo) {
     use x86_64::VirtAddr;
+    framebuffer::init(boot_info.framebuffer.take());
     let boot_info: &'static bootloader_api::BootInfo = boot_info;
     let offset = boot_info
         .physical_memory_offset
