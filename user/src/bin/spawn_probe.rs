@@ -8,6 +8,7 @@
 use l_core::{
     handles::Rights,
     syscall::{ERR_BAD_HANDLE, ERR_INVALID, ERR_NO_RIGHTS, ERR_NO_SLOT, ERR_NOT_CHILD, Outcome},
+    time::{ticks_from_ms, ticks_from_seconds},
 };
 use l_user::{Console, entry, h, println, spawn, wait};
 
@@ -19,6 +20,7 @@ const HELLO_RS: u64 = 3; // exists, but is not in this spawner's mask
 fn main() -> u16 {
     let mut out = Console(h::CONSOLE);
     let mut failed = 0u16;
+    let one_second = ticks_from_seconds(1);
     macro_rules! check {
         ($name:expr, $cond:expr) => {
             if !$cond {
@@ -29,22 +31,22 @@ fn main() -> u16 {
     }
     let write = Rights::WRITE.bits() as u64;
 
-    let pid = spawn(SPAWNER, HELLO, &[(h::CONSOLE, write)], &[], 18);
+    let pid = spawn(SPAWNER, HELLO, &[(h::CONSOLE, write)], &[], one_second);
     check!("spawn hello", pid > 0);
     check!("child outcome is its exit code", wait(pid as u64) == Outcome::Exited(18).to_raw() as i64);
     check!("a reaped child cannot be waited on again", wait(pid as u64) == ERR_NOT_CHILD);
     check!("waiting on a stranger fails", wait(9999) == ERR_NOT_CHILD);
 
-    check!("program outside the spawner's mask", spawn(SPAWNER, HELLO_RS, &[], &[], 18) == ERR_NO_RIGHTS);
-    check!("unknown program id", spawn(SPAWNER, 99, &[], &[], 18) == ERR_NO_RIGHTS);
-    check!("a console handle is not a spawner", spawn(h::CONSOLE, HELLO, &[], &[], 18) == ERR_NO_RIGHTS);
-    check!("granting needs the GRANT right", spawn(SPAWNER, HELLO, &[(2, write)], &[], 18) == ERR_NO_RIGHTS);
-    check!("forged handle in the grant list", spawn(SPAWNER, HELLO, &[(0x777, write)], &[], 18) == ERR_BAD_HANDLE);
+    check!("program outside the spawner's mask", spawn(SPAWNER, HELLO_RS, &[], &[], one_second) == ERR_NO_RIGHTS);
+    check!("unknown program id", spawn(SPAWNER, 99, &[], &[], one_second) == ERR_NO_RIGHTS);
+    check!("a console handle is not a spawner", spawn(h::CONSOLE, HELLO, &[], &[], one_second) == ERR_NO_RIGHTS);
+    check!("granting needs the GRANT right", spawn(SPAWNER, HELLO, &[(2, write)], &[], one_second) == ERR_NO_RIGHTS);
+    check!("forged handle in the grant list", spawn(SPAWNER, HELLO, &[(0x777, write)], &[], one_second) == ERR_BAD_HANDLE);
     check!("zero budget is invalid", spawn(SPAWNER, SPIN, &[], &[], 0) == ERR_INVALID);
 
     // Rights narrow: grant the console with an empty mask. The child's write is
     // refused and hello exits with that (negative) result.
-    let pid = spawn(SPAWNER, HELLO, &[(h::CONSOLE, 0)], &[], 18);
+    let pid = spawn(SPAWNER, HELLO, &[(h::CONSOLE, 0)], &[], one_second);
     check!("spawn with empty rights", pid > 0);
     check!(
         "child holds no right to write",
@@ -61,7 +63,7 @@ fn main() -> u16 {
     let mut pids = [0i64; 16];
     let mut n = 0;
     let last_err = loop {
-        let r = spawn(SPAWNER, SPIN, &[], &[], 3);
+        let r = spawn(SPAWNER, SPIN, &[], &[], ticks_from_ms(165));
         if r < 0 || n == pids.len() {
             break r;
         }
@@ -74,7 +76,7 @@ fn main() -> u16 {
         check!("each spinner ends by timeout", wait(p as u64) == Outcome::Timeout.to_raw() as i64);
     }
     // Slots are free again after reaping.
-    let pid = spawn(SPAWNER, HELLO, &[(h::CONSOLE, write)], &[], 18);
+    let pid = spawn(SPAWNER, HELLO, &[(h::CONSOLE, write)], &[], one_second);
     check!("slots are reusable after reaping", pid > 0 && wait(pid as u64) >= 0);
 
     failed

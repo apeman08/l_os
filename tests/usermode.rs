@@ -28,7 +28,7 @@ fn panic(info: &PanicInfo) -> ! {
     l_os::test_panic_handler(info)
 }
 
-const BUDGET: u64 = 18; // ~1 s
+const BUDGET: u64 = l_os::time::ticks_from_seconds(1);
 type Handles = &'static [(Object, Rights)];
 const NONE: Handles = &[];
 const NET: Handles = &[(Object::NetClient, Rights::USE)];
@@ -72,10 +72,11 @@ fn invalid_opcode_and_div0_kill_only_the_process() {
 
 #[test_case]
 fn runaway_process_is_killed_by_time_budget() {
+    let budget = l_os::time::ticks_from_ms(275);
     let start = l_os::time::ticks();
-    let out = usermode::run(usermode::prog_spin(), NONE, 5).unwrap();
+    let out = usermode::run(usermode::prog_spin(), NONE, budget).unwrap();
     assert_eq!(out, Outcome::Timeout);
-    assert!(l_os::time::ticks() - start >= 5);
+    assert!(l_os::time::ticks() - start >= budget);
 }
 
 #[test_case]

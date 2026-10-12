@@ -12,7 +12,7 @@ use l_core::{
     handles::Rights,
     shell::{Command, EditEvent, LineEditor, ParseError, parse, parse_host_port},
     syscall::*,
-    time::{approx_seconds, ticks_from_seconds},
+    time::{TICK_HZ, approx_seconds, ticks_from_seconds},
 };
 use l_user::{Console, entry, h, netctl, print, println, read_key, spawn, sysinfo, wait};
 use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts};
@@ -26,8 +26,8 @@ const PROGRAMS: [(&str, u64, bool, bool); 5] = [
     ("hello_rs", 3, true, false),
     ("fetch", 4, true, true),
 ];
-const CHILD_BUDGET_TICKS: u64 = 18; // about one second
-const FETCH_BUDGET_TICKS: u64 = 18 * 60;
+const CHILD_BUDGET_SECONDS: u64 = 1;
+const FETCH_BUDGET_SECONDS: u64 = 60;
 const DEFAULT_GRANT_SECONDS: u64 = 300;
 
 type Kb = Keyboard<layouts::De105Key, ScancodeSet1>;
@@ -125,7 +125,7 @@ fn execute(t: &mut Term, cmd: Command<'_>) {
         Command::Clear => t.out.clear(),
         Command::Uptime => {
             let ticks = sysinfo(h::SYSTEM, SYSINFO_TICKS).max(0) as u64;
-            println!(t.out, "{} ticks (~{} s, assumes default PIT rate)", ticks, approx_seconds(ticks));
+            println!(t.out, "{} ticks (~{} s at {} Hz)", ticks, approx_seconds(ticks), TICK_HZ);
         }
         Command::Security => security(t),
         Command::Echo(text) => println!(t.out, "{}", text),
@@ -213,7 +213,7 @@ fn run_program(t: &mut Term, rest: &str) {
         grants[n + 2] = (h::SYSTEM, read);
         n += 3;
     }
-    let budget = if id == 4 { FETCH_BUDGET_TICKS } else { CHILD_BUDGET_TICKS };
+    let budget = ticks_from_seconds(if id == 4 { FETCH_BUDGET_SECONDS } else { CHILD_BUDGET_SECONDS });
 
     let pid = spawn(h::SPAWNER, id, &grants[..n], args.as_bytes(), budget);
     if pid < 0 {

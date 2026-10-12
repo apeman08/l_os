@@ -79,7 +79,7 @@ fn probe(port: u16, host: &str) -> Outcome {
     let spec = Spec {
         program: Program::Elf(user_elf("tls_probe").unwrap()),
         handles: HANDLES,
-        budget_ticks: 1500,
+        budget_ticks: l_os::time::ticks_from_ms(82_400),
         args: &buf[..n],
     };
     usermode::run_all(&[spec]).unwrap().remove(0).outcome
@@ -161,7 +161,7 @@ fn without_a_random_handle_no_connection_is_attempted() {
     let spec = Spec {
         program: Program::Elf(user_elf("tls_probe").unwrap()),
         handles,
-        budget_ticks: 1500,
+        budget_ticks: l_os::time::ticks_from_ms(82_400),
         args: b"test.example 18443 /",
     };
     let r = usermode::run_all(&[spec]).unwrap().remove(0).outcome;

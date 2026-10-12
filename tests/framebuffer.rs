@@ -184,14 +184,14 @@ fn two_thousand_lines_render_only_changed_rows() {
     let rtc_after = l_os::rtc::unix_time();
     let rendered = fb_console::rendered_rows() - rendered_before;
     serial_println!(
-        "  {} lines: {} ticks (~18.2 Hz PIT), RTC {:?} -> {:?}, {} text rows rendered",
-        LINES, ticks, rtc_before, rtc_after, rendered
+        "  {} lines: {} ticks ({} Hz PIT), RTC {:?} -> {:?}, {} text rows rendered",
+        LINES, ticks, l_os::time::TICK_HZ, rtc_before, rtc_after, rendered
     );
     // Each line dirties its own row and the new blank bottom row.
     assert!(rendered <= 2 * LINES as u64 + rows as u64, "{} rows rendered: full redraws?", rendered);
-    // Measured: 78 ticks (~4 s); 1267 ticks (~70 s) with an unoptimized l_core.
-    // Bound: about 20 s at the default PIT rate.
-    assert!(ticks < 360, "2000 lines took {} ticks", ticks);
+    // Measured: 450 ticks at 100 Hz (~4.5 s); before at 18.2 Hz 78-89 ticks
+    // (~4-5 s), and 1267 ticks (~70 s) with an unoptimized l_core. Bound: 20 s.
+    assert!(ticks < l_os::time::ticks_from_seconds(20), "2000 lines took {} ticks", ticks);
     // After the scrolling, the screen shows the last rows-1 lines, then the empty cursor row.
     let mut text = alloc::string::String::new();
     for row in 0..rows - 1 {

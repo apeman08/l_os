@@ -36,7 +36,7 @@ fn probe(handles: &[(Object, Rights)], args: &str) -> Outcome {
     let spec = Spec {
         program: Program::Elf(user_elf("tcp_probe").unwrap()),
         handles,
-        budget_ticks: 400,
+        budget_ticks: l_os::time::ticks_from_seconds(22),
         args: args.as_bytes(),
     };
     usermode::run_all(&[spec]).unwrap().remove(0).outcome

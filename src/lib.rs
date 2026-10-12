@@ -47,6 +47,7 @@ pub fn init() {
         pics.initialize();
         pics.write_masks(0b1111_1000, 0b1111_1111);
     }
+    time::init_pit();
     x86_64::instructions::interrupts::enable();
 }
 
@@ -122,7 +123,7 @@ pub fn run_shell_forever() -> ! {
     ];
     // A shell that dies right after starting would be restarted in a tight loop;
     // give up after a few very short runs in a row.
-    const MIN_HEALTHY_TICKS: u64 = 18; // about one second
+    let min_healthy_ticks = time::ticks_from_seconds(1);
     const MAX_QUICK_FAILURES: u32 = 3;
     let mut quick_failures = 0;
     loop {
@@ -134,7 +135,7 @@ pub fn run_shell_forever() -> ! {
                 hlt_loop();
             }
         }
-        if time::ticks() - started < MIN_HEALTHY_TICKS {
+        if time::ticks() - started < min_healthy_ticks {
             quick_failures += 1;
             if quick_failures >= MAX_QUICK_FAILURES {
                 println!("the shell keeps failing right after start; not restarting again");

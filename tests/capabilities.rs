@@ -31,7 +31,7 @@ fn panic(info: &PanicInfo) -> ! {
     l_os::test_panic_handler(info)
 }
 
-const BUDGET: u64 = 100;
+const BUDGET: u64 = l_os::time::ticks_from_ms(5500); // about 5.5 s
 const MSG_LEN: u16 = 4; // "hi!\n"
 
 fn ep() -> u16 {

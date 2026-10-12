@@ -33,7 +33,7 @@ fn panic(info: &PanicInfo) -> ! {
 const NET: &[(Object, Rights)] = &[(Object::NetClient, Rights::USE)];
 
 fn elf(name: &str, handles: &'static [(Object, Rights)], args: &'static str) -> Spec<'static> {
-    Spec { program: Program::Elf(user_elf(name).unwrap()), handles, budget_ticks: 2000, args: args.as_bytes() }
+    Spec { program: Program::Elf(user_elf(name).unwrap()), handles, budget_ticks: l_os::time::ticks_from_seconds(110), args: args.as_bytes() }
 }
 
 fn run(spec: Spec<'static>) -> Outcome {
@@ -104,7 +104,7 @@ fn revoking_cuts_an_open_connection() {
     static MANAGER: &[(Object, Rights)] = &[(Object::NetManager, Rights::USE), (Object::System, Rights::READ)];
     let r = usermode::run_all(&[
         elf("tcp_hold", NET, "10.0.2.2 18080"),
-        elf("revoker", MANAGER, "10 10.0.2.2 18080"),
+        elf("revoker", MANAGER, "550 10.0.2.2 18080"),
     ])
     .unwrap();
     assert_eq!(r[1].outcome, Outcome::Exited(1), "the grant existed and was revoked");
@@ -115,7 +115,7 @@ fn revoking_cuts_an_open_connection() {
 #[test_case]
 fn an_expiring_grant_ends_the_connection() {
     reset();
-    POLICY.lock().grant("10.0.2.2", 18080, Some(l_os::time::ticks() + 25)).unwrap();
+    POLICY.lock().grant("10.0.2.2", 18080, Some(l_os::time::ticks() + l_os::time::ticks_from_ms(1375))).unwrap();
     assert_eq!(run(elf("tcp_hold", NET, "10.0.2.2 18080")), err(-18));
 }
 

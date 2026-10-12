@@ -1,19 +1,37 @@
-//! Time helpers for the legacy PIT tick (pure math).
+//! Time helpers for the PIT timer tick (pure math).
 //!
-//! The PIT runs at its power-on default (divisor 65536 of 1193182 Hz,
-//! about 18.2 Hz). That default is an assumption observed only under QEMU.
+//! The kernel programs PIT channel 0 to fire [`TICK_HZ`] times per second
+//! (divisor [`PIT_DIVISOR`] of the 1193182 Hz base clock, i.e. 99.9985 Hz;
+//! the 15 ppm difference to 100 Hz is ignored here). Durations in the kernel
+//! and in user programs should be written with these helpers, not as raw
+//! tick numbers.
 
+/// Timer interrupts per second.
+pub const TICK_HZ: u32 = 100;
+/// Input clock of the 8253/8254 PIT.
 pub const PIT_BASE_HZ: u64 = 1_193_182;
-pub const PIT_DEFAULT_DIVISOR: u64 = 65_536;
+/// PIT channel-0 reload value for [`TICK_HZ`], rounded to nearest (11932).
+pub const PIT_DIVISOR: u16 = ((PIT_BASE_HZ + TICK_HZ as u64 / 2) / TICK_HZ as u64) as u16;
 
-/// Approximate whole seconds for a tick count at the assumed PIT rate.
-pub fn approx_seconds(ticks: u64) -> u64 {
-    ticks.saturating_mul(PIT_DEFAULT_DIVISOR) / PIT_BASE_HZ
+/// Whole seconds covered by a tick count (rounded down).
+pub const fn approx_seconds(ticks: u64) -> u64 {
+    ticks / TICK_HZ as u64
 }
 
-/// Timer ticks needed to cover `seconds` (rounded up).
-pub fn ticks_from_seconds(seconds: u64) -> u64 {
-    seconds.saturating_mul(PIT_BASE_HZ).div_ceil(PIT_DEFAULT_DIVISOR)
+/// Timer ticks needed to cover `seconds`.
+pub const fn ticks_from_seconds(seconds: u64) -> u64 {
+    seconds.saturating_mul(TICK_HZ as u64)
+}
+
+/// Milliseconds covered by a tick count (saturating).
+pub const fn ticks_to_ms(ticks: u64) -> u64 {
+    ticks.saturating_mul(1000) / TICK_HZ as u64
+}
+
+/// Timer ticks needed to cover `ms` milliseconds (rounded up, so a wait or
+/// budget is never shorter than asked).
+pub const fn ticks_from_ms(ms: u64) -> u64 {
+    ms.saturating_mul(TICK_HZ as u64).div_ceil(1000)
 }
 
 /// Oldest year the wall clock may report; anything earlier means the RTC is
@@ -59,7 +77,7 @@ mod tests {
     #[test]
     fn seconds_to_ticks_rounds_up_and_is_consistent() {
         assert_eq!(ticks_from_seconds(0), 0);
-        assert_eq!(ticks_from_seconds(1), 19); // 18.2 Hz, rounded up
+        assert_eq!(ticks_from_seconds(1), 100);
         for s in [1u64, 5, 60, 300, 3600] {
             assert!(approx_seconds(ticks_from_seconds(s)) >= s - 1);
         }
@@ -90,10 +108,25 @@ mod tests {
     }
 
     #[test]
-    fn matches_default_pit_rate() {
+    fn ticks_to_ms_uses_100hz() {
+        assert_eq!(TICK_HZ, 100);
+        assert_eq!(ticks_to_ms(0), 0);
+        assert_eq!(ticks_to_ms(1), 10);
+        assert_eq!(ticks_to_ms(100), 1000);
+        assert_eq!(ticks_to_ms(12_345), 123_450);
+        assert!(ticks_to_ms(u64::MAX) > 0); // saturates, no panic
+        assert_eq!(ticks_from_ms(0), 0);
+        assert_eq!(ticks_from_ms(1), 1); // rounded up: never shorter than asked
+        assert_eq!(ticks_from_ms(10), 1);
+        assert_eq!(ticks_from_ms(11), 2);
+        assert_eq!(ticks_from_ms(5500), 550);
+        assert!(ticks_from_ms(u64::MAX) > 0);
         assert_eq!(approx_seconds(0), 0);
-        assert_eq!(approx_seconds(18), 0);
-        assert_eq!(approx_seconds(19), 1);
-        assert!(approx_seconds(u64::MAX) > 0); // saturates, no panic
+        assert_eq!(approx_seconds(99), 0);
+        assert_eq!(approx_seconds(100), 1);
+        assert_eq!(approx_seconds(6000), 60);
+        assert!(approx_seconds(u64::MAX) > 0);
+        // PIT divisor for 100 Hz: 1193182 / 100 = 11931.82, rounded.
+        assert_eq!(PIT_DIVISOR, 11_932);
     }
 }
