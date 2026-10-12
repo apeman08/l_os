@@ -6,8 +6,6 @@
 
 use core::panic::PanicInfo;
 
-use l_os::gdt;
-
 mod vga_buffer;
 mod serial;
 
@@ -15,7 +13,7 @@ mod serial;
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("{}", info);
-    loop {}
+    l_os::hlt_loop();
 }
 
 // our panic handler in test mode
@@ -32,18 +30,11 @@ pub extern "C" fn _start() -> ! {
     }
 
     l_os::init();
-    gdt::init();
-
-    fn stack_overflow() {
-        stack_overflow();
-    }
-
-    stack_overflow();
     
     #[cfg(test)]
     test_main();
 
-    loop {}
+    l_os::hlt_loop();
 }
 
 /////////////////////////////////////////////////////////////////////////
