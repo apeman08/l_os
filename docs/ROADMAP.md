@@ -4,17 +4,23 @@ Ordered by prerequisite dependency. Each item lists its acceptance check.
 
 ## Done
 - Boot, VGA, serial, GDT/IDT, PIC/PIT, PS/2 keyboard (pre-existing).
-- **Stage A terminal** (this cycle): ISR-light input path, line editor, parser, `help/version/uptime/security/echo/clear`. Verified by in-kernel tests and `scripts/qemu_shell_smoke.py`.
+- **Stage A terminal**: ISR-light input path, line editor, parser, shell commands. Verified by tests and `scripts/qemu_shell_smoke.py`.
+- **Stage B (first pass)**:
+  1. Exception handlers (#DE #UD #TS #NP #SS #GP #PF) with integration tests through the real IDT.
+  2. Frame allocator, paging access, kernel heap (`tests/memory.rs`).
+  3. Host-testable `l_core` crate (`scripts/host_tests.sh`).
+  4. User mode: ring 3, `int 0x80`, per-process capability bits, pointer validation, time budget (`tests/usermode.rs`).
+  5. Default-deny `NetPolicy` consulted by `SYS_NET_CHECK` (allow, deny, revoke, expiry tests).
 
-## Next (Stage B — foundations)
-1. **More exception handlers** (GPF, invalid opcode, stack segment, etc.) with fail-stop messages. *Check:* test that triggers each where practical.
-2. **Physical frame allocator** from the bootloader memory map; **paging** (offset page table mapper); **kernel heap** + `alloc`. *Check:* in-kernel tests for map/unmap, allocation, exhaustion.
-3. **Scrollback/cursor/serial console mirror** for usability (optional).
-4. **Host-testable core crates** (`no_std`): parser, policy engine. *Check:* `cargo test` on host.
-5. **User mode**: ring 3 GDT entries, per-process address spaces, `syscall`, scheduler. *Check:* a user program cannot read kernel memory (test faults and is killed).
-6. **Capability table + policy engine** enforced at the syscall boundary; default: no capabilities. *Check:* unauthorized, revoked, and expired access tests.
+## Next (Stage B follow-ups, in priority order)
+1. **Multiple processes**: separate address spaces (own L4 table per process), scheduler, per-process kernel stacks, frame *free*. *Check:* two processes cannot see each other's memory; killed process memory is reclaimed (no frame leak).
+2. **Enable SMEP/SMAP** (check CPUID, set CR4) and re-run the user-mode suite. Add user stack-overflow and syscall-argument fuzz-style tests.
+3. **Capability handles** instead of bits: kernel objects referenced through per-process tables, with revoke and (explicit) delegation.
+4. Move the shell itself out of ring 0 (it should hold only Console + Keyboard capabilities).
+5. **Remaining exception handlers** (#NMI, #MC, SIMD/x87) and a panic path that does not rely on the VGA lock.
+6. Frame-allocator reclaim of boot-time memory, guard pages for kernel stacks.
 
-## Stage C — networking (blocked on 2, 5, 6)
+## Stage C — networking (blocked on multi-process isolation and capability handles)
 - PCI enumeration; one emulated NIC (e.g. virtio-net or e1000/RTL8139 under QEMU), interface down until authorized.
 - Candidate stack: `smoltcp` (no_std; evaluate license/unsafe/features). DNS and TCP only through the authorization gate.
 - TLS via an audited `no_std` implementation (e.g. `rustls` with a suitable crypto provider; evaluate feasibility). Certificate validation and trust store design before any `fetch`.
