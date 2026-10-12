@@ -26,8 +26,10 @@ ovmf=$("$root/scripts/ovmf_path.sh")
 # bootindex makes OVMF connect only the boot disk. Otherwise its own network
 # stack brings up the NIC during boot and sends IPv6 frames (MLD report,
 # duplicate-address probe) that the "nothing is sent" pcap check would see.
+# QEMU option values escape a comma by doubling it. snapshot=on: the image is
+# never written (it is rebuilt for every run anyway).
 common=(
-  -drive "if=none,id=disk0,format=raw,file=$img" -device ide-hd,drive=disk0,bootindex=0
+  -drive "if=none,id=disk0,format=raw,snapshot=on,file=${img//,/,,}" -device ide-hd,drive=disk0,bootindex=0
   -bios "$ovmf"
   -cpu max
   -vga none -device VGA,xres=1024,yres=768

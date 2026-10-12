@@ -65,6 +65,11 @@ Verified (kernel tests in QEMU, `scripts/net_tests.sh`):
   The capture mechanism was shown to work: the functional run produces a
   non-empty capture, and with the policy check removed (mutation) the denied
   run's capture is no longer empty and its tests fail.
+  This holds only because the runner gives the boot disk `bootindex=0`, so
+  OVMF connects only the disk; otherwise OVMF itself sends IPv6 frames (MLD
+  report, neighbour solicitation with the MAC) before the kernel starts. Real
+  UEFI firmware can likewise send frames before the kernel runs; the kernel's
+  guarantee starts when it takes over.
 * `network` (10 tests): echo through the real stack against a host server,
   repeated connections, denied attempts do not change the transmit counter
   even with the NIC up, revoke-then-deny, revoking cuts an open connection

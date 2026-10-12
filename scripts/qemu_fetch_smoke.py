@@ -85,7 +85,7 @@ def main():
         type_("run fetch https://1.1.1.1/\n"); wait_for("[process exited", 90); snap()
     finally:
         q.terminate(); q.wait()
-    screen = "".join(snaps)  # rows joined, as with the 80-column VGA screen before
+    screen = "\n".join(snaps)  # serial lines are whole lines; no row-wrap to undo
     print("\n".join(r for r in snaps if r.strip()))
     expected = [
         "only https:// URLs are supported",                       # no plain http

@@ -5,7 +5,7 @@ An experimental privacy-first operating system with its own Rust kernel (x86_64,
 ## Build and run
 Requires: rustup (nightly pinned by `rust-toolchain.toml`, with `rust-src`), `qemu-system-x86_64`, OVMF UEFI firmware (Debian/Ubuntu: `apt-get install ovmf`; found at the usual paths, or set `OVMF_FD=/path/to/OVMF.fd`). The kernel build also compiles the ring-3 programs in `user/`, and the first image build compiles the bootloader (`bootloader` 0.11, host crate `tools/image`); both need network the first time.
 
-The kernel boots via UEFI. Until the framebuffer console exists, the console is mirrored to the serial port, so the terminal you start QEMU from shows it; type into the QEMU window.
+The kernel boots via UEFI and draws its console on the framebuffer (QEMU window, 1024x768). By default (cargo feature `serial-console`) every console write is also mirrored to the serial port, i.e. the terminal you start QEMU from; build with `--no-default-features` to switch the mirror off. Type into the QEMU window.
 
 ```
 cargo run                                    # build, make a UEFI image, boot it in QEMU (scripts/qemu_runner.sh)
@@ -13,6 +13,6 @@ scripts/build_image.sh                       # only build: target/x86_64-l_os/de
 cargo test                                   # kernel tests, each booted in QEMU (exit code 33 = pass)
 scripts/host_tests.sh                        # host tests: l_core, l_tls (needs the openssl CLI)
 scripts/net_tests.sh                         # network + TLS tests in QEMU against host test servers
-python3 -I scripts/qemu_shell_smoke.py       # drives the real kernel's shell (after scripts/build_image.sh)
+python3 -I scripts/qemu_shell_smoke.py       # drives the real kernel's shell, checks serial text and screen pixels (after scripts/build_image.sh)
 ```
 Try `net status`, `run hello`, `run hello_rs`, `run evil`, `run spin` in the shell. Keyboard layout is German (`De105Key`).

@@ -8,9 +8,9 @@ Target: `x86_64-l_os.json` (bare metal x86_64, soft-float, no red zone, panic=ab
 
 | Area | State | Notes |
 |---|---|---|
-| Boot (UEFI via OVMF, bootloader 0.11) | [impl] | Boots in QEMU. `BOOTLOADER_CONFIG` (`src/lib.rs`): all physical memory at fixed `0x1000_0000_0000` (L4 slot 32), dynamic bootloader mappings below L4 slot 128 (heap: 136, user: 224), 2 MiB kernel stack. Framebuffer taken over (`src/framebuffer.rs`), nothing drawn yet. Secure Boot: [planned], no chain of trust today. |
-| Text console | [impl, interim] | `src/vga_buffer.rs`; 80x25 grid in memory (no VGA text mode under UEFI), bottom-row writer with scroll, backspace, clear; every write is mirrored to COM1, which is the only visible output until the framebuffer console. |
-| Serial (COM1) | [impl] | Used only for test output. |
+| Boot (UEFI via OVMF, bootloader 0.11) | [impl] | Boots in QEMU. `BOOTLOADER_CONFIG` (`src/lib.rs`): all physical memory at fixed `0x1000_0000_0000` (L4 slot 32), dynamic bootloader mappings below L4 slot 128 (heap: 136, user: 224), 2 MiB kernel stack. Framebuffer taken over (`src/framebuffer.rs`) and drawn on by the console. Secure Boot: [planned], no chain of trust today. |
+| Framebuffer console | [impl] | `src/fb_console.rs` (replaces the VGA text console). An `l_core::cell::Grid` of 8x16 cells (128x48 at QEMU's 1024x768) drawn by `l_core::render` in `AURORA` colours; geometry, stride and Rgb/Bgr come from the firmware. Cursor starts top left; newline, wrap, scroll, backspace, clear (form feed from `write`); control characters show as the replacement glyph. After each print call only changed rows are rendered; a scroll moves the drawn pixels up with one copy per print call. Measured (`tests/framebuffer.rs`, QEMU TCG, debug kernel, `l_core` at `opt-level = 3`): 2000 `println!` lines in 78-79 ticks (~4 s), 3953 text rows rendered; with unoptimized `l_core` the same took 1267 ticks (~70 s). Panic output never blocks: with the console lock held it is painted straight onto the bottom rows. Checked pixel-exactly against host rendering in `tests/framebuffer.rs` and the smoke test. Real hardware: [assumed] to work; scrolling reads framebuffer memory back, which can be slow on real GPUs. |
+| Serial (COM1) | [impl] | Test output; panic messages; and, with the cargo feature `serial-console` (on by default), a mirror of every console write. |
 | GDT/TSS | [impl] | Kernel code/data, user code/data (ring 3), mutable TSS: IST stack for double fault and a per-process ring-0 stack set on every context switch. |
 | IDT / exceptions | [impl] | #DE #UD #NMI #OF #BR #NM #TS #NP #SS #GP #PF #AC #MF/#XM #MC #DF #BP handled. From ring 3 they end only the user process; from ring 0 they panic (fail-stop). Panic output never blocks on a held console lock. Not handled: virtualization/CET/VMM exceptions. |
 | PIC + PIT timer | [impl] | Tick counter in `src/time.rs`. PIT rate is **[assumed]** default (~18.2 Hz); observed ~18 Hz under QEMU only (SeaBIOS boot and UEFI/OVMF boot: 377 ticks in ~20.4 s). |
@@ -30,7 +30,7 @@ Target: `x86_64-l_os.json` (bare metal x86_64, soft-float, no red zone, panic=ab
 ## 2. Testing layers (be precise about what each proves)
 
 - **In-kernel tests** (`cargo test`): the test binary is a kernel image booted in QEMU; results are reported over serial and `isa-debug-exit`. This is the only test layer today. Unit tests for the shell parser, line editor, scancode queue, and tick math run here.
-- **QEMU smoke test** (`scripts/qemu_shell_smoke.py`): boots the real `l_os` image, types through the emulated PS/2 keyboard via the QEMU monitor, reads the console from the serial mirror and asserts on text. Exercises ISR → queue → decoder → editor → parser → console.
+- **QEMU smoke test** (`scripts/qemu_shell_smoke.py`): boots the real `l_os` image, types through the emulated PS/2 keyboard via the QEMU monitor, reads the console from the serial mirror and asserts on text, and compares a QEMU `screendump` of the framebuffer console pixel-exactly with the same lines rendered on the host by `l_core::render` (`crates/l_core/examples/render_text.rs`). Exercises ISR → queue → decoder → editor → parser → console → framebuffer.
 - **Host-side tests** (`scripts/host_tests.sh`): the `l_core` crate (`#![forbid(unsafe_code)]`: shell parser/editor, frame cursor, `NetPolicy`, capabilities, syscall ABI helpers). These run on the host, not in the kernel, so they prove the logic only, not that the kernel uses it correctly.
 - **Kernel integration tests** (`tests/*.rs`, ~70 results): exceptions through the real IDT, heap/paging/frame reuse and double free, SMEP/SMAP violations (each with a passing control case), and ring-3 suites: `usermode` (kernel-memory isolation, privileged instructions, pointer validation, policy outcomes), `processes` (separate address spaces, preemption, crash containment, no frame leaks, table-driven pointer probe) `capabilities` (forged/closed handles, delegation, attenuation, deadlock cleanup) and `userland` (Rust ELF programs: W^X of the loaded image, corrupt-image rejection, spawn/wait limits, keyboard handle). Selected tests were checked by mutation (breaking the protection makes the test fail).
 
@@ -63,9 +63,9 @@ src/gdt.rs         GDT/TSS
 src/interrupts.rs  IDT, PIC, timer + keyboard ISRs (ISRs do minimal work)
 src/input.rs       lock-free scancode queue
 src/time.rs        tick counter
-src/vga_buffer.rs  text console (in-memory grid, mirrored to serial)
-src/framebuffer.rs framebuffer from the bootloader (kept, not drawn on yet)
-src/serial.rs      COM1 (tests)
+src/fb_console.rs  text console on the framebuffer (l_core grid + renderer)
+src/framebuffer.rs framebuffer description from the bootloader
+src/serial.rs      COM1 (tests, panics, console mirror)
 src/shell.rs       line editor, parser, commands
 ```
 
