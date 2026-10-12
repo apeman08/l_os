@@ -1,0 +1,16 @@
+[package]
+name = "l_os_image"
+version = "0.1.0"
+edition = "2024"
+description = "Host tool: turns an l_os kernel ELF into a bootable UEFI disk image"
+publish = false
+
+# A standalone host crate. Build it from a neutral directory (see
+# scripts/build_image.sh): the repository's .cargo/config.toml selects the
+# kernel target and build-std, which must not apply here.
+[workspace]
+
+[dependencies]
+# The `uefi` feature only: the BIOS path of 0.11 cannot reach 1024x768
+# (see docs/superpowers/notes/2026-10-12-framebuffer-spike.md).
+bootloader = { version = "=0.11.17", default-features = false, features = ["uefi"] }
