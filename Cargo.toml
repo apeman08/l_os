@@ -40,6 +40,18 @@ harness = false
 name = "exception_page_fault"
 harness = false
 
+[[test]]
+name = "exception_nmi"
+harness = false
+
+[[test]]
+name = "exception_overflow"
+harness = false
+
+[[test]]
+name = "exception_bound_range"
+harness = false
+
 [dependencies]
 l_core = { path = "crates/l_core" }
 bootloader = { version = "0.9", features = ["map_physical_memory"] }

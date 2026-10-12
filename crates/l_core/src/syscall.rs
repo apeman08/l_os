@@ -55,6 +55,8 @@ pub enum Outcome {
     GeneralProtection,
     InvalidOpcode,
     DivideError,
+    /// Any other CPU exception raised by the process (alignment, FPU, overflow, ...).
+    OtherFault,
     /// Killed because it ran past its time budget.
     Timeout,
 }
@@ -67,6 +69,7 @@ impl Outcome {
             Outcome::GeneralProtection => 0x1_0002,
             Outcome::InvalidOpcode => 0x1_0003,
             Outcome::DivideError => 0x1_0004,
+            Outcome::OtherFault => 0x1_0005,
             Outcome::Timeout => 0x1_00ff,
         }
     }
@@ -79,6 +82,7 @@ impl Outcome {
             0x1_0001 => Outcome::PageFault,
             0x1_0003 => Outcome::InvalidOpcode,
             0x1_0004 => Outcome::DivideError,
+            0x1_0005 => Outcome::OtherFault,
             0x1_00ff => Outcome::Timeout,
             _ => Outcome::GeneralProtection,
         }
@@ -93,7 +97,7 @@ mod tests {
     fn outcome_roundtrip() {
         for o in [
             Outcome::Exited(0), Outcome::Exited(7), Outcome::Exited(u16::MAX), Outcome::PageFault,
-            Outcome::GeneralProtection, Outcome::InvalidOpcode, Outcome::DivideError, Outcome::Timeout,
+            Outcome::GeneralProtection, Outcome::InvalidOpcode, Outcome::DivideError, Outcome::OtherFault, Outcome::Timeout,
         ] {
             assert_eq!(Outcome::from_raw(o.to_raw()), o);
         }

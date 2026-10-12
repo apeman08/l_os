@@ -72,6 +72,7 @@ fn run_program(name: &str) {
         Ok(Outcome::GeneralProtection) => println!("[process killed: protection fault]"),
         Ok(Outcome::InvalidOpcode) => println!("[process killed: invalid instruction]"),
         Ok(Outcome::DivideError) => println!("[process killed: divide error]"),
+        Ok(Outcome::OtherFault) => println!("[process killed: CPU exception]"),
         Ok(Outcome::Timeout) => println!("[process killed: exceeded its time budget]"),
         Err(e) => println!("run failed: {:?}", e),
     }
