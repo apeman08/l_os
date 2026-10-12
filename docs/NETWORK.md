@@ -140,4 +140,4 @@ code with the test CA instead of the production roots. Do not read
 * A process can open at most 6 sockets system-wide; there is no per-process
   quota and no rate limiting.
 * The grant table holds 16 entries.
-* TLS handshakes with software crypto on emulated hardware take seconds.
+* Handshake latency with software-only crypto was not measured; expect it to be noticeably slower than on hardware-accelerated systems.
