@@ -19,7 +19,9 @@ pub mod memory;
 pub mod allocator;
 pub mod input;
 pub mod shell;
+pub mod syscall;
 pub mod time;
+pub mod usermode;
 
 pub fn init() {
     interrupts::idt_init();

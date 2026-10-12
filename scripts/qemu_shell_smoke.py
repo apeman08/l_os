@@ -32,6 +32,7 @@ def main():
         time.sleep(3)
         type_("help\n"); type_("echo hix\b\n"); type_("bogus\n")
         type_("help me\n"); type_("uptime\n"); type_("security\n")
+        type_("run hello\n"); type_("run evil\n"); type_("run spin\n"); time.sleep(2); type_("run nope\n")
         time.sleep(1)
         mon(f'pmemsave 0xb8000 4000 "{dump}"'); time.sleep(1)
         d = open(dump, "rb").read()
@@ -41,8 +42,10 @@ def main():
             for r in range(25)]
     screen = "\n".join(rows)
     print(screen)
-    expected = ["Larp OS", "l_os> echo hi", "\nhi\n", "unknown command: bogus",
-                "help: takes no arguments", "ticks (~", "no NIC driver", "ring 0"]
+    expected = ["l_os> echo hi", "\nhi\n", "unknown command: bogus",
+                "help: unexpected arguments", "ticks (~", "no NIC driver", "ring 3",
+                "hello from ring 3", "[process exited with code 18]", "illegal memory access",
+                "exceeded its time budget", "unknown program 'nope'"]
     missing = [e for e in expected if e not in screen]
     if missing:
         print("FAIL, missing:", missing); sys.exit(1)

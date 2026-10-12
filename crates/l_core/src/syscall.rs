@@ -1,0 +1,133 @@
+//! System-call ABI shared by the kernel and (future) user programs.
+//!
+//! Convention (`int 0x80`): `rax` = number, `rdi`/`rsi`/`rdx` = arguments,
+//! result in `rax` as a signed 64-bit value (negative = error). All other
+//! registers are preserved.
+
+use crate::policy::{Decision, DenyReason};
+
+pub const SYS_EXIT: u64 = 0;
+/// `write(ptr, len)`: needs `Cap::Console`.
+pub const SYS_WRITE: u64 = 1;
+/// `net_check(host_ptr, host_len, port)`: needs `Cap::Net`; returns the policy
+/// decision. It does not open a connection (there is no network stack yet).
+pub const SYS_NET_CHECK: u64 = 2;
+
+pub const ERR_NO_CAP: i64 = -1;
+pub const ERR_BAD_POINTER: i64 = -2;
+pub const ERR_INVALID: i64 = -3;
+pub const ERR_NO_SYSCALL: i64 = -4;
+pub const DENIED_NO_GRANT: i64 = -10;
+pub const DENIED_EXPIRED: i64 = -11;
+pub const DENIED_INVALID_DESTINATION: i64 = -12;
+
+pub const MAX_WRITE_LEN: u64 = 256;
+pub const MAX_HOST_ARG_LEN: u64 = 253;
+
+/// First address that is not user space (canonical lower half ends here).
+pub const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+
+pub fn decision_to_ret(d: Decision) -> i64 {
+    match d {
+        Decision::Allow => 0,
+        Decision::Deny(DenyReason::NoGrant) => DENIED_NO_GRANT,
+        Decision::Deny(DenyReason::Expired) => DENIED_EXPIRED,
+        Decision::Deny(DenyReason::InvalidDestination) => DENIED_INVALID_DESTINATION,
+    }
+}
+
+/// Does `[ptr, ptr+len)` lie entirely below the kernel/user split, without
+/// overflow, and is it non-empty? (Page-level mapping checks happen in the
+/// kernel; this is the address-range part.)
+pub fn range_in_user_space(ptr: u64, len: u64) -> bool {
+    match ptr.checked_add(len) {
+        Some(end) => len > 0 && ptr != 0 && end <= USER_SPACE_END,
+        None => false,
+    }
+}
+
+/// How a user program ended. Encoded as a `u64` for the asm return path:
+/// exit codes occupy the low 16 bits, every kernel-detected end is >= 0x1_0000.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Exited(u16),
+    PageFault,
+    GeneralProtection,
+    InvalidOpcode,
+    DivideError,
+    /// Killed because it ran past its time budget.
+    Timeout,
+}
+
+impl Outcome {
+    pub const fn to_raw(self) -> u64 {
+        match self {
+            Outcome::Exited(c) => c as u64,
+            Outcome::PageFault => 0x1_0001,
+            Outcome::GeneralProtection => 0x1_0002,
+            Outcome::InvalidOpcode => 0x1_0003,
+            Outcome::DivideError => 0x1_0004,
+            Outcome::Timeout => 0x1_00ff,
+        }
+    }
+
+    /// Unknown raw values map to `GeneralProtection` (a kill), never to a
+    /// successful exit.
+    pub const fn from_raw(raw: u64) -> Outcome {
+        match raw {
+            0..=0xffff => Outcome::Exited(raw as u16),
+            0x1_0001 => Outcome::PageFault,
+            0x1_0003 => Outcome::InvalidOpcode,
+            0x1_0004 => Outcome::DivideError,
+            0x1_00ff => Outcome::Timeout,
+            _ => Outcome::GeneralProtection,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outcome_roundtrip() {
+        for o in [
+            Outcome::Exited(0), Outcome::Exited(7), Outcome::Exited(u16::MAX), Outcome::PageFault,
+            Outcome::GeneralProtection, Outcome::InvalidOpcode, Outcome::DivideError, Outcome::Timeout,
+        ] {
+            assert_eq!(Outcome::from_raw(o.to_raw()), o);
+        }
+        assert_eq!(Outcome::from_raw(u64::MAX), Outcome::GeneralProtection);
+    }
+
+    #[test]
+    fn user_cannot_spoof_a_kernel_kill_with_exit_code() {
+        // Exit codes are truncated to 16 bits by the kernel before encoding.
+        assert_ne!(Outcome::Exited(0xffff).to_raw(), Outcome::PageFault.to_raw());
+        assert!(Outcome::Exited(u16::MAX).to_raw() < 0x1_0000);
+    }
+
+    #[test]
+    fn user_range_checks() {
+        assert!(range_in_user_space(0x1000, 16));
+        assert!(!range_in_user_space(0, 16)); // null
+        assert!(!range_in_user_space(0x1000, 0)); // empty
+        assert!(!range_in_user_space(USER_SPACE_END - 8, 16)); // straddles split
+        assert!(range_in_user_space(USER_SPACE_END - 16, 16)); // ends exactly at split
+        assert!(!range_in_user_space(0xffff_8000_0000_0000, 8)); // kernel half
+        assert!(!range_in_user_space(u64::MAX - 4, 16)); // overflow
+        assert!(!range_in_user_space(0x4444_4444_0000 | (1 << 63), 8));
+    }
+
+    #[test]
+    fn decisions_map_to_distinct_negative_codes() {
+        assert_eq!(decision_to_ret(Decision::Allow), 0);
+        let denied = [
+            decision_to_ret(Decision::Deny(DenyReason::NoGrant)),
+            decision_to_ret(Decision::Deny(DenyReason::Expired)),
+            decision_to_ret(Decision::Deny(DenyReason::InvalidDestination)),
+        ];
+        assert!(denied.iter().all(|&r| r < 0));
+        assert!(denied[0] != denied[1] && denied[1] != denied[2] && denied[0] != denied[2]);
+    }
+}

@@ -13,6 +13,10 @@ name = "memory"
 harness = true
 
 [[test]]
+name = "usermode"
+harness = true
+
+[[test]]
 name = "should_panic"
 harness = false
 

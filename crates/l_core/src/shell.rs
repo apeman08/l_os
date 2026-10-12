@@ -74,12 +74,15 @@ pub enum Command<'a> {
     Uptime,
     Security,
     Echo(&'a str),
+    /// `run <program>`: start a built-in demo program in ring 3.
+    Run(&'a str),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseError<'a> {
     Unknown(&'a str),
     UnexpectedArguments(&'a str),
+    MissingArgument(&'a str),
 }
 
 pub fn parse(line: &str) -> Result<Command<'_>, ParseError<'_>> {
@@ -101,6 +104,15 @@ pub fn parse(line: &str) -> Result<Command<'_>, ParseError<'_>> {
         "uptime" => no_args(Command::Uptime),
         "security" => no_args(Command::Security),
         "echo" => Ok(Command::Echo(rest)),
+        "run" => {
+            if rest.is_empty() {
+                Err(ParseError::MissingArgument(name))
+            } else if rest.contains(' ') {
+                Err(ParseError::UnexpectedArguments(name))
+            } else {
+                Ok(Command::Run(rest))
+            }
+        }
         _ => Err(ParseError::Unknown(name)),
     }
 }
@@ -119,6 +131,13 @@ mod tests {
         assert_eq!(parse("  uptime  "), Ok(Command::Uptime));
         assert_eq!(parse("echo   a  b "), Ok(Command::Echo("a  b")));
         assert_eq!(parse("echo"), Ok(Command::Echo("")));
+    }
+
+    #[test]
+    fn parse_run() {
+        assert_eq!(parse("run hello"), Ok(Command::Run("hello")));
+        assert_eq!(parse("run"), Err(ParseError::MissingArgument("run")));
+        assert_eq!(parse("run a b"), Err(ParseError::UnexpectedArguments("run")));
     }
 
     #[test]

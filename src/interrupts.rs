@@ -1,3 +1,5 @@
+use x86_64::{PrivilegeLevel, VirtAddr};
+use l_core::syscall::Outcome;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use crate::println;
 use lazy_static::lazy_static;
@@ -14,6 +16,14 @@ lazy_static! {
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
         idt.page_fault.set_handler_fn(page_fault_handler);
+        // SAFETY: syscall_entry is an assembly stub that follows the interrupt
+        // gate contract (saves/restores registers and ends with iretq).
+        // DPL 3 lets ring 3 invoke exactly this vector with `int 0x80`.
+        unsafe {
+            idt[0x80]
+                .set_handler_addr(VirtAddr::new(crate::usermode::syscall_entry as *const () as u64))
+                .set_privilege_level(PrivilegeLevel::Ring3);
+        }
         idt.divide_error.set_handler_fn(divide_error_handler);
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
         idt.invalid_tss.set_handler_fn(invalid_tss_handler);
@@ -35,33 +45,59 @@ pub fn idt_init() {
 extern "x86-interrupt" fn page_fault_handler(stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
     use x86_64::registers::control::Cr2;
 
+    if from_user(&stack_frame) {
+        crate::usermode::terminate_current(Outcome::PageFault);
+    }
     panic!(
         "EXCEPTION: PAGE FAULT\nAccessed Address: {:?}\nError Code: {:?}\n{:#?}",
         Cr2::read(), error_code, stack_frame
     );
 }
 
+/// Did the exception interrupt ring-3 code?
+fn from_user(frame: &InterruptStackFrame) -> bool {
+    frame.code_segment.rpl() == PrivilegeLevel::Ring3
+}
+
 extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
+    if from_user(&stack_frame) {
+        crate::usermode::terminate_current(Outcome::DivideError);
+    }
     panic!("EXCEPTION: DIVIDE ERROR\n{:#?}", stack_frame);
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    if from_user(&stack_frame) {
+        crate::usermode::terminate_current(Outcome::InvalidOpcode);
+    }
     panic!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
 }
 
 extern "x86-interrupt" fn invalid_tss_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    if from_user(&stack_frame) {
+        crate::usermode::terminate_current(Outcome::GeneralProtection);
+    }
     panic!("EXCEPTION: INVALID TSS (selector {:#x})\n{:#?}", error_code, stack_frame);
 }
 
 extern "x86-interrupt" fn segment_not_present_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    if from_user(&stack_frame) {
+        crate::usermode::terminate_current(Outcome::GeneralProtection);
+    }
     panic!("EXCEPTION: SEGMENT NOT PRESENT (selector {:#x})\n{:#?}", error_code, stack_frame);
 }
 
 extern "x86-interrupt" fn stack_segment_fault_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    if from_user(&stack_frame) {
+        crate::usermode::terminate_current(Outcome::GeneralProtection);
+    }
     panic!("EXCEPTION: STACK SEGMENT FAULT (selector {:#x})\n{:#?}", error_code, stack_frame);
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    if from_user(&stack_frame) {
+        crate::usermode::terminate_current(Outcome::GeneralProtection);
+    }
     panic!("EXCEPTION: GENERAL PROTECTION FAULT (code {:#x})\n{:#?}", error_code, stack_frame);
 }
 
@@ -81,13 +117,15 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     }
 }
 
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
     crate::time::tick();
 
     // SAFETY: EOI for the vector that is currently being serviced.
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
+    // After EOI and with no locks held: a runaway user process may be killed.
+    crate::usermode::enforce_deadline(from_user(&stack_frame));
 }
 
 extern "x86-interrupt" fn  breakpoint_handler(stack_frame: InterruptStackFrame) {
