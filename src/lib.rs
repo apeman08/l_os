@@ -6,12 +6,17 @@
 #![reexport_test_harness_main = "test_main"]
 #![feature(abi_x86_interrupt)]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
 
 pub mod serial;
 pub mod vga_buffer;
 pub mod interrupts;
 pub mod gdt;
+pub mod frames;
+pub mod memory;
+pub mod allocator;
 pub mod input;
 pub mod shell;
 pub mod time;
@@ -21,6 +26,19 @@ pub fn init() {
     gdt::init();
     unsafe {interrupts::PICS.lock().initialize()};
     x86_64::instructions::interrupts::enable();
+}
+
+/// Set up paging access, the frame allocator and the kernel heap.
+pub fn init_memory(boot_info: &'static bootloader::BootInfo) {
+    use x86_64::VirtAddr;
+    // SAFETY: values come straight from the bootloader's BootInfo, which was
+    // built with `map_physical_memory`; this is called once during boot.
+    unsafe {
+        memory::init(VirtAddr::new(boot_info.physical_memory_offset), &boot_info.memory_map);
+    }
+    let mut guard = memory::MEMORY.lock();
+    let mem = guard.as_mut().expect("memory initialized above");
+    allocator::init_heap(mem).expect("kernel heap initialization failed");
 }
 
 pub fn hlt_loop() -> ! {
@@ -59,10 +77,12 @@ pub fn test_panic_handler(info: &PanicInfo) -> ! {
     hlt_loop();
 }
 
-/// Entry point for `cargo test`
+// Entry point for `cargo test`
 #[cfg(test)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+bootloader::entry_point!(test_kernel_main);
+
+#[cfg(test)]
+fn test_kernel_main(_boot_info: &'static bootloader::BootInfo) -> ! {
     init();
     test_main();
     hlt_loop();

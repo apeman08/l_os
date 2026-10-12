@@ -9,6 +9,10 @@ test-success-exit-code = 33
 test-timeout = 300
 
 [[test]]
+name = "memory"
+harness = true
+
+[[test]]
 name = "should_panic"
 harness = false
 
@@ -33,7 +37,8 @@ name = "exception_page_fault"
 harness = false
 
 [dependencies]
-bootloader = "0.9"
+bootloader = { version = "0.9", features = ["map_physical_memory"] }
+linked_list_allocator = "0.10.6"
 volatile = "0.2.6"
 spin = "0.5.2"
 x86_64 = "0.15.5"

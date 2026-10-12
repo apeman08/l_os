@@ -20,9 +20,11 @@ fn panic(info: &PanicInfo) -> ! {
     l_os::test_panic_handler(info)
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+bootloader::entry_point!(kernel_main);
+
+fn kernel_main(boot_info: &'static bootloader::BootInfo) -> ! {
     l_os::init();
+    l_os::init_memory(boot_info);
 
     l_os::println!("Larp OS {}", env!("CARGO_PKG_VERSION"));
 
