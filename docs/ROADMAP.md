@@ -16,9 +16,11 @@ Ordered by prerequisite dependency. Each item lists its acceptance check.
 - **Phase 1**: frame free list, per-process address spaces, process table, preemptive scheduler, SMEP/SMAP, pointer/stack-overflow tests.
 - **Phase 2.1-2.3**: capability handles, delegation with attenuation, blocking IPC with deadlock cleanup.
 
+- **Phase 2.4/2.5**: user-space build pipeline (`user/`, `build.rs`, validated ELF loader), `spawn`/`wait`, keyboard/system/spawner handles, shell in ring 3. (Deviation from the plan: console and keyboard are kernel objects reachable through handles, not separate service processes.)
+
 ## Next
-1. **User-space build pipeline**: compile Rust programs for ring 3 (second crate, linker script, flat binary embedded in the kernel) and a dynamic `spawn`/`wait` syscall.
-2. Keyboard/console as capability objects; **shell as a ring-3 process** (reusing `l_core::shell`).
+1. Console/keyboard as real **service processes** behind endpoints (plan 2.4 as written) and focus handling for several consumers.
+2. **Revocation** of delegated handles.
 3. Then Stage C below (PCI, NIC as service, policy at the syscall edge).
 
 ## Stage C — networking (blocked on multi-process isolation and capability handles)

@@ -14,7 +14,7 @@ use l_core::{
     handles::{Object, Rights},
     syscall::{Outcome, USER_SPACE_END},
 };
-use l_os::usermode::{self, Spec, USER_CODE_ADDR, USER_STACK_TOP};
+use l_os::usermode::{self, Program, Spec, USER_CODE_ADDR, USER_STACK_PAGES, USER_STACK_TOP};
 
 entry_point!(main);
 
@@ -35,7 +35,7 @@ const NONE: Handles = &[];
 const CONSOLE: Handles = &[(Object::Console, Rights::WRITE)];
 
 fn spec<'a>(program: &'a [u8], handles: &'a [(Object, Rights)], budget_ticks: u64) -> Spec<'a> {
-    Spec { program, handles, budget_ticks }
+    Spec { program: Program::Raw(program), handles, budget_ticks }
 }
 
 #[test_case]
@@ -161,7 +161,7 @@ fn write_syscall_rejects_every_bad_pointer() {
         (code_end, 8),                           // first byte after code page
         (USER_STACK_TOP - 8, 16),                // runs off the end of the stack
         (USER_STACK_TOP, 8),                     // just above the stack
-        (USER_STACK_TOP - 2 * 4096 - 8, 16),     // starts below the stack (guard side)
+        (USER_STACK_TOP - USER_STACK_PAGES * 4096 - 8, 16), // starts in the guard page below the stack
         (0x4444_4444_0000, 8),                   // kernel heap (supervisor-only, mapped)
         (0xffff_8000_0000_0000, 8),              // kernel half
         (USER_SPACE_END - 4, 8),                 // straddles the user/kernel split

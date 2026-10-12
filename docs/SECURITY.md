@@ -1,7 +1,7 @@
 # Security policy and posture
 
 ## Honest status
-Larp OS (`l_os`) is an early research kernel. It has **tested process isolation for hand-assembled ring-3 programs, capability handles with IPC, no network, and no storage**. The shell and all kernel code still run in ring 0. It must not be used to protect anything real. Compilation or passing tests does not imply security.
+Larp OS (`l_os`) is an early research kernel. It has **tested process isolation for hand-assembled ring-3 programs, capability handles with IPC, no network, and no storage**. The shell and the demo programs run in ring 3; the kernel and all drivers run in ring 0. It must not be used to protect anything real. Compilation or passing tests does not imply security.
 
 ## Rules for contributors
 - No telemetry, no hidden network access, no background checks. Network and storage features must be denied by default and enforced by the kernel, not by application-level flags.
@@ -11,7 +11,7 @@ Larp OS (`l_os`) is an early research kernel. It has **tested process isolation 
   - `src/serial.rs` UART init `expect`: boot-time only, no external input.
   - `src/lib.rs` `init_memory` (`expect` x2): boot-time; failure means no usable memory/heap.
   - `src/memory.rs` double-`init` `panic!`: programming-error guard.
-  - `src/usermode.rs` / `src/syscall.rs` `panic!` on ring-3 event/syscall with no user process: invariant, can only be hit by kernel code issuing `int 0x80`.
+  - `src/usermode.rs` / `src/syscall.rs` / `src/sched.rs` `panic!`/`expect` on ring-3 event/syscall with no user process: invariant, can only be hit by kernel code issuing `int 0x80`.
   - `src/interrupts.rs`: deliberate fail-stop `panic!` for ring-0 exceptions.
   - Output paths (`print!`, serial) no longer `unwrap`/`expect`.
   Nothing on this list takes user input as its panic condition.
@@ -20,7 +20,8 @@ Larp OS (`l_os`) is an early research kernel. It has **tested process isolation 
 - Do not claim guarantees (e.g. "RAM-only means no traces", "zeroized means gone") that the platform cannot provide.
 
 ## Known weaknesses (current)
-- The shell, input handling and all kernel code run in ring 0; any kernel bug owns the machine.
+- All kernel code and (future) drivers run in ring 0; any kernel bug owns the machine. The shell is in ring 3.
+- The user-program build (`build.rs` -> nested `cargo`) downloads crates and uses the host toolchain; there is no reproducible-build or signature check on the produced ELF images.
 - Processes: single CPU, SMEP/SMAP only if the CPU offers them, assumed timer rate, abandoned kernel stacks on kill (see THREAT_MODEL.md).
 - Unhandled exceptions: #NMI, #MC, x87/SIMD, virtualization (they would double fault).
 - Interrupt handlers lock the global PIC mutex; `print!` disables interrupts around the VGA lock. Terminating a process abandons the interrupt frame it was in; no locks may be held at those points (not formally verified).

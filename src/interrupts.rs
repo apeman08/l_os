@@ -153,6 +153,9 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     let scancode: u8 = unsafe { port.read() };
     // Decoding and echo happen in the shell loop, not in interrupt context.
     crate::input::SCANCODES.push(scancode);
+    // A process may be sleeping in read_key(); the lock is only ever held with
+    // interrupts disabled, so taking it here cannot deadlock.
+    crate::sched::wake_keyboard();
 
     // SAFETY: EOI for the vector that is currently being serviced.
     unsafe {

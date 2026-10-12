@@ -27,13 +27,11 @@ fn kernel_main(boot_info: &'static bootloader::BootInfo) -> ! {
     l_os::init();
     l_os::init_memory(boot_info);
 
-    l_os::println!("Larp OS {}", env!("CARGO_PKG_VERSION"));
-
     #[cfg(test)]
     test_main();
 
     #[cfg(not(test))]
-    l_os::shell::run();
+    l_os::run_shell_forever();
 
     #[cfg(test)]
     l_os::hlt_loop();

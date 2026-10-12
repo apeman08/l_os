@@ -9,7 +9,7 @@ import os, socket, subprocess, sys, tempfile, time
 
 IMG = "target/x86_64-l_os/debug/bootimage-l_os.bin"
 # The kernel uses the German layout (De105Key): the US y/z keys are swapped.
-KEYNAMES = {" ": "spc", "\n": "ret", "\b": "backspace", "y": "z", "z": "y"}
+KEYNAMES = {" ": "spc", "\n": "ret", "\b": "backspace", "y": "z", "z": "y", "_": "shift-slash"}
 
 def main():
     tmp = tempfile.mkdtemp()
@@ -40,7 +40,7 @@ def main():
                          for r in range(25))
         type_("help\n"); type_("echo hix\b\n"); type_("bogus\n"); type_("help me\n"); snap()
         type_("uptime\n"); type_("security\n"); snap()
-        type_("run hello\n"); type_("run evil\n"); snap()
+        type_("run hello\n"); type_("run hello_rs\n"); type_("run evil\n"); snap()
         type_("run spin\n"); time.sleep(2); type_("run nope\n"); snap()
     finally:
         q.terminate(); q.wait()
@@ -48,8 +48,9 @@ def main():
     print("\n".join(snaps[-25:]))
     expected = ["l_os> echo hi", "\nhi\n", "unknown command: bogus", "help: unexpected arguments",
                 "ticks (~", "no NIC driver", "ring 3", "SMEP on, SMAP on", "hello from ring 3",
-                "[process exited with code 18]", "illegal memory access",
-                "exceeded its time budget", "unknown program 'nope'"]
+                "[process exited with code 18]", "hello from Rust in ring 3", "[process exited with code 0]",
+                "shell running in ring 3", "illegal memory access",
+                "exceeded its time budget", "unknown program 'nope' (hello | evil | spin | hello_rs)"]
     missing = [e for e in expected if e not in screen]
     if missing:
         print("FAIL, missing:", missing); sys.exit(1)

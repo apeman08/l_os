@@ -23,13 +23,13 @@ pub fn smap_enabled() -> bool {
 pub fn init() {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
 
-    // SAFETY: CPUID is available on every x86_64 CPU.
-    let max_leaf = unsafe { __cpuid(0) }.eax;
+    // CPUID is available on every x86_64 CPU (a safe intrinsic on this toolchain).
+    let max_leaf = __cpuid(0).eax;
     if max_leaf < 7 {
         return;
     }
-    // SAFETY: leaf 7 is within the reported maximum leaf.
-    let ebx = unsafe { __cpuid_count(7, 0) }.ebx;
+    // Leaf 7 is within the reported maximum leaf.
+    let ebx = __cpuid_count(7, 0).ebx;
     let has_smep = ebx & (1 << 7) != 0;
     let has_smap = ebx & (1 << 20) != 0;
 

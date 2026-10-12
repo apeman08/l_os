@@ -38,7 +38,6 @@ dependencies = [
  "l_core",
  "lazy_static",
  "linked_list_allocator",
- "pc-keyboard",
  "pic8259",
  "spin 0.5.2",
  "uart_16550",
@@ -72,12 +71,6 @@ checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
 ]
-
-[[package]]
-name = "pc-keyboard"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed089a1fbffe3337a1a345501c981f1eb1e47e69de5a40e852433e12953c3174"
 
 [[package]]
 name = "pic8259"

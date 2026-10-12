@@ -49,7 +49,7 @@ fn large_vec() {
 #[test_case]
 fn memory_is_reused_after_free() {
     // Far more total allocation than the heap holds: only works if freed.
-    for i in 0..(l_os::allocator::HEAP_SIZE) {
+    for i in 0..200_000usize {
         let x = Box::new([i as u8; 256]);
         assert_eq!(x[0], i as u8);
     }

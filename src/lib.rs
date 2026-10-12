@@ -19,7 +19,6 @@ pub mod memory;
 pub mod allocator;
 pub mod input;
 pub mod ipc;
-pub mod shell;
 pub mod sched;
 pub mod syscall;
 pub mod cpu;
@@ -45,6 +44,30 @@ pub fn init_memory(boot_info: &'static bootloader::BootInfo) {
     let mut guard = memory::MEMORY.lock();
     let mem = guard.as_mut().expect("memory initialized above");
     allocator::init_heap(mem).expect("kernel heap initialization failed");
+}
+
+/// Run the interactive shell as a ring-3 process, forever. It holds exactly:
+/// the console (write + grant), the keyboard, read-only system info, and a
+/// spawner for the built-in programs. If it ends, it is started again.
+pub fn run_shell_forever() -> ! {
+    use l_core::handles::{Object, Rights};
+    use usermode::{Spec, run_all, shell_program, PROGRAM_COUNT};
+
+    let handles = [
+        (Object::Console, Rights::WRITE.union(Rights::GRANT)),
+        (Object::Keyboard, Rights::READ),
+        (Object::System, Rights::READ),
+        (Object::Spawner((1u16 << PROGRAM_COUNT) - 1), Rights::USE),
+    ];
+    loop {
+        match run_all(&[Spec { program: shell_program(), handles: &handles, budget_ticks: u64::MAX }]) {
+            Ok(results) => println!("\n[shell ended: {:?}; restarting]", results[0].outcome),
+            Err(e) => {
+                println!("\ncannot start the shell: {:?}", e);
+                hlt_loop();
+            }
+        }
+    }
 }
 
 pub fn hlt_loop() -> ! {

@@ -132,6 +132,10 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64,
         abi::SYS_NET_CHECK => sys_net_check(a0, a1, a2, a3),
         abi::SYS_SEND => sys_send(a0, a1, a2, a3, a4),
         abi::SYS_RECV => sys_recv(a0, a1, a2),
+        abi::SYS_SPAWN => sys_spawn(a0, a1, a2, a3, a4),
+        abi::SYS_WAIT => sys_wait(a0),
+        abi::SYS_READ_KEY => sys_read_key(a0),
+        abi::SYS_SYSINFO => sys_sysinfo(a0, a1),
         _ => abi::ERR_NO_SYSCALL,
     }
 }
@@ -150,9 +154,14 @@ fn sys_write(handle: u64, ptr: u64, len: u64) -> i64 {
         return abi::ERR_BAD_POINTER;
     }
     for &b in &buf[..len as usize] {
-        // Only printable ASCII and newline reach the screen.
-        let c = if (0x20..=0x7e).contains(&b) || b == b'\n' { b } else { b'?' };
-        crate::print!("{}", c as char);
+        match b {
+            // Terminal controls a console holder is allowed to use.
+            0x08 => crate::vga_buffer::backspace(),
+            0x0c => crate::vga_buffer::clear_screen(),
+            // Anything else non-printable is shown as '?', never interpreted.
+            0x20..=0x7e | b'\n' => crate::print!("{}", b as char),
+            _ => crate::print!("?"),
+        }
     }
     len as i64
 }
@@ -251,5 +260,92 @@ fn sys_recv(ep: u64, ptr: u64, max_len: u64) -> i64 {
         // Nothing queued: sleep until a sender wakes us (or we are found to be
         // deadlocked and ended, in which case this call never returns).
         sched::block_on_recv(id);
+    }
+}
+
+fn sys_read_key(handle: u64) -> i64 {
+    match lookup(handle, Rights::READ) {
+        Ok((Object::Keyboard, _)) => {}
+        Ok(_) => return abi::ERR_NO_RIGHTS,
+        Err(e) => return e,
+    }
+    loop {
+        if let Some(sc) = crate::input::SCANCODES.pop() {
+            return sc as i64;
+        }
+        // Sleep until the keyboard interrupt queues a scancode.
+        sched::block_on_key();
+    }
+}
+
+fn sys_sysinfo(handle: u64, what: u64) -> i64 {
+    match lookup(handle, Rights::READ) {
+        Ok((Object::System, _)) => {}
+        Ok(_) => return abi::ERR_NO_RIGHTS,
+        Err(e) => return e,
+    }
+    match what {
+        abi::SYSINFO_TICKS => crate::time::ticks().min(i64::MAX as u64) as i64,
+        abi::SYSINFO_CPU => {
+            (if crate::cpu::smep_enabled() { abi::CPU_SMEP } else { 0 }
+                | if crate::cpu::smap_enabled() { abi::CPU_SMAP } else { 0 }) as i64
+        }
+        _ => abi::ERR_INVALID,
+    }
+}
+
+fn sys_spawn(spawner: u64, program: u64, grants_ptr: u64, grants_len: u64, budget: u64) -> i64 {
+    let mask = match lookup(spawner, Rights::USE) {
+        Ok((Object::Spawner(mask), _)) => mask,
+        Ok(_) => return abi::ERR_NO_RIGHTS,
+        Err(e) => return e,
+    };
+    // The spawner names exactly which programs its holder may start.
+    if program >= usermode::PROGRAM_COUNT as u64 || mask & (1 << program) == 0 {
+        return abi::ERR_NO_RIGHTS;
+    }
+    let Some(image) = usermode::builtin(program as u16) else { return abi::ERR_INVALID };
+    if grants_len > abi::MAX_SPAWN_GRANTS || budget == 0 {
+        return abi::ERR_INVALID;
+    }
+    // Read the grant list: (parent_handle, rights_mask) pairs of u64.
+    let mut raw = [0u8; abi::MAX_SPAWN_GRANTS as usize * 16];
+    let bytes = grants_len as usize * 16;
+    if bytes > 0 && !copy_from_user(grants_ptr, bytes as u64, &mut raw) {
+        return abi::ERR_BAD_POINTER;
+    }
+    // Derive every grant from the parent's own table: needs GRANT, only narrows.
+    let mut granted = [(Object::Console, Rights::NONE); abi::MAX_SPAWN_GRANTS as usize];
+    for i in 0..grants_len as usize {
+        let word = |o: usize| u64::from_le_bytes(raw[i * 16 + o..i * 16 + o + 8].try_into().unwrap_or([0; 8]));
+        let (handle, rmask) = (word(0), word(8));
+        match sched::with_handles(|t| t.derive(handle, Rights::from_bits(rmask))) {
+            Some(Ok(pair)) => granted[i] = pair,
+            Some(Err(e)) => return handle_err(e),
+            None => return abi::ERR_BAD_HANDLE,
+        }
+    }
+    let Some(parent) = sched::current_pid() else { return abi::ERR_BAD_HANDLE };
+    // A child can never be given more CPU time than its parent has left.
+    let budget = budget.min(sched::current_remaining_budget());
+    match usermode::spawn_child(parent, image, &granted[..grants_len as usize], budget) {
+        Ok(pid) => pid as i64,
+        Err(e) => e,
+    }
+}
+
+fn sys_wait(pid: u64) -> i64 {
+    let Some(me) = sched::current_pid() else { return abi::ERR_BAD_HANDLE };
+    let Ok(pid) = u32::try_from(pid) else { return abi::ERR_NOT_CHILD };
+    loop {
+        match sched::reap_child(me, pid) {
+            sched::Reap::NotChild => return abi::ERR_NOT_CHILD,
+            sched::Reap::Done(child) => {
+                let raw = child.outcome().unwrap_or(Outcome::GeneralProtection).to_raw();
+                usermode::release(child);
+                return raw as i64;
+            }
+            sched::Reap::StillRunning => sched::block_on_child(pid),
+        }
     }
 }

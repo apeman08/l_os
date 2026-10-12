@@ -5,12 +5,15 @@
 //!   saving callee-saved registers on the current kernel stack, loading the
 //!   target's stack pointer and CR3, and restoring.
 //! * The "boot context" (whoever called `usermode::run_all`) waits until no
-//!   process is left; it is never preempted.
+//!   process can run any more; it is never preempted.
 //! * All scheduler state is touched with interrupts disabled (syscall/ISR
 //!   gates clear IF; boot code uses `without_interrupts`). No lock guard is
 //!   ever held across a context switch.
 //! * Preemption happens only when the timer interrupts *user* code; kernel
 //!   code is never preempted.
+//! * When every process is blocked but some wait for the keyboard, the CPU
+//!   idles in `hlt` (on the stack of the process that just blocked) until an
+//!   interrupt makes something runnable.
 
 use crate::{gdt, memory};
 use alloc::{boxed::Box, vec, vec::Vec};
@@ -24,7 +27,7 @@ use x86_64::{
 };
 
 pub const MAX_PROCS: usize = 8;
-const KERNEL_STACK_SIZE: usize = 32 * 1024;
+const KERNEL_STACK_SIZE: usize = 64 * 1024;
 
 global_asm!(
     r#"
@@ -69,11 +72,16 @@ enum State {
     Running,
     /// Waiting for a message on this endpoint.
     BlockedRecv(u16),
+    /// Waiting for the child with this pid to end.
+    BlockedWait(u32),
+    /// Waiting for a keyboard scancode (woken by the keyboard interrupt).
+    BlockedKey,
     Zombie,
 }
 
 pub struct Process {
     pub id: u32,
+    parent: Option<u32>,
     handles: HandleTable,
     state: State,
     pub(crate) l4: PhysFrame,
@@ -88,20 +96,28 @@ pub struct Process {
 impl Process {
     /// Create a process that will start executing in ring 3 at `entry` with
     /// stack pointer `user_sp` when first scheduled.
-    pub fn new(id: u32, handles: HandleTable, budget_ticks: u64, l4: PhysFrame, entry: u64, user_sp: u64) -> Box<Process> {
+    pub fn new(
+        id: u32,
+        parent: Option<u32>,
+        handles: HandleTable,
+        budget_ticks: u64,
+        l4: PhysFrame,
+        entry: u64,
+        user_sp: u64,
+    ) -> Box<Process> {
         let mut kstack = vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
         let (user_cs, user_ss) = gdt::user_selectors();
         let top = (kstack.as_mut_ptr() as u64 + KERNEL_STACK_SIZE as u64) & !0xf;
 
         // Layout (high -> low): iretq frame, return address, six saved regs.
         let words: [u64; 12] = [
-            0, 0, 0, 0, 0, 0,                // r15 r14 r13 r12 rbp rbx (popped first)
+            0, 0, 0, 0, 0, 0,                    // r15 r14 r13 r12 rbp rbx (popped first)
             user_trampoline as *const () as u64, // `ret` target
-            entry,                           // iretq: rip
-            user_cs.0 as u64,                // cs
-            0x202,                           // rflags: IF=1, IOPL=0
-            user_sp,                         // rsp
-            user_ss.0 as u64,                // ss
+            entry,                               // iretq: rip
+            user_cs.0 as u64,                    // cs
+            0x202,                               // rflags: IF=1, IOPL=0
+            user_sp,                             // rsp
+            user_ss.0 as u64,                    // ss
         ];
         let saved_rsp = top - (words.len() as u64) * 8;
         // SAFETY: [saved_rsp, top) lies inside `kstack`, which we own.
@@ -113,6 +129,7 @@ impl Process {
         }
         Box::new(Process {
             id,
+            parent,
             handles,
             state: State::Ready,
             l4,
@@ -139,7 +156,7 @@ impl Process {
 }
 
 struct Scheduler {
-    procs: Vec<Box<Process>>,
+    slots: [Option<Box<Process>>; MAX_PROCS],
     current: Option<usize>,
     boot_waiting: bool,
 }
@@ -150,50 +167,105 @@ enum Target {
     Proc { rsp: u64, l4: PhysFrame, kstack_top: u64 },
 }
 
+enum Stop {
+    Switch(Target),
+    /// Nothing runnable, but a keyboard interrupt may change that.
+    Idle,
+}
+
 impl Scheduler {
-    /// First Ready process after index `after` in round-robin order (wraps,
-    /// and may return `after` itself if it is the only Ready one).
-    fn select_next(&self, after: usize) -> Option<usize> {
-        let n = self.procs.len();
-        (1..=n).map(|k| (after + k) % n).find(|&i| self.procs[i].state == State::Ready)
+    fn proc(&self, i: usize) -> &Process {
+        self.slots[i].as_deref().expect("scheduler index names a live slot")
     }
 
-    /// Nothing can run any more. Processes still blocked will never be woken
-    /// (the only wake-ups come from other processes), so end them.
-    fn kill_blocked(&mut self) {
-        let now = crate::time::ticks();
-        for p in self.procs.iter_mut().filter(|p| matches!(p.state, State::BlockedRecv(_))) {
-            p.state = State::Zombie;
-            p.outcome = Some(Outcome::Deadlock);
-            p.finished_tick = now;
+    fn proc_mut(&mut self, i: usize) -> &mut Process {
+        self.slots[i].as_deref_mut().expect("scheduler index names a live slot")
+    }
+
+    /// First Ready process after slot `after` in round-robin order (wraps, and
+    /// may return `after` itself if it is the only Ready one).
+    fn select_next(&self, after: usize) -> Option<usize> {
+        (1..=MAX_PROCS)
+            .map(|k| (after + k) % MAX_PROCS)
+            .find(|&i| matches!(&self.slots[i], Some(p) if p.state == State::Ready))
+    }
+
+    fn any_blocked_on_key(&self) -> bool {
+        self.slots.iter().flatten().any(|p| p.state == State::BlockedKey)
+    }
+
+    /// Wake parents waiting for a process that has become a zombie.
+    fn wake_waiters(&mut self) {
+        let zombies: Vec<u32> = self.slots.iter().flatten().filter(|p| p.state == State::Zombie).map(|p| p.id).collect();
+        for p in self.slots.iter_mut().flatten() {
+            if let State::BlockedWait(pid) = p.state {
+                if zombies.contains(&pid) {
+                    p.state = State::Ready;
+                }
+            }
         }
     }
 
+    /// End processes that can never be woken. Receivers go first: ending them
+    /// may unblock a parent waiting for them, so waiters are only ended when no
+    /// receiver was left. Returns whether anything was ended.
+    fn kill_unwakeable(&mut self) -> bool {
+        let now = crate::time::ticks();
+        let mut killed = false;
+        for pass in 0..2 {
+            for p in self.slots.iter_mut().flatten() {
+                let hit = match (pass, p.state) {
+                    (0, State::BlockedRecv(_)) => true,
+                    (1, State::BlockedWait(_)) => true,
+                    _ => false,
+                };
+                if hit {
+                    p.state = State::Zombie;
+                    p.outcome = Some(Outcome::Deadlock);
+                    p.finished_tick = now;
+                    killed = true;
+                }
+            }
+            if killed {
+                break;
+            }
+        }
+        killed
+    }
+
     /// Choose what runs after the current process stopped being runnable.
-    fn next_after_stop(&mut self, cur: usize) -> Target {
-        match self.select_next(cur) {
-            Some(next) => {
-                self.procs[next].state = State::Running;
+    fn stop_current(&mut self, cur: usize) -> Stop {
+        loop {
+            if let Some(next) = self.select_next(cur) {
+                self.proc_mut(next).state = State::Running;
                 self.current = Some(next);
-                self.target(next)
+                return Stop::Switch(self.target(next));
             }
-            None => {
-                self.kill_blocked();
-                assert!(self.boot_waiting, "last process stopped but nobody is waiting");
-                self.current = None;
-                Target::Boot
+            if self.any_blocked_on_key() {
+                return Stop::Idle;
             }
+            if self.kill_unwakeable() {
+                self.wake_waiters();
+                continue; // ending a receiver may have unblocked its parent
+            }
+            assert!(self.boot_waiting, "nothing can run and nobody is waiting");
+            self.current = None;
+            return Stop::Switch(Target::Boot);
         }
     }
 
     fn target(&self, idx: usize) -> Target {
-        let p = &self.procs[idx];
+        let p = self.proc(idx);
         Target::Proc { rsp: p.saved_rsp, l4: p.l4, kstack_top: p.kernel_stack_top() }
+    }
+
+    fn save_slot(&mut self, idx: usize) -> *mut u64 {
+        &raw mut self.proc_mut(idx).saved_rsp
     }
 }
 
 static SCHED: Mutex<Scheduler> =
-    Mutex::new(Scheduler { procs: Vec::new(), current: None, boot_waiting: false });
+    Mutex::new(Scheduler { slots: [const { None }; MAX_PROCS], current: None, boot_waiting: false });
 
 /// Saved stack pointer of the boot context while it waits.
 static BOOT_RSP: AtomicU64 = AtomicU64::new(0);
@@ -224,71 +296,125 @@ unsafe fn perform_switch(save: *mut u64, target: Target) {
     unsafe { switch_context(save, new_rsp) };
 }
 
-/// Install processes and run them until none is left. Called by the boot
-/// context with interrupts disabled; returns when all are zombies.
+/// With interrupts enabled, halt until some process becomes Ready. Returns the
+/// target to switch to, or `None` if the waiting process itself is the one
+/// that became runnable (it simply continues).
+fn idle_until_runnable(cur: usize) -> Option<Target> {
+    use x86_64::instructions::interrupts;
+    loop {
+        interrupts::enable_and_hlt();
+        interrupts::disable();
+        let mut s = SCHED.lock();
+        if let Some(n) = s.select_next(cur) {
+            s.proc_mut(n).state = State::Running;
+            s.current = Some(n);
+            return if n == cur { None } else { Some(s.target(n)) };
+        }
+    }
+}
+
+/// Install processes and run them until none can run any more. Called by the
+/// boot context with interrupts disabled. Returns every process still in the
+/// table (zombies), in slot order.
 pub fn run_until_idle(procs: Vec<Box<Process>>) -> Vec<Box<Process>> {
     let target = {
         let mut s = SCHED.lock();
-        assert!(s.procs.is_empty() && !s.boot_waiting, "scheduler already active");
-        s.procs = procs;
-        if s.procs.is_empty() {
+        assert!(!s.boot_waiting && s.slots.iter().all(Option::is_none), "scheduler already active");
+        assert!(procs.len() <= MAX_PROCS);
+        if procs.is_empty() {
             return Vec::new();
         }
+        for (i, p) in procs.into_iter().enumerate() {
+            s.slots[i] = Some(p);
+        }
         s.boot_waiting = true;
-        let n = s.procs.len();
-        let first = s.select_next(n - 1).expect("new processes are Ready");
-        s.procs[first].state = State::Running;
+        let first = s.select_next(MAX_PROCS - 1).expect("new processes are Ready");
+        s.proc_mut(first).state = State::Running;
         s.current = Some(first);
         s.target(first)
     };
     // SAFETY: interrupts are disabled by the caller; BOOT_RSP is a static;
     // the target process was just created.
     unsafe { perform_switch(BOOT_RSP.as_ptr(), target) };
-    // Resumed: every process has exited.
+    // Resumed: nothing can run any more.
     let mut s = SCHED.lock();
     s.boot_waiting = false;
     s.current = None;
-    core::mem::take(&mut s.procs)
+    s.slots.iter_mut().filter_map(Option::take).collect()
+}
+
+/// Run the common "current process stops" path: pick what is next and switch.
+fn stop_and_switch(cur: usize, save: *mut u64, stop: Stop) {
+    let target = match stop {
+        Stop::Switch(t) => Some(t),
+        Stop::Idle => idle_until_runnable(cur),
+    };
+    if let Some(t) = target {
+        // SAFETY: syscall/ISR gate (IF=0), no lock guard alive, `save` points
+        // into a boxed Process that stays in its slot until reaped.
+        unsafe { perform_switch(save, t) };
+    }
 }
 
 /// Give up the CPU voluntarily (syscall) or because the slice ended (timer).
 pub fn yield_current() {
-    let (save, target) = {
+    let (cur, save, stop) = {
         let mut s = SCHED.lock();
         let Some(cur) = s.current else { return };
-        s.procs[cur].state = State::Ready;
+        s.proc_mut(cur).state = State::Ready;
         let next = s.select_next(cur).unwrap_or(cur);
-        s.procs[next].state = State::Running;
+        s.proc_mut(next).state = State::Running;
         if next == cur {
             return;
         }
         s.current = Some(next);
-        (&raw mut s.procs[cur].saved_rsp, s.target(next))
+        let t = s.target(next);
+        (cur, s.save_slot(cur), Stop::Switch(t))
     };
-    // SAFETY: we are in a syscall/ISR gate (IF=0), the lock guard is dropped,
-    // `save` points into a boxed Process that stays in the table until reaped.
-    unsafe { perform_switch(save, target) };
+    stop_and_switch(cur, save, stop);
 }
 
-/// Block the current process until a message may be available on `endpoint`,
-/// run something else meanwhile, and return once woken. Callers re-check.
-pub fn block_on_recv(endpoint: u16) {
-    let (save, target) = {
+/// Block the current process in `state`; returns once it was woken and is
+/// running again. Callers re-check their condition in a loop.
+fn block_current(state: State) {
+    let (cur, save, stop) = {
         let mut s = SCHED.lock();
         let Some(cur) = s.current else { return };
-        s.procs[cur].state = State::BlockedRecv(endpoint);
-        let target = s.next_after_stop(cur);
-        (&raw mut s.procs[cur].saved_rsp, target)
+        s.proc_mut(cur).state = state;
+        let stop = s.stop_current(cur);
+        (cur, s.save_slot(cur), stop)
     };
-    // SAFETY: as in yield_current. If nothing else could run, the process was
-    // turned into a zombie by kill_blocked and is never resumed.
-    unsafe { perform_switch(save, target) };
+    stop_and_switch(cur, save, stop);
+}
+
+/// Wait for a message on `endpoint` (see `block_current`).
+pub fn block_on_recv(endpoint: u16) {
+    block_current(State::BlockedRecv(endpoint));
+}
+
+/// Wait for a keyboard scancode.
+pub fn block_on_key() {
+    block_current(State::BlockedKey);
+}
+
+/// Wait for child `pid` to end.
+pub fn block_on_child(pid: u32) {
+    block_current(State::BlockedWait(pid));
 }
 
 /// Make every process waiting on `endpoint` runnable again.
 pub fn wake_endpoint(endpoint: u16) {
-    for p in SCHED.lock().procs.iter_mut() {
+    for p in SCHED.lock().slots.iter_mut().flatten() {
         if p.state == State::BlockedRecv(endpoint) {
+            p.state = State::Ready;
+        }
+    }
+}
+
+/// Keyboard interrupt hook: wake everything waiting for a key.
+pub fn wake_keyboard() {
+    for p in SCHED.lock().slots.iter_mut().flatten() {
+        if p.state == State::BlockedKey {
             p.state = State::Ready;
         }
     }
@@ -298,29 +424,74 @@ pub fn wake_endpoint(endpoint: u16) {
 pub fn with_handles<R>(f: impl FnOnce(&mut HandleTable) -> R) -> Option<R> {
     let mut s = SCHED.lock();
     let cur = s.current?;
-    Some(f(&mut s.procs[cur].handles))
+    Some(f(&mut s.proc_mut(cur).handles))
+}
+
+pub fn current_pid() -> Option<u32> {
+    let s = SCHED.lock();
+    s.current.map(|c| s.proc(c).id)
+}
+
+/// CPU ticks the running process may still use.
+pub fn current_remaining_budget() -> u64 {
+    let s = SCHED.lock();
+    s.current.map(|c| s.proc(c).budget_ticks.saturating_sub(s.proc(c).used_ticks)).unwrap_or(0)
+}
+
+/// Put a freshly built process into a free slot.
+pub fn add_process(p: Box<Process>) -> Result<(), Box<Process>> {
+    let mut s = SCHED.lock();
+    match s.slots.iter().position(Option::is_none) {
+        Some(i) => {
+            s.slots[i] = Some(p);
+            Ok(())
+        }
+        None => Err(p),
+    }
+}
+
+pub enum Reap {
+    /// No such process, or it is not a child of the caller.
+    NotChild,
+    StillRunning,
+    /// The child ended; its slot is free again. The caller frees its memory.
+    Done(Box<Process>),
+}
+
+pub fn reap_child(parent_pid: u32, child_pid: u32) -> Reap {
+    let mut s = SCHED.lock();
+    let Some(i) = s.slots.iter().position(|p| matches!(p, Some(p) if p.id == child_pid)) else {
+        return Reap::NotChild;
+    };
+    let p = s.proc(i);
+    if p.parent != Some(parent_pid) {
+        return Reap::NotChild;
+    }
+    if p.state != State::Zombie {
+        return Reap::StillRunning;
+    }
+    Reap::Done(s.slots[i].take().expect("slot checked above"))
 }
 
 /// End the current process and never return to it.
 pub fn exit_current(outcome: Outcome) -> ! {
-    let (save, target) = {
+    let (cur, save, stop) = {
         let mut s = SCHED.lock();
         let cur = match s.current {
             Some(c) => c,
             None => panic!("ring-3 event ({:?}) with no user process running", outcome),
         };
         {
-            let p = &mut s.procs[cur];
+            let p = s.proc_mut(cur);
             p.state = State::Zombie;
             p.outcome = Some(outcome);
             p.finished_tick = crate::time::ticks();
         }
-        let target = s.next_after_stop(cur);
-        (&raw mut s.procs[cur].saved_rsp, target)
+        s.wake_waiters();
+        let stop = s.stop_current(cur);
+        (cur, s.save_slot(cur), stop)
     };
-    // SAFETY: as in yield_current; the zombie's stack is never resumed, and it
-    // is freed only after the boot context regains control.
-    unsafe { perform_switch(save, target) };
+    stop_and_switch(cur, save, stop);
     unreachable!("a zombie process was resumed");
 }
 
@@ -338,11 +509,11 @@ pub fn on_tick(interrupted_user_code: bool) {
     let action = {
         let mut s = SCHED.lock();
         let Some(cur) = s.current else { return };
-        let p = &mut s.procs[cur];
+        let p = s.proc_mut(cur);
         p.used_ticks += 1;
         if p.used_ticks >= p.budget_ticks {
             Action::Kill
-        } else if s.procs.iter().enumerate().any(|(i, q)| i != cur && q.state == State::Ready) {
+        } else if s.slots.iter().enumerate().any(|(i, q)| i != cur && matches!(q, Some(q) if q.state == State::Ready)) {
             Action::Yield
         } else {
             Action::Nothing
@@ -357,9 +528,4 @@ pub fn on_tick(interrupted_user_code: bool) {
 
 pub fn process_active() -> bool {
     SCHED.lock().current.is_some()
-}
-
-pub fn scheduler_busy() -> bool {
-    let s = SCHED.lock();
-    s.boot_waiting || !s.procs.is_empty()
 }

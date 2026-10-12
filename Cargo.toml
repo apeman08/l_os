@@ -2,6 +2,7 @@
 name = "l_os"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [package.metadata.bootimage]
 run-args = ["-cpu", "max"]
@@ -23,6 +24,10 @@ harness = true
 
 [[test]]
 name = "capabilities"
+harness = true
+
+[[test]]
+name = "userland"
 harness = true
 
 [[test]]
@@ -82,7 +87,6 @@ spin = "0.5.2"
 x86_64 = "0.15.5"
 uart_16550 = "0.6.0"
 pic8259 = "0.11.0"
-pc-keyboard = "0.7.0"
 
 [dependencies.lazy_static]
 version = "1.0"

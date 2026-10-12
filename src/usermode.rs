@@ -1,11 +1,12 @@
 //! Ring 3 processes: building address spaces, loading programs, and the
-//! `run`/`run_all` entry points. Scheduling lives in `sched.rs`.
+//! `run`/`run_all`/`spawn_child` entry points. Scheduling lives in `sched.rs`.
 //!
-//! Current limits (see docs/THREAT_MODEL.md): programs are raw machine code
-//! copied into one page (no ELF loader), at most `sched::MAX_PROCS` processes,
-//! no blocking IPC. Isolation rests on separate page tables (kernel pages
-//! supervisor-only), ring 3 privilege checks, and syscall argument validation;
-//! it is exercised by `tests/usermode.rs` and `tests/processes.rs`.
+//! Programs are either raw machine code (a single read+execute page, used by
+//! the hand-assembled test programs) or statically linked ELF executables
+//! built from `user/` (validated by `l_core::elf` before anything is mapped).
+//! Isolation rests on separate page tables (kernel pages supervisor-only),
+//! ring 3 privilege checks, SMEP/SMAP where available, and syscall argument
+//! validation; it is exercised by `tests/`.
 
 use crate::memory::{self, Memory};
 use crate::sched::{self, Process};
@@ -13,19 +14,24 @@ use alloc::{boxed::Box, vec::Vec};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use l_core::{
+    elf,
     handles::{HandleTable, Object, Rights},
     policy::NetPolicy,
     syscall::Outcome,
 };
 use spin::Mutex;
 use x86_64::{
-    structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB},
+    structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB},
     VirtAddr,
 };
 
 pub const USER_CODE_ADDR: u64 = 0x_7000_0000_0000;
 pub const USER_STACK_TOP: u64 = 0x_7000_0010_0000;
-const USER_STACK_PAGES: u64 = 2;
+pub const USER_STACK_PAGES: u64 = 8;
+/// ELF segments must lie in `[USER_IMAGE_START, USER_IMAGE_END)`; one unmapped
+/// guard page separates the image from the stack.
+const USER_IMAGE_START: u64 = USER_CODE_ADDR;
+const USER_IMAGE_END: u64 = USER_STACK_TOP - USER_STACK_PAGES * 4096 - 4096;
 
 /// The network policy consulted by `SYS_NET_CHECK`. Do not hold this lock
 /// while calling [`run`].
@@ -33,6 +39,20 @@ pub static POLICY: Mutex<NetPolicy> = Mutex::new(NetPolicy::new());
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
+
+macro_rules! user_elfs {
+    ($($name:ident),* $(,)?) => {
+        /// The ELF image of a program built from `user/src/bin/<name>.rs`.
+        pub fn user_elf(name: &str) -> Option<&'static [u8]> {
+            match name {
+                $(stringify!($name) => Some(include_bytes!(concat!(env!("OUT_DIR"), "/user/", stringify!($name), ".elf"))),)*
+                _ => None,
+            }
+        }
+    };
+}
+
+user_elfs!(shell, hello_rs, spawn_probe, key_probe, fault_write_code, fault_exec_stack, fault_write_rodata);
 
 global_asm!(
     r#"
@@ -83,15 +103,26 @@ pub enum RunError {
     TooMany,
     /// A handle in the spec is invalid (too many, or names a missing endpoint).
     BadHandles,
+    /// The ELF image was rejected by the validating parser.
+    BadImage,
     /// Memory manager missing or out of frames.
     NoMemory,
+}
+
+/// Machine code to run.
+#[derive(Clone, Copy)]
+pub enum Program<'a> {
+    /// One read+execute page entered at its first byte.
+    Raw(&'a [u8]),
+    /// A statically linked ELF executable (validated before loading).
+    Elf(&'a [u8]),
 }
 
 /// What to start: code, the handles the process is born with (slot order =
 /// handle values 0, 1, 2, ... in a fresh table), and its CPU budget. A process
 /// has no authority beyond these handles.
 pub struct Spec<'a> {
-    pub program: &'a [u8],
+    pub program: Program<'a>,
     pub handles: &'a [(Object, Rights)],
     pub budget_ticks: u64,
 }
@@ -112,11 +143,31 @@ pub fn terminate_current(outcome: Outcome) -> ! {
     sched::exit_current(outcome)
 }
 
-/// Build the address space of one process. On any failure everything already
-/// allocated for it is released again.
-fn build_process(mem: &mut Memory, spec: &Spec) -> Result<Box<Process>, RunError> {
+/// Built-in programs a `Spawner` handle can start, by id.
+pub const PROGRAM_HELLO: u16 = 0;
+pub const PROGRAM_EVIL: u16 = 1;
+pub const PROGRAM_SPIN: u16 = 2;
+pub const PROGRAM_HELLO_RS: u16 = 3;
+pub const PROGRAM_COUNT: u16 = 4;
+
+pub fn builtin(id: u16) -> Option<Program<'static>> {
+    Some(match id {
+        PROGRAM_HELLO => Program::Raw(prog_hello()),
+        PROGRAM_EVIL => Program::Raw(prog_read_kernel()),
+        PROGRAM_SPIN => Program::Raw(prog_spin()),
+        PROGRAM_HELLO_RS => Program::Elf(user_elf("hello_rs")?),
+        _ => return None,
+    })
+}
+
+/// The interactive shell image.
+pub fn shell_program() -> Program<'static> {
+    Program::Elf(user_elf("shell").expect("shell image is built by build.rs"))
+}
+
+fn build_table(handles: &[(Object, Rights)]) -> Result<HandleTable, RunError> {
     let mut table = HandleTable::new();
-    for &(object, rights) in spec.handles {
+    for &(object, rights) in handles {
         if let Object::Endpoint(id) = object {
             if !crate::ipc::exists(id) {
                 return Err(RunError::BadHandles);
@@ -124,11 +175,25 @@ fn build_process(mem: &mut Memory, spec: &Spec) -> Result<Box<Process>, RunError
         }
         table.insert(object, rights).map_err(|_| RunError::BadHandles)?;
     }
+    Ok(table)
+}
+
+/// Build the address space of one process. On any failure everything already
+/// allocated for it is released again.
+fn build_process(
+    mem: &mut Memory,
+    program: Program,
+    handles: &[(Object, Rights)],
+    budget_ticks: u64,
+    parent: Option<u32>,
+) -> Result<Box<Process>, RunError> {
+    let table = build_table(handles)?;
     let l4 = memory::create_address_space(mem).map_err(|_| RunError::NoMemory)?;
-    match populate(mem, l4, spec) {
-        Ok(()) => {
+    match populate(mem, l4, program) {
+        Ok(entry) => {
             let id = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-            Ok(Process::new(id, table, spec.budget_ticks, l4, USER_CODE_ADDR, USER_STACK_TOP))
+            // 8 bytes below the top: the ABI expects rsp % 16 == 8 at function entry.
+            Ok(Process::new(id, parent, table, budget_ticks, l4, entry, USER_STACK_TOP - 8))
         }
         Err(e) => {
             memory::destroy_address_space(mem, l4);
@@ -137,57 +202,133 @@ fn build_process(mem: &mut Memory, spec: &Spec) -> Result<Box<Process>, RunError
     }
 }
 
-fn populate(mem: &mut Memory, l4: x86_64::structures::paging::PhysFrame, spec: &Spec) -> Result<(), RunError> {
-    // SAFETY: `l4` was just created by create_address_space and is not active.
-    let mut mapper = unsafe { memory::mapper_for(l4) };
+/// Map one fresh zeroed frame at `addr`, optionally prefilled with `init`.
+fn map_page(
+    mem: &mut Memory,
+    mapper: &mut x86_64::structures::paging::OffsetPageTable<'static>,
+    addr: u64,
+    flags: PageTableFlags,
+    init: &[u8],
+) -> Result<(), RunError> {
     let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-    let off = memory::phys_offset();
-
-    let mut map = |addr: u64, flags: PageTableFlags, init: Option<&[u8]>| -> Result<(), RunError> {
-        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
-        let frame = mem.frames.allocate_frame().ok_or(RunError::NoMemory)?; // zeroed
-        if let Some(bytes) = init {
-            // SAFETY: the frame is exclusively ours and mapped at the physical
-            // offset; bytes.len() <= 4096 was checked by the caller. This goes
-            // through the kernel's mapping, never through user addresses.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    (off + frame.start_address().as_u64()).as_mut_ptr::<u8>(),
-                    bytes.len(),
-                );
-            }
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+    let frame: PhysFrame = mem.frames.allocate_frame().ok_or(RunError::NoMemory)?; // zeroed
+    if !init.is_empty() {
+        debug_assert!(init.len() <= 4096);
+        // SAFETY: the frame is exclusively ours and mapped at the physical
+        // offset. This goes through the kernel's mapping, never through user
+        // addresses (so it also works with SMAP on).
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                init.as_ptr(),
+                (memory::phys_offset() + frame.start_address().as_u64()).as_mut_ptr::<u8>(),
+                init.len(),
+            );
         }
-        // SAFETY: the target virtual page is unmapped in this fresh address
-        // space and the frame is not mapped anywhere else.
-        unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut mem.frames) }
-            .map_err(|_| RunError::NoMemory)?
-            .ignore(); // not the active address space: nothing to flush
-        Ok(())
-    };
-
-    // Code: readable + executable, never writable (W^X).
-    map(USER_CODE_ADDR, PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE, Some(spec.program))?;
-    // Stack: writable, never executable.
-    let stack_base = USER_STACK_TOP - USER_STACK_PAGES * 4096;
-    let rw = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE
-        | PageTableFlags::NO_EXECUTE;
-    for i in 0..USER_STACK_PAGES {
-        map(stack_base + i * 4096, rw, None)?;
     }
+    // SAFETY: the target virtual page is unmapped in this fresh address space
+    // and the frame is not mapped anywhere else.
+    unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut mem.frames) }
+        .map_err(|_| RunError::NoMemory)?
+        .ignore(); // not the active address space: nothing to flush
     Ok(())
 }
 
-/// Run several programs concurrently (preemptive round-robin) until all have
-/// ended, each in its own address space with exactly its `caps` and a budget
-/// of `budget_ticks` CPU ticks. Results are in the order of `specs`.
+/// Map the program image and the stack; returns the entry address.
+fn populate(mem: &mut Memory, l4: PhysFrame, program: Program) -> Result<u64, RunError> {
+    // SAFETY: `l4` was just created by create_address_space and is not active.
+    let mut mapper = unsafe { memory::mapper_for(l4) };
+    let user = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+
+    let entry = match program {
+        Program::Raw(code) => {
+            if code.is_empty() || code.len() > 4096 {
+                return Err(RunError::TooLarge);
+            }
+            // Code: readable + executable, never writable (W^X).
+            map_page(mem, &mut mapper, USER_CODE_ADDR, user, code)?;
+            USER_CODE_ADDR
+        }
+        Program::Elf(bytes) => {
+            let image = elf::parse(bytes, USER_IMAGE_START, USER_IMAGE_END).map_err(|_| RunError::BadImage)?;
+            for seg in image.segments() {
+                let flags = if seg.writable {
+                    user | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE
+                } else if seg.executable {
+                    user
+                } else {
+                    user | PageTableFlags::NO_EXECUTE
+                };
+                for i in 0..seg.pages() {
+                    let off_in_seg = i * 4096;
+                    let init: &[u8] = if off_in_seg < seg.file_size {
+                        let n = (seg.file_size - off_in_seg).min(4096);
+                        let start = (seg.file_offset + off_in_seg) as usize;
+                        // The parser guaranteed file_offset + file_size <= len.
+                        &bytes[start..start + n as usize]
+                    } else {
+                        &[]
+                    };
+                    map_page(mem, &mut mapper, seg.vaddr + off_in_seg, flags, init)?;
+                }
+            }
+            image.entry
+        }
+    };
+
+    // Stack: writable, never executable; the page below it stays unmapped.
+    let rw = user | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let stack_base = USER_STACK_TOP - USER_STACK_PAGES * 4096;
+    for i in 0..USER_STACK_PAGES {
+        map_page(mem, &mut mapper, stack_base + i * 4096, rw, &[])?;
+    }
+    Ok(entry)
+}
+
+/// Start a new process from user space (the `spawn` syscall). `handles` have
+/// already been derived from the parent's table by the caller.
+pub fn spawn_child(
+    parent_pid: u32,
+    program: Program,
+    handles: &[(Object, Rights)],
+    budget_ticks: u64,
+) -> Result<u32, i64> {
+    use l_core::syscall::{ERR_INVALID, ERR_NO_SLOT, ERR_TABLE_FULL};
+
+    let mut guard = memory::MEMORY.lock();
+    let mem = guard.as_mut().ok_or(ERR_INVALID)?;
+    let proc = build_process(mem, program, handles, budget_ticks, Some(parent_pid)).map_err(|e| match e {
+        RunError::BadHandles => ERR_TABLE_FULL,
+        _ => ERR_INVALID,
+    })?;
+    let (l4, pid) = (proc.l4, proc.id);
+    match sched::add_process(proc) {
+        Ok(()) => Ok(pid),
+        Err(_rejected) => {
+            memory::destroy_address_space(mem, l4);
+            Err(ERR_NO_SLOT)
+        }
+    }
+}
+
+/// Free the memory of a process that ended and was reaped.
+pub fn release(p: Box<Process>) {
+    if let Some(mem) = memory::MEMORY.lock().as_mut() {
+        memory::destroy_address_space(mem, p.l4);
+    }
+}
+
+/// Run several programs concurrently (preemptive round-robin) until nothing
+/// can run any more, each in its own address space with exactly its handles
+/// and a budget of `budget_ticks` CPU ticks. Results are in the order of
+/// `specs`. Processes they spawned are reaped at the end.
 pub fn run_all(specs: &[Spec]) -> Result<Vec<ProcessResult>, RunError> {
     use x86_64::instructions::interrupts;
 
     if specs.len() > sched::MAX_PROCS {
         return Err(RunError::TooMany);
     }
-    if specs.iter().any(|s| s.program.is_empty() || s.program.len() > 4096) {
+    if specs.iter().any(|s| matches!(s.program, Program::Raw(c) if c.is_empty() || c.len() > 4096)) {
         return Err(RunError::TooLarge);
     }
     if RUNNING.swap(true, Ordering::SeqCst) {
@@ -204,12 +345,16 @@ fn run_all_inner(specs: &[Spec]) -> Result<Vec<ProcessResult>, RunError> {
     use x86_64::instructions::interrupts;
 
     let mut procs: Vec<Box<Process>> = Vec::with_capacity(specs.len());
+    let mut ids: Vec<u32> = Vec::with_capacity(specs.len());
     {
         let mut guard = memory::MEMORY.lock();
         let mem = guard.as_mut().ok_or(RunError::NoMemory)?;
         for spec in specs {
-            match build_process(mem, spec) {
-                Ok(p) => procs.push(p),
+            match build_process(mem, spec.program, spec.handles, spec.budget_ticks, None) {
+                Ok(p) => {
+                    ids.push(p.id);
+                    procs.push(p);
+                }
                 Err(e) => {
                     for p in procs {
                         memory::destroy_address_space(mem, p.l4);
@@ -224,25 +369,24 @@ fn run_all_inner(specs: &[Spec]) -> Result<Vec<ProcessResult>, RunError> {
     // last process is gone (processes themselves run with IF=1 via iretq).
     let finished = interrupts::without_interrupts(|| sched::run_until_idle(procs));
 
-    let mut results = Vec::with_capacity(finished.len());
-    let mut guard = memory::MEMORY.lock();
-    for p in finished {
+    let mut results = Vec::with_capacity(ids.len());
+    for id in ids {
+        let p = finished.iter().find(|p| p.id == id);
         results.push(ProcessResult {
             // A process that never recorded an outcome is treated as killed.
-            outcome: p.outcome().unwrap_or(Outcome::GeneralProtection),
-            finished_tick: p.finished_tick(),
+            outcome: p.and_then(|p| p.outcome()).unwrap_or(Outcome::GeneralProtection),
+            finished_tick: p.map(|p| p.finished_tick()).unwrap_or(0),
         });
-        if let Some(mem) = guard.as_mut() {
-            memory::destroy_address_space(mem, p.l4);
-        }
-        // `p` (and its kernel stack) is dropped here.
+    }
+    for p in finished {
+        release(p); // also frees orphaned children and their kernel stacks
     }
     Ok(results)
 }
 
 /// Run one program; see [`run_all`].
 pub fn run(program: &[u8], handles: &[(Object, Rights)], budget_ticks: u64) -> Result<Outcome, RunError> {
-    let mut r = run_all(&[Spec { program, handles, budget_ticks }])?;
+    let mut r = run_all(&[Spec { program: Program::Raw(program), handles, budget_ticks }])?;
     Ok(r.remove(0).outcome)
 }
 

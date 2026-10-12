@@ -18,6 +18,12 @@ pub enum Object {
     /// The right to *ask* the network policy; each destination still needs a grant.
     NetClient,
     Endpoint(u16),
+    /// Raw keyboard scancodes. Whoever holds this handle receives the keys.
+    Keyboard,
+    /// Read-only system facts (tick counter, CPU protection features).
+    System,
+    /// May start built-in programs whose id bit is set in the mask.
+    Spawner(u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +37,8 @@ impl Rights {
     pub const RECV: Rights = Rights(1 << 3);
     /// May be passed on to another process (always attenuated by a mask).
     pub const GRANT: Rights = Rights(1 << 4);
-    const ALL: u8 = 0b1_1111;
+    pub const READ: Rights = Rights(1 << 5);
+    const ALL: u8 = 0b11_1111;
 
     pub const fn union(self, other: Rights) -> Rights {
         Rights(self.0 | other.0)
@@ -140,7 +147,7 @@ mod tests {
         assert!(!W.contains(Rights::GRANT));
         assert!(W.contains(Rights::NONE));
         assert_eq!(W.intersect(Rights::GRANT), Rights::NONE);
-        assert_eq!(Rights::from_bits(0xffff_ffff).bits(), 0b1_1111);
+        assert_eq!(Rights::from_bits(0xffff_ffff).bits(), 0b11_1111);
     }
 
     #[test]

@@ -23,6 +23,25 @@ pub const SYS_SEND: u64 = 5;
 /// Result: `len | has_handle << 16 | handle << 32`.
 pub const SYS_RECV: u64 = 6;
 
+/// `spawn(spawner, program_id, grants_ptr, grants_count, budget_ticks)`:
+/// starts a built-in program. Each grant is `(parent_handle, rights_mask)` (two
+/// u64); the child receives those handles, in order, with rights ∩ mask. The
+/// child's budget is capped by the parent's remaining budget. Returns the pid.
+pub const SYS_SPAWN: u64 = 7;
+/// `wait(pid)`: block until the child `pid` ended; returns its `Outcome::to_raw()`.
+pub const SYS_WAIT: u64 = 8;
+/// `read_key(keyboard_handle)`: block until a raw scancode arrives; returns it.
+pub const SYS_READ_KEY: u64 = 9;
+/// `sysinfo(system_handle, what)`: 0 = ticks since boot, 1 = CPU feature bits.
+pub const SYS_SYSINFO: u64 = 10;
+
+pub const SYSINFO_TICKS: u64 = 0;
+pub const SYSINFO_CPU: u64 = 1;
+pub const CPU_SMEP: u64 = 1;
+pub const CPU_SMAP: u64 = 2;
+
+pub const MAX_SPAWN_GRANTS: u64 = 8;
+
 /// Not a live handle in the caller's table (also: forged, closed, stale).
 pub const ERR_BAD_HANDLE: i64 = -1;
 pub const ERR_BAD_POINTER: i64 = -2;
@@ -31,6 +50,10 @@ pub const ERR_NO_SYSCALL: i64 = -4;
 pub const ERR_WOULD_BLOCK: i64 = -5;
 pub const ERR_NO_RIGHTS: i64 = -6;
 pub const ERR_TABLE_FULL: i64 = -7;
+/// No free process slot.
+pub const ERR_NO_SLOT: i64 = -8;
+/// Not a child of the caller (or already reaped).
+pub const ERR_NOT_CHILD: i64 = -9;
 pub const DENIED_NO_GRANT: i64 = -10;
 pub const DENIED_EXPIRED: i64 = -11;
 pub const DENIED_INVALID_DESTINATION: i64 = -12;

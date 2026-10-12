@@ -1,6 +1,6 @@
 # Plan: Wie es weitergeht
 
-Stand: Phase 0, Phase 1 und 2.1–2.3 umgesetzt (siehe „Status“ unten); Rest offen. Grundlage ist `docs/ROADMAP.md`; dieser Plan macht daraus abarbeitbare Aufgaben.
+Stand: Phase 0, Phase 1 und Phase 2 (bis auf Widerruf und echte Dienstprozesse) umgesetzt (siehe „Status“ unten); Rest offen. Grundlage ist `docs/ROADMAP.md`; dieser Plan macht daraus abarbeitbare Aufgaben.
 
 ## Leitregeln für jede Aufgabe
 - Test zuerst schreiben, sehen dass er fehlschlägt, dann implementieren (Kernel-Tests in `tests/*.rs`, reine Logik als Host-Test in `crates/l_core`).
@@ -101,6 +101,6 @@ Als unprivilegierter Prozess mit nur `Net`-Anfragerecht, gleicher Freigabeweg wi
 | 2.1 Handles | erledigt | |
 | 2.2 Delegation/Widerruf | **teilweise** | Delegation mit Abschwächung ja; **Widerruf bereits weitergegebener Handles fehlt** |
 | 2.3 IPC | erledigt | synchron-blockierendes Empfangen, Sender bekommt `WOULD_BLOCK` bei voller Queue |
-| 2.4 Konsole/Tastatur als Dienst | offen | braucht Rust-Userland-Build (nächster Schritt) |
-| 2.5 Shell in Ring 3 | offen | siehe 2.4 |
+| 2.4 Konsole/Tastatur als Dienst | **teilweise** | Rust-Userland-Pipeline, ELF-Loader, `spawn`/`wait` fertig; Tastatur und Konsole sind Kernel-Objekte mit Handles (Fokus = wer das Handle hält), **kein** separater Dienstprozess |
+| 2.5 Shell in Ring 3 | erledigt | Rust-Shell mit Console/Keyboard/System/Spawner-Handles; Absturz → Neustart durch den Kernel |
 | 3 – 6 | offen | unverändert |

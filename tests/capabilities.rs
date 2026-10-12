@@ -14,7 +14,7 @@ use l_core::{
 };
 use l_os::{
     ipc,
-    usermode::{self, RunError, Spec},
+    usermode::{self, Program, RunError, Spec},
 };
 
 entry_point!(main);
@@ -67,8 +67,8 @@ fn delegation(parent_console: (Object, Rights), parent: &[u8], child_first: bool
     let e = ep();
     let p_handles = [parent_console, (Object::Endpoint(e), Rights::SEND)];
     let c_handles = [(Object::Endpoint(e), Rights::RECV)];
-    let p = Spec { program: parent, handles: &p_handles, budget_ticks: BUDGET };
-    let c = Spec { program: usermode::prog_recv_and_write(), handles: &c_handles, budget_ticks: BUDGET };
+    let p = Spec { program: Program::Raw(parent), handles: &p_handles, budget_ticks: BUDGET };
+    let c = Spec { program: Program::Raw(usermode::prog_recv_and_write()), handles: &c_handles, budget_ticks: BUDGET };
     let r = if child_first { usermode::run_all(&[c, p]).unwrap() } else { usermode::run_all(&[p, c]).unwrap() };
     if child_first { (r[1].outcome, r[0].outcome) } else { (r[0].outcome, r[1].outcome) }
 }
@@ -113,8 +113,8 @@ fn plain_message_passing_wakes_a_blocked_receiver() {
     let s_handles = [(Object::Endpoint(e), Rights::SEND)];
     let r_handles = [(Object::Endpoint(e), Rights::RECV)];
     let r = usermode::run_all(&[
-        Spec { program: usermode::prog_recv_only(), handles: &r_handles, budget_ticks: BUDGET },
-        Spec { program: usermode::prog_send_plain(), handles: &s_handles, budget_ticks: BUDGET },
+        Spec { program: Program::Raw(usermode::prog_recv_only()), handles: &r_handles, budget_ticks: BUDGET },
+        Spec { program: Program::Raw(usermode::prog_send_plain()), handles: &s_handles, budget_ticks: BUDGET },
     ])
     .unwrap();
     assert_eq!(r[0].outcome, Outcome::Exited(MSG_LEN));
@@ -144,8 +144,8 @@ fn two_processes_waiting_on_each_other_are_both_ended() {
     let ha = [(Object::Endpoint(a), Rights::RECV)];
     let hb = [(Object::Endpoint(b), Rights::RECV)];
     let r = usermode::run_all(&[
-        Spec { program: usermode::prog_recv_only(), handles: &ha, budget_ticks: BUDGET },
-        Spec { program: usermode::prog_recv_only(), handles: &hb, budget_ticks: BUDGET },
+        Spec { program: Program::Raw(usermode::prog_recv_only()), handles: &ha, budget_ticks: BUDGET },
+        Spec { program: Program::Raw(usermode::prog_recv_only()), handles: &hb, budget_ticks: BUDGET },
     ])
     .unwrap();
     assert_eq!(r[0].outcome, Outcome::Deadlock);
@@ -165,8 +165,8 @@ fn a_blocked_process_does_not_stop_others_and_nothing_leaks() {
         let e = ep();
         let h = [(Object::Endpoint(e), Rights::RECV)];
         let r = usermode::run_all(&[
-            Spec { program: usermode::prog_recv_only(), handles: &h, budget_ticks: BUDGET },
-            Spec { program: usermode::prog_stack_11(), handles: &[], budget_ticks: BUDGET },
+            Spec { program: Program::Raw(usermode::prog_recv_only()), handles: &h, budget_ticks: BUDGET },
+            Spec { program: Program::Raw(usermode::prog_stack_11()), handles: &[], budget_ticks: BUDGET },
         ])
         .unwrap();
         assert_eq!(r[0].outcome, Outcome::Deadlock);
