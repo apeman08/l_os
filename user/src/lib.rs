@@ -15,6 +15,9 @@ pub mod h {
     pub const KEYBOARD: u64 = 1;
     pub const SYSTEM: u64 = 2;
     pub const SPAWNER: u64 = 3;
+    pub const NETMANAGER: u64 = 4;
+    pub const NETCLIENT: u64 = 5;
+    pub const RANDOM: u64 = 6;
 }
 
 /// Raw `int 0x80`. All registers except `rax` are preserved by the kernel.

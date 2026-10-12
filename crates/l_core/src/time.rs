@@ -11,6 +11,11 @@ pub fn approx_seconds(ticks: u64) -> u64 {
     ticks.saturating_mul(PIT_DEFAULT_DIVISOR) / PIT_BASE_HZ
 }
 
+/// Timer ticks needed to cover `seconds` (rounded up).
+pub fn ticks_from_seconds(seconds: u64) -> u64 {
+    seconds.saturating_mul(PIT_BASE_HZ).div_ceil(PIT_DEFAULT_DIVISOR)
+}
+
 /// Oldest year the wall clock may report; anything earlier means the RTC is
 /// unset or wrong, and callers must not trust it (e.g. for certificate validity).
 pub const MIN_PLAUSIBLE_YEAR: u32 = 2026;
@@ -50,6 +55,16 @@ pub fn unix_from_civil(year: u32, month: u32, day: u32, hour: u32, minute: u32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seconds_to_ticks_rounds_up_and_is_consistent() {
+        assert_eq!(ticks_from_seconds(0), 0);
+        assert_eq!(ticks_from_seconds(1), 19); // 18.2 Hz, rounded up
+        for s in [1u64, 5, 60, 300, 3600] {
+            assert!(approx_seconds(ticks_from_seconds(s)) >= s - 1);
+        }
+        assert!(ticks_from_seconds(u64::MAX) > 0); // saturates
+    }
 
     #[test]
     fn civil_to_unix_known_values() {

@@ -54,7 +54,7 @@ macro_rules! user_elfs {
 
 user_elfs!(
     shell, hello_rs, spawn_probe, key_probe, fault_write_code, fault_exec_stack, fault_write_rodata,
-    tcp_probe, tcp_hold, revoker,
+    tcp_probe, tcp_hold, revoker, fetch,
 );
 
 global_asm!(
@@ -153,7 +153,8 @@ pub const PROGRAM_HELLO: u16 = 0;
 pub const PROGRAM_EVIL: u16 = 1;
 pub const PROGRAM_SPIN: u16 = 2;
 pub const PROGRAM_HELLO_RS: u16 = 3;
-pub const PROGRAM_COUNT: u16 = 4;
+pub const PROGRAM_FETCH: u16 = 4;
+pub const PROGRAM_COUNT: u16 = 5;
 
 pub fn builtin(id: u16) -> Option<Program<'static>> {
     Some(match id {
@@ -161,6 +162,7 @@ pub fn builtin(id: u16) -> Option<Program<'static>> {
         PROGRAM_EVIL => Program::Raw(prog_read_kernel()),
         PROGRAM_SPIN => Program::Raw(prog_spin()),
         PROGRAM_HELLO_RS => Program::Elf(user_elf("hello_rs")?),
+        PROGRAM_FETCH => Program::Elf(user_elf("fetch")?),
         _ => return None,
     })
 }

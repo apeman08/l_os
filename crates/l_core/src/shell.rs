@@ -63,6 +63,19 @@ impl LineEditor {
     }
 }
 
+/// Split `host:port` (port 1..=65535). Only the shape is checked here; the
+/// kernel validates the host name strictly before it stores a grant.
+pub fn parse_host_port(s: &str) -> Result<(&str, u16), ()> {
+    let (host, port) = s.rsplit_once(':').ok_or(())?;
+    if host.is_empty() || host.contains(':') || port.is_empty() || !port.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(());
+    }
+    match port.parse::<u16>() {
+        Ok(p) if p != 0 => Ok((host, p)),
+        _ => Err(()),
+    }
+}
+
 // --------------------------------------------------------------------- parser
 
 #[derive(Debug, PartialEq, Eq)]
@@ -74,8 +87,12 @@ pub enum Command<'a> {
     Uptime,
     Security,
     Echo(&'a str),
-    /// `run <program>`: start a built-in demo program in ring 3.
+    /// `run <program> [args...]`: start a built-in program in its own process.
+    /// The payload is everything after `run `.
     Run(&'a str),
+    /// `net <subcommand> ...`: network management. The payload is everything
+    /// after `net `.
+    Net(&'a str),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -104,15 +121,8 @@ pub fn parse(line: &str) -> Result<Command<'_>, ParseError<'_>> {
         "uptime" => no_args(Command::Uptime),
         "security" => no_args(Command::Security),
         "echo" => Ok(Command::Echo(rest)),
-        "run" => {
-            if rest.is_empty() {
-                Err(ParseError::MissingArgument(name))
-            } else if rest.contains(' ') {
-                Err(ParseError::UnexpectedArguments(name))
-            } else {
-                Ok(Command::Run(rest))
-            }
-        }
+        "run" => if rest.is_empty() { Err(ParseError::MissingArgument(name)) } else { Ok(Command::Run(rest)) },
+        "net" => if rest.is_empty() { Err(ParseError::MissingArgument(name)) } else { Ok(Command::Net(rest)) },
         _ => Err(ParseError::Unknown(name)),
     }
 }
@@ -134,10 +144,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_run() {
+    fn parse_run_and_net() {
         assert_eq!(parse("run hello"), Ok(Command::Run("hello")));
         assert_eq!(parse("run"), Err(ParseError::MissingArgument("run")));
-        assert_eq!(parse("run a b"), Err(ParseError::UnexpectedArguments("run")));
+        assert_eq!(parse("run fetch https://x.example/a"), Ok(Command::Run("fetch https://x.example/a")));
+        assert_eq!(parse("net request a.example:443 60"), Ok(Command::Net("request a.example:443 60")));
+        assert_eq!(parse("net"), Err(ParseError::MissingArgument("net")));
+    }
+
+    #[test]
+    fn host_port_parsing() {
+        assert_eq!(parse_host_port("example.com:443"), Ok(("example.com", 443)));
+        assert_eq!(parse_host_port("10.0.2.2:18080"), Ok(("10.0.2.2", 18080)));
+        for bad in ["example.com", ":443", "example.com:", "example.com:0", "example.com:65536", "example.com:44x", "a:b:443", "example.com:-1", ""] {
+            assert!(parse_host_port(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -145,7 +166,7 @@ mod tests {
         assert_eq!(parse("rm -rf /"), Err(ParseError::Unknown("rm")));
         assert_eq!(parse("HELP"), Err(ParseError::Unknown("HELP")));
         assert_eq!(parse("help me"), Err(ParseError::UnexpectedArguments("help")));
-        assert_eq!(parse("net request example.com:443"), Err(ParseError::Unknown("net")));
+        assert_eq!(parse("netx request example.com:443"), Err(ParseError::Unknown("netx")));
     }
 
     #[test]

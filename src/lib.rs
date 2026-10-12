@@ -32,6 +32,8 @@ pub mod usermode;
 
 pub fn init() {
     cpu::init();
+    // Learn which devices exist (reads PCI configuration space; sends nothing).
+    pci::enumerate();
     interrupts::idt_init();
     gdt::init();
     unsafe {interrupts::PICS.lock().initialize()};
@@ -61,8 +63,13 @@ pub fn run_shell_forever() -> ! {
     let handles = [
         (Object::Console, Rights::WRITE.union(Rights::GRANT)),
         (Object::Keyboard, Rights::READ),
-        (Object::System, Rights::READ),
+        (Object::System, Rights::READ.union(Rights::GRANT)),
         (Object::Spawner((1u16 << PROGRAM_COUNT) - 1), Rights::USE),
+        // Trusted-path authority: only the shell may change network grants.
+        (Object::NetManager, Rights::USE),
+        // The right to ask; programs get it only if the shell passes it on.
+        (Object::NetClient, Rights::USE.union(Rights::GRANT)),
+        (Object::Random, Rights::READ.union(Rights::GRANT)),
     ];
     // A shell that dies right after starting would be restarted in a tight loop;
     // give up after a few very short runs in a row.
