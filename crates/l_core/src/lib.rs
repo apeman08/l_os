@@ -13,6 +13,7 @@ pub mod http;
 pub mod handles;
 pub mod ipc;
 pub mod policy;
+pub mod render;
 pub mod shell;
 pub mod syscall;
 pub mod url;
