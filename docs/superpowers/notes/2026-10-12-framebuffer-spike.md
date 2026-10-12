@@ -2,7 +2,8 @@
 
 Datum: 2026-10-12. Ergebnis von Task 1 des Plans `docs/superpowers/plans/2026-10-12-zukunftsplan.md`.
 Spike-Code lag ausschließlich im Scratchpad (`fb-spike-THROWAWAY/`, außerhalb des Repos) und ist
-nicht Teil dieses Commits. Alles, was nicht tatsächlich ausgeführt wurde, ist mit **[assumed]** markiert.
+nicht Teil dieses Commits. **Spike-Code, Images und PPM-Dateien sind nicht archiviert**; die Belege
+unten sind die beim Lauf beobachteten Ausgaben, nachvollziehbar über die angegebenen Befehle. Alles, was nicht tatsächlich ausgeführt wurde, ist mit **[assumed]** markiert.
 
 Umgebung: `qemu-system-x86_64` 8.2.2, `bootimage` 0.10.5, `nightly-2026-10-11` (aus `rust-toolchain.toml`),
 OVMF aus dem Ubuntu-Paket `ovmf` (`/usr/share/qemu/OVMF.fd`).
@@ -13,7 +14,7 @@ OVMF aus dem Ubuntu-Paket `ovmf` (`/usr/share/qemu/OVMF.fd`).
 - `bootloader` 0.11.17 **im BIOS-Modus** liefert einen Framebuffer, erfüllt aber die Anforderung
   ≥ 1024×768 bei 32 bpp **nicht**: Stage 2 begrenzt fest auf maximal 1280×720, QEMU wählt dabei 24 bpp.
 - `bootloader` 0.11.17 **im UEFI-Modus (OVMF)** erfüllt die Anforderung deterministisch:
-  1024×768, 4 Byte/Pixel, BGR, `stride` 1024, belegt per `screendump`.
+  gemeldet wurden 1024×768, 4 Byte/Pixel, `Bgr`, `stride` 1024; der `screendump` passte dazu (Abschnitt 2).
 - Tests mit `isa-debug-exit` + Serial + `custom_test_frameworks` laufen ohne `bootimage` über einen eigenen
   Cargo-`runner` (im Spike ausgeführt, Erfolg und Fehlschlag geprüft).
 - **Empfehlung: (a)** Migration auf `bootloader` 0.11 mit eigenem Image-Builder-Crate, in QEMU per UEFI booten.
@@ -45,12 +46,36 @@ Modus wäre nur über einen Fork des Real-Mode-Teils (`config_video_mode`) mögl
   schreibt einen Verlauf (R wächst nach rechts, G nach unten, B = 0x40) plus ein weißes 64×64-Quadrat oben
   links, beachtet `pixel_format`, `stride` und `bytes_per_pixel`, gibt `FrameBufferInfo` auf COM1 aus und
   beendet QEMU über `isa-debug-exit` (Port `0xf4`, Wert `0x10` → Exit-Code 33).
-- `builder/`: Host-Crate mit `bootloader = "0.11.17"` (Features `bios`, `uefi`), ruft
-  `BiosBoot::new(..).create_disk_image(..)` bzw. `UefiBoot::new(..)` auf.
+- `builder/`: Host-Crate mit `bootloader = { version = "0.11.17", default-features = false, features = ["bios", "uefi"] }`
+  (erst nur `["bios"]`, dann um `"uefi"` erweitert). `main` liest `<kernel-elf> <ausgabe.img>`, baut
+  `BootConfig::default()` mit `serial_logging = false`, setzt ohne Umgebungsvariable `NOMIN`
+  `frame_buffer.minimum_framebuffer_width/height = Some(1024)/Some(768)`, und ruft dann je nach `UEFI`
+  `UefiBoot::new(&kernel)` bzw. `BiosBoot::new(&kernel)`, `.set_boot_config(&cfg)`, `.create_disk_image(&out)` auf.
 - QEMU mit `-display none`, Monitor über Unix-Socket, `screendump <datei>.ppm`; die PPM wurde mit
   einem kleinen Python-Skript ausgewertet (Header, Eckpixel, SHA-256).
 
-### Ergebnisse (alle ausgeführt)
+### Befehle der Kernzeile (1024×768)
+
+Alle relativ zum Spike-Verzeichnis, mit dem Nightly aus `rust-toolchain.toml`:
+
+```sh
+# Kernel (kernel/, Target-JSON = Kopie von x86_64-l_os.json)
+SPIKE_EXIT=1 cargo build --target x86_64-l_os.json -Zjson-target-spec \
+  -Zbuild-std=core,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+# Image-Builder (builder/) bauen und UEFI-Image ohne Mindestgröße erzeugen
+cargo build
+NOMIN=1 UEFI=1 builder/target/debug/spike_builder kernel/target/x86_64-l_os/debug/spike_kernel uefi-nomin.img
+# QEMU (gestartet von einem Python-Skript, das nach 15 s über den Monitor-Socket
+# "screendump shot-nomin-edid1024.ppm" und dann "quit" sendet)
+qemu-system-x86_64 -drive format=raw,file=uefi-nomin.img -display none -no-reboot \
+  -serial file:serial.log -monitor unix:mon.sock,server,nowait \
+  -bios /usr/share/qemu/OVMF.fd -vga none -device VGA,xres=1024,yres=768
+```
+
+Die anderen Zeilen der Tabelle: dasselbe QEMU-Grundkommando mit den genannten Zusatzargumenten; BIOS ohne
+`-bios`, Images ohne `NOMIN` mit Mindestgröße 1024×768 (`bios.img` ohne `UEFI`, `uefi.img` mit `UEFI=1`).
+
+### Ergebnisse (alle ausgeführt, beobachtete Ausgaben)
 
 | Variante | QEMU-Argumente | `FrameBufferInfo` (Serial) | PPM |
 |---|---|---|---|
@@ -62,13 +87,16 @@ Modus wäre nur über einen Fork des Real-Mode-Teils (`config_video_mode`) mögl
 
 PPM-Auswertung der empfohlenen Variante (`screendump` liefert RGB, unabhängig vom BGR-Speicherformat):
 
-- Pixel (10,10) = (255,255,255) → Markierung oben links, Orientierung stimmt.
-- oben rechts (255,0,64), unten links (0,255,64), unten rechts (255,255,64), Mitte (127,127,64)
-  → Kanäle richtig zugeordnet, also ist `Bgr` korrekt gemeldet und korrekt beschrieben.
+- Beobachtet: Pixel (10,10) = (255,255,255), also liegt die weiße Markierung oben links.
+- Beobachtet: oben rechts (255,0,64), unten links (0,255,64), unten rechts (255,255,64), Mitte (127,127,64).
+  Das ist genau der RGB-Verlauf, den der Kernel schreiben sollte. Der Kernel hat für `Bgr` die Bytes
+  in der Reihenfolge B, G, R geschrieben; dass die PPM die beabsichtigten RGB-Werte zeigt, ist also
+  konsistent mit dem gemeldeten Pixelformat `Bgr`.
 - Zwei unabhängige Läufe ergaben dieselbe SHA-256 (`d18907b71da21a5a…`) → Screendump ist deterministisch,
   Pixel-Hash-Tests (Spec, Abschnitt Tests) sind machbar.
 
-Die BIOS-Variante zeigte ebenfalls einen korrekten Verlauf (gleiche Eckwerte), nur in 1280×720×24.
+BIOS-Variante (1280×720×24), beobachtet: (10,10) = (255,255,255), oben rechts (255,0,64),
+unten links (0,255,64), unten rechts (255,255,64), Mitte (127,127,64) – dieselben beabsichtigten Werte.
 
 ### Warum BIOS nicht reicht (Quellcode geprüft)
 
@@ -117,7 +145,7 @@ unter `timeout 300`. Exit-Code 33 wird auf 0 abgebildet, alles andere auf 1.
 
 - Ausgeführt: `cargo test` → Serial zeigt `running 1 tests`, `trivial... ok`, QEMU-Exit 33, `cargo test` Exit 0.
 - Gegenprobe: `assert_eq!(1 + 1, 3)` → Panic-Handler schreibt `0x11`, QEMU-Exit 35, `cargo test` Exit 1.
-- Auch das BIOS-Image beendet sich mit `isa-debug-exit` korrekt mit 33 (ausgeführt).
+- Auch das BIOS-Image beendet sich über `isa-debug-exit`; beobachteter QEMU-Exit-Code 33 (ausgeführt).
 - Laufzeit pro Boot bis zum Exit: etwa 4,9 s (BIOS und UEFI gemessen, Spike-Kernel, `-cpu max`).
 
 Stolperstein im Spike: `[profile.*] panic = "abort"` im Kernel-`Cargo.toml` führte bei `cargo test` zu
@@ -172,7 +200,8 @@ Aufwand für Task 7 (Schätzung, [assumed]): **2–3 Personentage**.
 
 - Kernel-Port auf `bootloader_api`: `entry_point!` mit `&'static mut BootInfo`, `memory_map` →
   `memory_regions` (andere Typen), `physical_memory_offset` ist `Option`. Betroffen: `src/main.rs`,
-  `src/lib.rs`, `src/memory.rs` und 11 Testdateien (20 Fundstellen von `bootloader::`).
+  `src/lib.rs`, `src/memory.rs` und 11 Testdateien (`grep -rln "bootloader::" tests | wc -l` → 11;
+  `grep -rn "bootloader::" src tests | wc -l` → 20 Fundstellen).
 - Runner + Image-Builder-Crate, Smoke-Skripte, CI, README.
 - `src/vga_buffer.rs` (inkl. `emergency_print`) durch Framebuffer-/Serial-Ausgabe ersetzen; das ist
   ohnehin `src/fb_console.rs` im Plan.
@@ -187,7 +216,7 @@ Risiken:
 - **Netzwerkabhängiger Build** der Bootloader-Stages (Proxy, CI-Cache).
 - **OVMF-Verhalten**: Auflösung hängt an `-device VGA,xres/yres` und dem GOP-Treiber; auf echter
   Hardware (M5) bestimmt die Firmware den Modus. Der Renderer muss beliebige Größen ab 1024×768 vertragen.
-- **Bootzeit**: UEFI-Boot verlängert jede der 23 QEMU-Testdateien unter `tests/` etwas (absolute Zahlen für l_os nicht gemessen) [assumed].
+- **Bootzeit**: UEFI-Boot verlängert jede der 22 QEMU-Testdateien unter `tests/` (`ls tests/*.rs | wc -l` → 22) etwas (absolute Zahlen für l_os nicht gemessen) [assumed].
 
 ## 5. Empfehlung
 
@@ -195,7 +224,8 @@ Risiken:
 
 Begründung:
 
-- Nachweislich 1024×768, 32 bpp, BGR, `stride` 1024, ohne Patch des Bootloaders.
+- Im (nicht archivierten) Spike beobachtet: 1024×768, 4 Byte/Pixel, gemeldet `Bgr`, `stride` 1024,
+  ohne Patch des Bootloaders; reproduzierbar mit den Befehlen in Abschnitt 2.
 - Tests, `isa-debug-exit` und Serial funktionieren mit einem eigenen Runner (ausgeführt).
 - Die Spec verlangt in M5 UEFI-Boot auf echter Hardware. 0.9 ist BIOS-only, (b) wäre also ein Umweg,
   der in M5 doch durch die Migration ersetzt werden müsste.
