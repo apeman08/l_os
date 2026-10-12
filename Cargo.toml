@@ -16,6 +16,22 @@ harness = false
 name = "stack_overflow"
 harness = false
 
+[[test]]
+name = "exception_invalid_opcode"
+harness = false
+
+[[test]]
+name = "exception_divide_error"
+harness = false
+
+[[test]]
+name = "exception_gpf"
+harness = false
+
+[[test]]
+name = "exception_page_fault"
+harness = false
+
 [dependencies]
 bootloader = "0.9"
 volatile = "0.2.6"
