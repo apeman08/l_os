@@ -3,7 +3,8 @@
 Datum: 2026-10-12. Ergebnis von Task 1 des Plans `docs/superpowers/plans/2026-10-12-zukunftsplan.md`.
 Spike-Code lag ausschließlich im Scratchpad (`fb-spike-THROWAWAY/`, außerhalb des Repos) und ist
 nicht Teil dieses Commits. **Spike-Code, Images und PPM-Dateien sind nicht archiviert**; die Belege
-unten sind die beim Lauf beobachteten Ausgaben, nachvollziehbar über die angegebenen Befehle. Alles, was nicht tatsächlich ausgeführt wurde, ist mit **[assumed]** markiert.
+unten sind die beim Lauf beobachteten Ausgaben. Die Befehle in Abschnitt 2 zeigen, wie die Belege entstanden
+sind; ohne den Spike-Code (dort beschrieben, nicht beigelegt) sind sie nicht direkt wiederholbar. Alles, was nicht tatsächlich ausgeführt wurde, ist mit **[assumed]** markiert.
 
 Umgebung: `qemu-system-x86_64` 8.2.2, `bootimage` 0.10.5, `nightly-2026-10-11` (aus `rust-toolchain.toml`),
 OVMF aus dem Ubuntu-Paket `ovmf` (`/usr/share/qemu/OVMF.fd`).
@@ -54,49 +55,68 @@ Modus wäre nur über einen Fork des Real-Mode-Teils (`config_video_mode`) mögl
 - QEMU mit `-display none`, Monitor über Unix-Socket, `screendump <datei>.ppm`; die PPM wurde mit
   einem kleinen Python-Skript ausgewertet (Header, Eckpixel, SHA-256).
 
-### Befehle der Kernzeile (1024×768)
+### Befehle (aus einer frischen Kopie des Spikes erneut ausgeführt)
 
-Alle relativ zum Spike-Verzeichnis, mit dem Nightly aus `rust-toolchain.toml`:
+Die Befehle unten wurden in einer frischen Kopie der Spike-Quellen (ohne `target/` und ohne
+`.cargo/config.toml`) genau so ausgeführt. Ausgangsverzeichnis ist jeweils das Spike-Verzeichnis `$SPIKE`;
+`rust-toolchain.toml` (Kopie aus dem Repo) liegt in `$SPIKE`, `kernel/` und `builder/`.
 
 ```sh
-# Kernel (kernel/, Target-JSON = Kopie von x86_64-l_os.json)
+# 1. Kernel (Target-JSON = Kopie von x86_64-l_os.json); SPIKE_EXIT=1 schaltet den isa-debug-exit am Ende ein
+cd "$SPIKE/kernel"
 SPIKE_EXIT=1 cargo build --target x86_64-l_os.json -Zjson-target-spec \
   -Zbuild-std=core,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
-# Image-Builder (builder/) bauen und UEFI-Image ohne Mindestgröße erzeugen
+# 2. Image-Builder bauen
+cd "$SPIKE/builder"
 cargo build
+# 3. Images erzeugen
+cd "$SPIKE"
 NOMIN=1 UEFI=1 builder/target/debug/spike_builder kernel/target/x86_64-l_os/debug/spike_kernel uefi-nomin.img
-# QEMU (gestartet von einem Python-Skript, das nach 15 s über den Monitor-Socket
-# "screendump shot-nomin-edid1024.ppm" und dann "quit" sendet)
-qemu-system-x86_64 -drive format=raw,file=uefi-nomin.img -display none -no-reboot \
-  -serial file:serial.log -monitor unix:mon.sock,server,nowait \
+builder/target/debug/spike_builder kernel/target/x86_64-l_os/debug/spike_kernel bios.img
+# 4. Booten + Screendump: run.py startet QEMU, wartet WAIT Sekunden, sendet über den
+#    Monitor-Socket "screendump <ppm>" und "quit", druckt dann serial.log
+WAIT=15 python3 -I run.py uefi-nomin.img shot-uefi-1024.ppm \
   -bios /usr/share/qemu/OVMF.fd -vga none -device VGA,xres=1024,yres=768
+WAIT=8 python3 -I run.py bios.img shot-bios.ppm
 ```
 
-Die anderen Zeilen der Tabelle: dasselbe QEMU-Grundkommando mit den genannten Zusatzargumenten; BIOS ohne
-`-bios`, Images ohne `NOMIN` mit Mindestgröße 1024×768 (`bios.img` ohne `UEFI`, `uefi.img` mit `UEFI=1`).
+`run.py` startet QEMU so (`<dir>` = Verzeichnis der PPM-Datei, `<zusatz>` = Argumente nach der PPM):
 
-### Ergebnisse (alle ausgeführt, beobachtete Ausgaben)
+```sh
+qemu-system-x86_64 -drive format=raw,file=<img> -display none -no-reboot \
+  -serial file:<dir>/serial.log -monitor unix:<dir>/mon.sock,server,nowait <zusatz>
+```
 
-| Variante | QEMU-Argumente | `FrameBufferInfo` (Serial) | PPM |
+Die drei übrigen UEFI-Zeilen der Tabelle wurden nur im ursprünglichen Spike ausgeführt, mit demselben
+`run.py` und `WAIT=15`: `uefi.img` (mit `UEFI=1`, ohne `NOMIN`, also Mindestgröße 1024×768) mit
+`-bios /usr/share/qemu/OVMF.fd` bzw. `-bios /usr/share/qemu/OVMF.fd -vga none -device VGA,vgamem_mb=4`,
+und `uefi-nomin.img` mit nur `-bios /usr/share/qemu/OVMF.fd`.
+
+### Ergebnisse (alle ausgeführt, beobachtete Ausgaben; BIOS- und 1024×768-Zeile zusätzlich aus der frischen Kopie)
+
+| Variante | QEMU-Zusatzargumente (`<zusatz>`) | `FrameBufferInfo` (Serial) | PPM |
 |---|---|---|---|
-| BIOS, Mindestgröße 1024×768 gesetzt | (Standard-VGA) | 1280×720, `Bgr`, 3 Byte/Pixel, `stride` 1280, `byte_len` 2764800 | P6 1280×720 |
-| UEFI, Mindestgröße 1024×768 gesetzt | `-bios OVMF.fd` | 2560×1600, `Bgr`, 4 Byte/Pixel, `stride` 2560 | P6 2560×1600 |
-| UEFI, Mindestgröße gesetzt | `-bios OVMF.fd -vga none -device VGA,vgamem_mb=4` | 1360×768, `Bgr`, 4, `stride` 1360 | P6 1360×768 |
-| UEFI, keine Mindestgröße | `-bios OVMF.fd` | 1280×800, `Bgr`, 4, `stride` 1280 | P6 1280×800 |
-| **UEFI, keine Mindestgröße** | **`-bios OVMF.fd -vga none -device VGA,xres=1024,yres=768`** | **1024×768, `Bgr`, 4 Byte/Pixel, `stride` 1024, `byte_len` 3145728** | **P6 1024×768** |
+| BIOS (`bios.img`), Mindestgröße 1024×768 gesetzt | keine (Standard-VGA) | 1280×720, `Bgr`, 3 Byte/Pixel, `stride` 1280, `byte_len` 2764800 | P6 1280×720 |
+| UEFI (`uefi.img`), Mindestgröße 1024×768 gesetzt | `-bios /usr/share/qemu/OVMF.fd` | 2560×1600, `Bgr`, 4 Byte/Pixel, `stride` 2560 | P6 2560×1600 |
+| UEFI (`uefi.img`), Mindestgröße gesetzt | `-bios /usr/share/qemu/OVMF.fd -vga none -device VGA,vgamem_mb=4` | 1360×768, `Bgr`, 4, `stride` 1360 | P6 1360×768 |
+| UEFI (`uefi-nomin.img`), keine Mindestgröße | `-bios /usr/share/qemu/OVMF.fd` | 1280×800, `Bgr`, 4, `stride` 1280 | P6 1280×800 |
+| **UEFI (`uefi-nomin.img`), keine Mindestgröße** | **`-bios /usr/share/qemu/OVMF.fd -vga none -device VGA,xres=1024,yres=768`** | **1024×768, `Bgr`, 4 Byte/Pixel, `stride` 1024, `byte_len` 3145728** | **P6 1024×768** |
 
-PPM-Auswertung der empfohlenen Variante (`screendump` liefert RGB, unabhängig vom BGR-Speicherformat):
+PPM-Auswertung der empfohlenen Variante (`screendump` liefert RGB, unabhängig vom BGR-Speicherformat).
+Die Werte stammen aus dem Lauf, die PPM-Dateien sind nicht archiviert:
 
 - Beobachtet: Pixel (10,10) = (255,255,255), also liegt die weiße Markierung oben links.
 - Beobachtet: oben rechts (255,0,64), unten links (0,255,64), unten rechts (255,255,64), Mitte (127,127,64).
-  Das ist genau der RGB-Verlauf, den der Kernel schreiben sollte. Der Kernel hat für `Bgr` die Bytes
-  in der Reihenfolge B, G, R geschrieben; dass die PPM die beabsichtigten RGB-Werte zeigt, ist also
-  konsistent mit dem gemeldeten Pixelformat `Bgr`.
-- Zwei unabhängige Läufe ergaben dieselbe SHA-256 (`d18907b71da21a5a…`) → Screendump ist deterministisch,
-  Pixel-Hash-Tests (Spec, Abschnitt Tests) sind machbar.
+  Das ist genau der RGB-Verlauf, den der Kernel schreiben sollte. Laut Spike-Quellcode (nicht archiviert)
+  schreibt der Kernel bei `Bgr` die Bytes in der Reihenfolge B, G, R; dass die PPM die beabsichtigten
+  RGB-Werte zeigt, ist also konsistent mit dem gemeldeten Pixelformat `Bgr`.
+- Drei Läufe (zwei im ursprünglichen Spike, einer aus der frischen Kopie, Befehle oben) ergaben dieselbe
+  SHA-256 der PPM (`d18907b71da21a5a…`) → Screendump ist deterministisch, Pixel-Hash-Tests (Spec,
+  Abschnitt Tests) sind machbar.
 
-BIOS-Variante (1280×720×24), beobachtet: (10,10) = (255,255,255), oben rechts (255,0,64),
-unten links (0,255,64), unten rechts (255,255,64), Mitte (127,127,64) – dieselben beabsichtigten Werte.
+BIOS-Variante (1280×720×24), beobachtet (nicht archiviert): (10,10) = (255,255,255), oben rechts (255,0,64),
+unten links (0,255,64), unten rechts (255,255,64), Mitte (127,127,64), also dieselben beabsichtigten Werte;
+PPM-SHA-256 `af60f03f1ecacb55…` im ursprünglichen Lauf und in der frischen Kopie.
 
 ### Warum BIOS nicht reicht (Quellcode geprüft)
 
@@ -216,7 +236,7 @@ Risiken:
 - **Netzwerkabhängiger Build** der Bootloader-Stages (Proxy, CI-Cache).
 - **OVMF-Verhalten**: Auflösung hängt an `-device VGA,xres/yres` und dem GOP-Treiber; auf echter
   Hardware (M5) bestimmt die Firmware den Modus. Der Renderer muss beliebige Größen ab 1024×768 vertragen.
-- **Bootzeit**: UEFI-Boot verlängert jede der 22 QEMU-Testdateien unter `tests/` (`ls tests/*.rs | wc -l` → 22) etwas (absolute Zahlen für l_os nicht gemessen) [assumed].
+- **Bootzeit**: UEFI-Boot verlängert jeden QEMU-Test etwas (es gibt 22 Dateien in `tests/`, `ls tests/*.rs | wc -l` → 22) (absolute Zahlen für l_os nicht gemessen) [assumed].
 
 ## 5. Empfehlung
 
@@ -225,7 +245,7 @@ Risiken:
 Begründung:
 
 - Im (nicht archivierten) Spike beobachtet: 1024×768, 4 Byte/Pixel, gemeldet `Bgr`, `stride` 1024,
-  ohne Patch des Bootloaders; reproduzierbar mit den Befehlen in Abschnitt 2.
+  ohne Patch des Bootloaders; aus einer frischen Kopie des Spikes erneut ausgeführt (Befehle in Abschnitt 2).
 - Tests, `isa-debug-exit` und Serial funktionieren mit einem eigenen Runner (ausgeführt).
 - Die Spec verlangt in M5 UEFI-Boot auf echter Hardware. 0.9 ist BIOS-only, (b) wäre also ein Umweg,
   der in M5 doch durch die Migration ersetzt werden müsste.
