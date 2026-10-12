@@ -4,7 +4,6 @@ use lazy_static::lazy_static;
 use crate::gdt;
 use pic8259::ChainedPics;
 use spin;
-use crate::print;
 use crate::hlt_loop;
 
 lazy_static! {
@@ -38,33 +37,24 @@ extern "x86-interrupt" fn page_fault_handler(stack_frame: InterruptStackFrame, e
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
-    use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
-    use spin::Mutex;
 
-    static KEYBOARD: Mutex<Keyboard<layouts::De105Key, ScancodeSet1>> = 
-        Mutex::new(Keyboard::new(ScancodeSet1::new(), layouts::De105Key, HandleControl::Ignore));
-    
-    let mut keyboard = KEYBOARD.lock();
     let mut port = Port::new(0x60);
+    // SAFETY: 0x60 is the PS/2 controller data port; reading it inside the
+    // keyboard IRQ handler is the required way to acknowledge the byte.
+    let scancode: u8 = unsafe { port.read() };
+    // Decoding and echo happen in the shell loop, not in interrupt context.
+    crate::input::SCANCODES.push(scancode);
 
-    let scancode: u8 = unsafe {port.read()};
-    if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
-        if let Some(key) = keyboard.process_keyevent(key_event) {
-            match key {
-                DecodedKey::Unicode(character) => print!("{}", character),
-                DecodedKey::RawKey(key) => print!("{:?}", key)
-            }
-        }
-    }
-
+    // SAFETY: EOI for the vector that is currently being serviced.
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
     }
 }
 
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame){
-    print!(".");
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::time::tick();
 
+    // SAFETY: EOI for the vector that is currently being serviced.
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }

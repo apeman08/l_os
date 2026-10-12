@@ -1,0 +1,5 @@
+[toolchain]
+# Nightly is required: build-std, json-target-spec, abi_x86_interrupt,
+# custom_test_frameworks. Verified with this date; bump deliberately.
+channel = "nightly-2026-10-11"
+components = ["rust-src", "llvm-tools-preview"]

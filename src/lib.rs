@@ -12,6 +12,9 @@ pub mod serial;
 pub mod vga_buffer;
 pub mod interrupts;
 pub mod gdt;
+pub mod input;
+pub mod shell;
+pub mod time;
 
 pub fn init() {
     interrupts::idt_init();

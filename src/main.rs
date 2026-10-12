@@ -22,20 +22,17 @@ fn panic(info: &PanicInfo) -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    for i in 0..11 {
-        l_os::println!("{}: Larp OS 0.0.2", i);
-    }
-
     l_os::init();
 
-    use x86_64::registers::control::Cr3;
+    l_os::println!("Larp OS {}", env!("CARGO_PKG_VERSION"));
 
-    let (level_4_page_table, _) = Cr3::read();
-    l_os::println!("Level 4 page table at: {:?}", level_4_page_table.start_address());
-    
     #[cfg(test)]
     test_main();
 
+    #[cfg(not(test))]
+    l_os::shell::run();
+
+    #[cfg(test)]
     l_os::hlt_loop();
 }
 
