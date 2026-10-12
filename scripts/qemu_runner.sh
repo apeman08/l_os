@@ -23,8 +23,11 @@ img="$kernel-uefi.img"
 "$root/scripts/build_image.sh" "$kernel" "$img"
 ovmf=$("$root/scripts/ovmf_path.sh")
 
+# bootindex makes OVMF connect only the boot disk. Otherwise its own network
+# stack brings up the NIC during boot and sends IPv6 frames (MLD report,
+# duplicate-address probe) that the "nothing is sent" pcap check would see.
 common=(
-  -drive "format=raw,file=$img"
+  -drive "if=none,id=disk0,format=raw,file=$img" -device ide-hd,drive=disk0,bootindex=0
   -bios "$ovmf"
   -cpu max
   -vga none -device VGA,xres=1024,yres=768
