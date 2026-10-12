@@ -66,4 +66,10 @@ mod tests {
         }
         assert_ne!(REPLACEMENT, BLANK);
     }
+
+    #[test]
+    fn table_is_strictly_sorted() {
+        let t = crate::font_data::GLYPHS;
+        assert!(t.windows(2).all(|w| w[0].0 < w[1].0), "GLYPHS must be strictly sorted by char");
+    }
 }
