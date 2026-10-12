@@ -141,7 +141,8 @@ code with the test CA instead of the production roots. Do not read
 * DMA is not isolated (no IOMMU); the emulated device is trusted.
 * The packet-capture check proves "no frame in this run", not that no code path
   could ever send one.
-* Timers use the 18 Hz PIT tick; TCP retransmissions are therefore coarse.
+* Timers use the 100 Hz PIT tick (10 ms resolution); connect/DNS/IO timeouts
+  are 10/5/30 s.
 * A process can open at most 6 sockets system-wide; there is no per-process
   quota and no rate limiting.
 * The grant table holds 16 entries.
