@@ -28,7 +28,7 @@ jobs:
       - name: Kernel tests (boot in QEMU)
         run: cargo test
 
-      - name: Smoke test (real kernel image, driven through the keyboard)
+      - name: Smoke test (real kernel image, driven through the keyboard; serial text + screen pixels, host helper needs stable Rust like the host tests)
         run: |
           scripts/build_image.sh
           python3 -I scripts/qemu_shell_smoke.py

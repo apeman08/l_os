@@ -2,12 +2,21 @@
 """Boot the real kernel image in QEMU (UEFI), type commands via the QEMU monitor
 and assert on the console output. This exercises the actual kernel, not host code.
 
-Since the switch to UEFI there is no VGA text buffer to read; the kernel mirrors
-every console write to COM1, which QEMU writes to a file here. The text is
-rendered like a terminal (backspace erases, ANSI sequences are dropped).
+Two checks:
+1. Text: the kernel mirrors every console write to COM1 (cargo feature
+   `serial-console`, on by default), which QEMU writes to a file here. The text
+   is rendered like a terminal (backspace erases, ANSI sequences are dropped)
+   and searched for the expected strings.
+2. Pixels: after `clear`, `version` and `help`, a QEMU `screendump` of the
+   framebuffer console is compared row by row, pixel-exactly, with the same
+   text rendered on the host by `l_core::render` (helper
+   crates/l_core/examples/render_text.rs, built here with `cargo +stable` from
+   a neutral directory, like scripts/host_tests.sh does). Every text row of the
+   screen is checked: the expected lines, then blank rows.
 
 Usage: scripts/build_image.sh && python3 -I scripts/qemu_shell_smoke.py
-Needs: qemu-system-x86_64 and OVMF (see scripts/ovmf_path.sh; OVMF_FD overrides).
+Needs: qemu-system-x86_64, OVMF (see scripts/ovmf_path.sh; OVMF_FD overrides),
+and a stable Rust toolchain for the host helper.
 Characters are mapped to keys for the kernel's German layout.
 """
 import os, re, socket, subprocess, sys, tempfile, time
@@ -31,8 +40,60 @@ def render(raw):
         else: lines[-1] += ch if 32 <= ord(ch) < 127 else "."
     return lines
 
+GLYPH_W, GLYPH_H = 8, 16
+
+def build_render_helper(tmp):
+    """Build the host helper; run cargo from a neutral directory so the kernel's
+    .cargo/config.toml (target, build-std) does not apply."""
+    subprocess.run(["cargo", "+stable", "build", "--quiet", "--example", "render_text",
+                    "--manifest-path", os.path.join(ROOT, "crates/l_core/Cargo.toml"),
+                    "--target-dir", os.path.join(ROOT, "target/host-tests")], cwd=tmp, check=True)
+    return os.path.join(ROOT, "target/host-tests/debug/examples/render_text")
+
+def parse_ppm(data):
+    """Binary PPM (P6, maxval 255) -> (width, height, RGB bytes)."""
+    fields, pos = [], 0
+    while len(fields) < 4:
+        while data[pos:pos + 1].isspace(): pos += 1
+        if data[pos:pos + 1] == b"#":
+            pos = data.index(b"\n", pos)
+            continue
+        end = pos
+        while not data[end:end + 1].isspace(): end += 1
+        fields.append(data[pos:end]); pos = end
+    if fields[0] != b"P6" or fields[3] != b"255":
+        raise ValueError(f"unexpected PPM header {fields}")
+    w, h = int(fields[1]), int(fields[2])
+    pixels = data[pos + 1:pos + 1 + w * h * 3]
+    if len(pixels) != w * h * 3:
+        raise ValueError("truncated PPM")
+    return w, h, pixels
+
+def compare_screen(helper, dump_path, lines):
+    """Pixel-compare every text row of the screendump with `lines` (then blank rows).
+    Returns a list of mismatch descriptions (empty = all rows equal)."""
+    w, h, screen = parse_ppm(open(dump_path, "rb").read())
+    cols, rows = w // GLYPH_W, h // GLYPH_H
+    if len(lines) > rows:
+        return [f"{len(lines)} expected lines do not fit on {rows} rows"]
+    expected = lines + [""] * (rows - len(lines))
+    out = subprocess.run([helper, str(cols)], input="\n".join(expected).encode() + b"\n",
+                         capture_output=True, check=True).stdout
+    ew, eh, want = parse_ppm(out)
+    assert (ew, eh) == (cols * GLYPH_W, rows * GLYPH_H), (ew, eh)
+    used = cols * GLYPH_W * 3
+    bad = []
+    for row, text in enumerate(expected):
+        same = all(screen[y * w * 3:y * w * 3 + used] == want[y * ew * 3:y * ew * 3 + used]
+                   for y in range(row * GLYPH_H, (row + 1) * GLYPH_H))
+        if not same:
+            bad.append(f"row {row}: expected {text!r}")
+    return bad
+
 def main():
     tmp = tempfile.mkdtemp()
+    helper = build_render_helper(tmp)
+    dump = os.path.join(tmp, "screen.ppm")
     sock_path, serial = os.path.join(tmp, "mon.sock"), os.path.join(tmp, "serial.log")
     q = subprocess.Popen(["qemu-system-x86_64", "-drive", f"if=none,id=disk0,format=raw,file={IMG},snapshot=on",
                           # bootindex: OVMF then connects only the disk and leaves the NIC alone.
@@ -63,6 +124,26 @@ def main():
             if any("l_os>" in r for r in snaps): break
         else:
             print("FAIL: no shell prompt on the serial console"); sys.exit(1)
+        # Pixel check: a cleared screen with the prompt and the output of
+        # `version` and `help`, compared with the host rendering of the same lines.
+        type_("clear\n"); type_("version\n"); type_("help\n"); snap()
+        raw = open(serial, "rb").read()
+        clear_at = raw.rfind(b"\x1b[2J")
+        if clear_at < 0:
+            print("FAIL: `clear` did not reach the console"); sys.exit(1)
+        screen_lines = render(raw[clear_at:])
+        for want in ["l_os> version", "Larp OS ", "l_os> help", "Commands:", "  clear     clear the screen", "l_os> "]:
+            if not any(r.startswith(want) for r in screen_lines):
+                print(f"FAIL: {want!r} missing from the console text after `clear`:", screen_lines); sys.exit(1)
+        mon(f"screendump {dump}")
+        for _ in range(50):
+            if os.path.exists(dump) and os.path.getsize(dump) > 0: time.sleep(0.2); break
+            time.sleep(0.1)
+        pixel_errors = compare_screen(helper, dump, screen_lines)
+        if pixel_errors:
+            print("FAIL: screendump differs from the host rendering:"); print("\n".join(pixel_errors)); sys.exit(1)
+        print(f"pixel check: {len(screen_lines)} text rows + blank rest match the host rendering:")
+        print("\n".join("  | " + r for r in screen_lines))
         type_("help\n"); type_("echo hix\b\n"); type_("bogus\n"); type_("help me\n"); snap()
         type_("uptime\n"); type_("security\n"); snap()
         type_("run hello\n"); type_("run hello_rs\n"); type_("run evil\n"); snap()
