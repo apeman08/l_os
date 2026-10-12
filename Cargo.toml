@@ -37,6 +37,7 @@ name = "exception_page_fault"
 harness = false
 
 [dependencies]
+l_core = { path = "crates/l_core" }
 bootloader = { version = "0.9", features = ["map_physical_memory"] }
 linked_list_allocator = "0.10.6"
 volatile = "0.2.6"

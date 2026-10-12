@@ -1,0 +1,8 @@
+[package]
+name = "l_core"
+version = "0.1.0"
+edition = "2024"
+
+# Portable, hardware-independent logic. no_std, no allocation, no unsafe.
+# Host tests: `cd crates/l_core && cargo test`
+[dependencies]
