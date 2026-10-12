@@ -11,7 +11,7 @@ extern crate alloc;
 use core::panic::PanicInfo;
 
 pub mod serial;
-pub mod vga_buffer;
+pub mod fb_console;
 pub mod framebuffer;
 pub mod interrupts;
 pub mod gdt;
@@ -73,11 +73,13 @@ pub const BOOTLOADER_CONFIG: bootloader_api::BootloaderConfig = {
     config
 };
 
-/// Take over what the bootloader handed over: the framebuffer (kept, not
-/// drawn on yet), then paging access, the frame allocator and the kernel heap.
+/// Take over what the bootloader handed over: the framebuffer, paging access,
+/// the frame allocator and the kernel heap; then start the framebuffer console
+/// (it needs the heap). Until then, console output goes only to the serial
+/// mirror (feature `serial-console`).
 pub fn init_memory(boot_info: &'static mut bootloader_api::BootInfo) {
     use x86_64::VirtAddr;
-    framebuffer::init(boot_info.framebuffer.take());
+    let fb_memory = framebuffer::init(boot_info.framebuffer.take());
     let boot_info: &'static bootloader_api::BootInfo = boot_info;
     let offset = boot_info
         .physical_memory_offset
@@ -93,6 +95,11 @@ pub fn init_memory(boot_info: &'static mut bootloader_api::BootInfo) {
     let mut guard = memory::MEMORY.lock();
     let mem = guard.as_mut().expect("memory initialized above");
     allocator::init_heap(mem).expect("kernel heap initialization failed");
+    drop(guard);
+    let fb_info = framebuffer::info().as_ref().and_then(framebuffer::render_info);
+    if let (Some(info), Some(memory)) = (fb_info, fb_memory) {
+        fb_console::init(info, memory);
+    }
 }
 
 /// Run the interactive shell as a ring-3 process, forever. It holds exactly:

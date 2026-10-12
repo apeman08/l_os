@@ -9,8 +9,10 @@ use core::panic::PanicInfo;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // Serial first on purpose: it needs no framebuffer and no console state.
     l_os::serial::emergency_print(format_args!("KERNEL PANIC: {}\n", info));
-    l_os::vga_buffer::emergency_print(format_args!("\nKERNEL PANIC: {}\n", info));
+    // Screen only (never blocks), so COM1 gets the message exactly once.
+    l_os::fb_console::emergency_print_screen(format_args!("\nKERNEL PANIC: {}\n", info));
     l_os::hlt_loop();
 }
 

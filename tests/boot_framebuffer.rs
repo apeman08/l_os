@@ -1,6 +1,6 @@
 //! The kernel takes over the framebuffer the bootloader set up (UEFI GOP).
 //! QEMU runs with `-vga none -device VGA,xres=1024,yres=768` (scripts/qemu_runner.sh).
-//! Nothing is drawn here; only the hand-over is checked.
+//! Only the hand-over is checked here; drawing is tested in tests/framebuffer.rs.
 #![no_std]
 #![no_main]
 #![feature(custom_test_frameworks)]
@@ -41,10 +41,12 @@ fn kernel_received_a_framebuffer() {
 
 #[test_case]
 fn framebuffer_memory_is_mapped() {
-    let guard = l_os::framebuffer::FRAMEBUFFER.lock();
-    let fb = guard.as_ref().expect("the bootloader handed over no framebuffer");
-    let buf = fb.buffer();
-    assert_eq!(buf.len(), fb.info().byte_len);
-    // Reading the first and last byte faults if the mapping is missing.
-    core::hint::black_box((buf[0], buf[buf.len() - 1]));
+    let byte_len = l_os::framebuffer::info().expect("the bootloader handed over no framebuffer").byte_len;
+    // The console owns the memory; read it through the console.
+    l_os::fb_console::with_framebuffer(|_, buf| {
+        assert_eq!(buf.len(), byte_len);
+        // Reading the first and last byte faults if the mapping is missing.
+        core::hint::black_box((buf[0], buf[buf.len() - 1]));
+    })
+    .expect("no framebuffer console");
 }

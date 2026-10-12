@@ -5,6 +5,9 @@ edition = "2024"
 build = "build.rs"
 
 [features]
+default = ["serial-console"]
+# Mirror every console write to COM1 (QEMU tests and the smoke test read it there).
+serial-console = []
 # Tests that need host-side servers: run via scripts/net_tests.sh
 net-tests = []
 
@@ -100,11 +103,14 @@ l_core = { path = "crates/l_core" }
 bootloader_api = "=0.11.17"
 linked_list_allocator = "0.10.6"
 smoltcp = { version = "=0.14.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
-volatile = "0.2.6"
 spin = "0.5.2"
 x86_64 = "0.15.5"
 uart_16550 = "0.6.0"
 pic8259 = "0.11.0"
+
+[dev-dependencies]
+# tests/stack_overflow.rs (the kernel itself no longer uses it).
+volatile = "0.2.6"
 
 [dependencies.lazy_static]
 version = "1.0"
@@ -114,3 +120,7 @@ features = ["spin_no_std"]
 name = "l_os"
 test = true
 bench = false
+# The console renders glyphs pixel by pixel with l_core; unoptimized, a
+# 2000-line output took ~70 s under QEMU (see tests/framebuffer.rs).
+[profile.dev.package.l_core]
+opt-level = 3

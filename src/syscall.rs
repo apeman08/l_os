@@ -163,14 +163,29 @@ fn sys_write(handle: u64, ptr: u64, len: u64) -> i64 {
     if !copy_from_user(ptr, len, &mut buf) {
         return abi::ERR_BAD_POINTER;
     }
-    for &b in &buf[..len as usize] {
-        match b {
-            // Terminal controls a console holder is allowed to use.
-            0x08 => crate::vga_buffer::backspace(),
-            0x0c => crate::vga_buffer::clear_screen(),
-            // Anything else non-printable is shown as '?', never interpreted.
-            0x20..=0x7e | b'\n' => crate::print!("{}", b as char),
-            _ => crate::print!("?"),
+    let bytes = &mut buf[..len as usize];
+    for b in bytes.iter_mut() {
+        // Printable ASCII, newline and the two terminal controls a console
+        // holder may use pass; anything else is shown as '?', never interpreted.
+        if !matches!(*b, 0x20..=0x7e | b'\n' | 0x08 | 0x0c) {
+            *b = b'?';
+        }
+    }
+    // Runs of text go to the console as one print each (one redraw per run
+    // instead of per byte); the controls are applied in between, in order.
+    for chunk in bytes.split_inclusive(|&b| b == 0x08 || b == 0x0c) {
+        let (text, control) = match chunk.split_last() {
+            Some((&c, text)) if c == 0x08 || c == 0x0c => (text, Some(c)),
+            _ => (&chunk[..], None),
+        };
+        if !text.is_empty() {
+            // Only ASCII is left, so this is valid UTF-8.
+            crate::print!("{}", core::str::from_utf8(text).unwrap_or("?"));
+        }
+        match control {
+            Some(0x08) => crate::fb_console::backspace(),
+            Some(_) => crate::fb_console::clear_screen(),
+            None => {}
         }
     }
     len as i64
