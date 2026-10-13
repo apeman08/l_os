@@ -23,6 +23,7 @@ pub mod syscall;
 pub mod url;
 pub mod wipe;
 pub mod wipetime;
+pub mod xhci_ctx;
 pub mod xhci_ring;
 pub mod zeroize;
 pub mod widgets;
