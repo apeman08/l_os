@@ -22,6 +22,7 @@ pub mod net;
 pub mod rng;
 pub mod rtc;
 pub mod pci;
+pub mod acpi;
 pub mod virtio_net;
 pub mod allocator;
 pub mod input;
@@ -110,6 +111,10 @@ pub fn init_memory(boot_info: &'static mut bootloader_api::BootInfo) {
     unsafe { memory::remove_boot_identity_map(mem, &boot_info.memory_regions) };
     allocator::init_heap(mem).expect("kernel heap initialization failed");
     drop(guard);
+    // Everything up to the end of the highest region is mapped at the offset.
+    let phys_end = boot_info.memory_regions.iter().map(|r| r.end).max().unwrap_or(0);
+    acpi::set_phys_limit(phys_end);
+    acpi::init(boot_info.rsdp_addr.into_option());
     let raw_info = framebuffer::info();
     let fb_info = raw_info.as_ref().and_then(framebuffer::render_info);
     match (fb_info, fb_memory) {
