@@ -16,6 +16,7 @@ pub mod http;
 pub mod handles;
 pub mod hotkey;
 pub mod ipc;
+pub mod pci_bar;
 pub mod memrange;
 pub mod policy;
 pub mod render;

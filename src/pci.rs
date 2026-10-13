@@ -3,6 +3,7 @@
 //! only asks the (emulated) chipset what devices exist.
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use l_core::pci_bar::{self, Bar};
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 
@@ -17,6 +18,8 @@ pub struct Device {
     pub device: u16,
     pub class: u8,
     pub subclass: u8,
+    /// Programming interface (configuration offset 0x09); 0x30 = xHCI.
+    pub prog_if: u8,
     pub irq_line: u8,
     pub bars: [u32; 6],
 }
@@ -31,32 +34,47 @@ static BDF: [AtomicU32; MAX_DEVICES] = [const { AtomicU32::new(0) }; MAX_DEVICES
 static BDF_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Command register bit 2: the function may master the bus (DMA).
 const CMD_BUS_MASTER: u32 = 1 << 2;
+/// Command register bits 0 and 1: I/O-space and memory-space decoding.
+const CMD_DECODE: u32 = 0x3;
 
 fn address(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
     0x8000_0000 | (bus as u32) << 16 | (slot as u32) << 11 | (func as u32) << 8 | (offset as u32 & 0xfc)
 }
 
-pub fn read32(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
-    let _g = CONFIG_LOCK.lock();
+/// One configuration read; the caller holds `CONFIG_LOCK`.
+fn read32_held(_held: &spin::MutexGuard<'_, ()>, bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
     let mut addr_port = Port::<u32>::new(0xCF8);
     let mut data_port = Port::<u32>::new(0xCFC);
     // SAFETY: 0xCF8/0xCFC are the standard PCI configuration mechanism #1
-    // ports; the lock keeps the address/data pair atomic.
+    // ports; the caller's `CONFIG_LOCK` guard keeps the address/data pair
+    // atomic against other locked accesses.
     unsafe {
         addr_port.write(address(bus, slot, func, offset));
         data_port.read()
     }
 }
 
-pub fn write32(bus: u8, slot: u8, func: u8, offset: u8, value: u32) {
-    let _g = CONFIG_LOCK.lock();
+/// One configuration write; the caller holds `CONFIG_LOCK`.
+fn write32_held(_held: &spin::MutexGuard<'_, ()>, bus: u8, slot: u8, func: u8, offset: u8, value: u32) {
     let mut addr_port = Port::<u32>::new(0xCF8);
     let mut data_port = Port::<u32>::new(0xCFC);
-    // SAFETY: as in `read32`.
+    // SAFETY: as in `read32_held`. Writing configuration space changes only
+    // the device's decoding/state, never memory the kernel owns, except
+    // through BARs/bus mastering, which callers set deliberately.
     unsafe {
         addr_port.write(address(bus, slot, func, offset));
         data_port.write(value);
     }
+}
+
+pub fn read32(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
+    let g = CONFIG_LOCK.lock();
+    read32_held(&g, bus, slot, func, offset)
+}
+
+pub fn write32(bus: u8, slot: u8, func: u8, offset: u8, value: u32) {
+    let g = CONFIG_LOCK.lock();
+    write32_held(&g, bus, slot, func, offset, value)
 }
 
 /// Scan all buses and remember what was found. Safe to call once at boot.
@@ -90,6 +108,7 @@ pub fn enumerate() {
                     device: (id >> 16) as u16,
                     class: (class >> 24) as u8,
                     subclass: (class >> 16) as u8,
+                    prog_if: (class >> 8) as u8,
                     irq_line: read32(bus, slot, func, 0x3c) as u8,
                     bars,
                 });
@@ -111,6 +130,82 @@ pub fn devices() -> impl Iterator<Item = Device> {
 
 pub fn find(vendor: u16, device: u16) -> Option<Device> {
     devices().find(|d| d.vendor == vendor && d.device == device)
+}
+
+/// BAR `idx` of `d`, decoded from the values read at enumeration
+/// (64-bit BARs combined with the next dword). [`Bar::Invalid`] for
+/// `idx > 5`, a 64-bit BAR at index 5 or a reserved type.
+pub fn bar64(d: &Device, idx: usize) -> Bar {
+    pci_bar::decode_at(&d.bars, idx)
+}
+
+/// Puts the command register and the probed BAR dwords back when dropped,
+/// so every exit from [`bar_size`] (including an early return) restores
+/// them. BARs first, then the command register (decoding back on only once
+/// the BAR holds its address again).
+struct BarRestore<'a> {
+    held: &'a spin::MutexGuard<'a, ()>,
+    d: Device,
+    cmd: u32,
+    /// (offset, original value) of the BAR dwords overwritten so far.
+    bars: [(u8, u32); 2],
+    n: usize,
+}
+
+impl Drop for BarRestore<'_> {
+    fn drop(&mut self) {
+        let (b, s, f) = (self.d.bus, self.d.slot, self.d.func);
+        for &(off, val) in &self.bars[..self.n] {
+            write32_held(self.held, b, s, f, off, val);
+        }
+        // Status half written as 0: its bits are RW1C, nothing is cleared.
+        write32_held(self.held, b, s, f, 0x04, self.cmd & 0xffff);
+    }
+}
+
+/// Size in bytes of BAR `idx` of `d`, measured the standard way: write
+/// all-ones, read back, restore. I/O and memory decoding are off in the
+/// command register during the measurement (the BAR briefly holds a bogus
+/// address), interrupts are off and `CONFIG_LOCK` is held throughout, and
+/// the original command and BAR values are restored on every path. `None`
+/// for `idx > 5`, an unimplemented or invalid BAR, a 64-bit BAR at index 5
+/// or a vanished device (vendor reads 0xFFFF).
+pub fn bar_size(d: &Device, idx: usize) -> Option<u64> {
+    if idx >= pci_bar::BAR_COUNT {
+        return None;
+    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let held = CONFIG_LOCK.lock();
+        let (b, s, f) = (d.bus, d.slot, d.func);
+        if read32_held(&held, b, s, f, 0x00) & 0xffff == 0xffff {
+            return None;
+        }
+        let off = 0x10 + 4 * idx as u8;
+        let lo = read32_held(&held, b, s, f, off);
+        let is64 = match pci_bar::decode(lo, 0) {
+            Bar::Invalid => return None,
+            Bar::Mem64 { .. } if idx + 1 >= pci_bar::BAR_COUNT => return None,
+            bar => bar.is64(),
+        };
+        let cmd = read32_held(&held, b, s, f, 0x04);
+        let mut restore = BarRestore { held: &held, d: *d, cmd, bars: [(0, 0); 2], n: 0 };
+        write32_held(&held, b, s, f, 0x04, cmd & 0xffff & !CMD_DECODE);
+        restore.bars[0] = (off, lo);
+        restore.n = 1;
+        write32_held(&held, b, s, f, off, 0xffff_ffff);
+        let probe_lo = read32_held(&held, b, s, f, off);
+        let probe_hi = if is64 {
+            let hi_off = off + 4;
+            restore.bars[1] = (hi_off, read32_held(&held, b, s, f, hi_off));
+            restore.n = 2;
+            write32_held(&held, b, s, f, hi_off, 0xffff_ffff);
+            read32_held(&held, b, s, f, hi_off)
+        } else {
+            0
+        };
+        drop(restore);
+        pci_bar::size_from_probe(probe_lo, probe_hi, is64)
+    })
 }
 
 /// Allow the device to master the bus (DMA) and respond to I/O and memory

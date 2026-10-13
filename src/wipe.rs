@@ -35,7 +35,12 @@
 //! 2. `ScreenBlanked`: [`crate::framebuffer::blank_raw`].
 //! 3. `DmaStopped`: bus-master bit of every enumerated PCI function cleared
 //!    ([`crate::pci::disable_all_bus_masters_unlocked`]); the xHCI halt comes
-//!    with the xHCI driver (Task 19).
+//!    with the xHCI driver (Task 19). That halt is the only use of the MMIO
+//!    window ([`crate::mmio`], L4 slot 144) by the wipe; from stage 4 on the
+//!    window is never touched. Its page-table frames are allocator frames
+//!    and are zeroed in stage 7 like any other; the BAR pages it maps are
+//!    device memory, never RAM, so no stage zeroes or depends on them, and
+//!    [`arm`] neither walks nor needs the window.
 //! 4. `StackSwitched`: one `asm!` loads CR3 with the kernel L4 and RSP with the
 //!    top of the island stack and calls [`stage_rest`].
 //! 5.–9. zero key slots, user frames, allocated frames, the rest of `Usable`,

@@ -23,6 +23,10 @@ name = "memory"
 harness = true
 
 [[test]]
+name = "usb_xhci"
+harness = true
+
+[[test]]
 name = "usermode"
 harness = true
 

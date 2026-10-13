@@ -18,6 +18,7 @@ pub mod interrupts;
 pub mod gdt;
 pub mod frames;
 pub mod memory;
+pub mod mmio;
 pub mod net;
 pub mod rng;
 pub mod rtc;
@@ -168,6 +169,8 @@ pub fn init_memory(boot_info: &'static mut bootloader_api::BootInfo) {
     // yet, so no copy of the removed slots survives.
     unsafe { memory::remove_boot_identity_map(mem, &boot_info.memory_regions) };
     allocator::init_heap(mem).expect("kernel heap initialization failed");
+    // Before any address space exists: processes copy the window's L4 entry.
+    mmio::init(mem);
     drop(guard);
     // Everything up to the end of the highest region is mapped at the offset.
     let phys_end = boot_info.memory_regions.iter().map(|r| r.end).max().unwrap_or(0);
