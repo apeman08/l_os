@@ -1,6 +1,6 @@
 # Larp OS (`l_os`)
 
-An experimental privacy-first operating system with its own Rust kernel (x86_64, QEMU target). Early stage: boots to a minimal terminal and runs sandboxed demo programs in ring 3 (separate address spaces, capability handles, IPC). Networking is denied by default (QEMU only): `net request HOST:PORT` asks you to confirm, then `run fetch https://HOST/PATH` can do an HTTPS GET (TLS 1.3 only). No storage. The shell is a ring-3 program. See `docs/`.
+An experimental privacy-first operating system with its own Rust kernel (x86_64, QEMU target). Early stage: boots via UEFI to a framebuffer terminal with an Aurora status and hint bar (milestone M1 done, see `docs/ROADMAP.md`) and runs sandboxed demo programs in ring 3 (separate address spaces, capability handles, IPC). Networking is denied by default (QEMU only): `net request HOST:PORT` asks you to confirm, then `run fetch https://HOST/PATH` can do an HTTPS GET (TLS 1.3 only). No storage. The shell is a ring-3 program. See `docs/`.
 
 ## Build and run
 Requires: rustup (nightly pinned by `rust-toolchain.toml`, with `rust-src`), `qemu-system-x86_64`, OVMF UEFI firmware (Debian/Ubuntu: `apt-get install ovmf`; found at the usual paths, or set `OVMF_FD=/path/to/OVMF.fd`). The kernel build also compiles the ring-3 programs in `user/`, and the first image build compiles the bootloader (`bootloader` 0.11, host crate `tools/image`); both need network the first time.
@@ -17,4 +17,6 @@ python3 -I scripts/qemu_shell_smoke.py       # drives the real kernel's shell, c
 ```
 Try `net status`, `run hello`, `run hello_rs`, `run evil`, `run spin` in the shell. Keyboard layout is German (`De105Key`).
 
-Screenshot of the shell with the Aurora status and hint bars (a QEMU screendump of the real kernel screen, saved by `python3 -I scripts/qemu_shell_smoke.py --screenshot docs/screenshots/aurora-shell.png`): [docs/screenshots/aurora-shell.png](docs/screenshots/aurora-shell.png)
+Screenshot of the shell with the Aurora status and hint bars (a QEMU screendump of the real kernel screen, saved by `python3 -I scripts/qemu_shell_smoke.py --screenshot docs/screenshots/aurora-shell.png`): [docs/screenshots/aurora-shell.png](docs/screenshots/aurora-shell.png). It is a real screendump, not a mock-up, and its content (e.g. uptime) changes whenever it is regenerated.
+
+Not done yet: real hardware, Tor, a browser and the amnesic live system (roadmap M2-M6). The status bar says "amnesisch: nein" on purpose.

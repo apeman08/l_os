@@ -2,6 +2,8 @@
 
 Stand: Phase 0–4 umgesetzt (Abweichungen und Lücken in der Tabelle unten); Phase 5–6 offen (siehe „Status“ unten); Rest offen. Grundlage ist `docs/ROADMAP.md`; dieser Plan macht daraus abarbeitbare Aufgaben.
 
+> Hinweis 2026-10-13: Die Phase-0-Zeilen 0.1 und 0.3 nennen `bootimage` und `vga_buffer`; das ist historisch. Seit M1 bootet l_os per UEFI (`scripts/qemu_runner.sh`, `tools/image`) und nutzt die Framebuffer-Konsole `src/fb_console.rs` (siehe `docs/ROADMAP.md`).
+
 ## Leitregeln für jede Aufgabe
 - Test zuerst schreiben, sehen dass er fehlschlägt, dann implementieren (Kernel-Tests in `tests/*.rs`, reine Logik als Host-Test in `crates/l_core`).
 - Pro Aufgabe ein Commit; vor dem Commit `cargo test`, `scripts/host_tests.sh` und `python3 -I scripts/qemu_shell_smoke.py` ausführen.

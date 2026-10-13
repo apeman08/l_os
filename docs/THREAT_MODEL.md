@@ -38,6 +38,16 @@ Firmware and the NIC: the "nothing is sent" check in QEMU (`scripts/net_tests.sh
 
 Network and TLS specifics: a connection needs a `NetClient` handle and an exact `host:port` grant (names also need the DNS resolver granted); only the shell can create grants, after a typed confirmation. TLS is TLS 1.3 only, client only, no fallback; certificate validity depends on an unauthenticated RTC; no revocation checking; the production trust store is the embedded Mozilla root list. The user-space TLS and HTTP code parses attacker-controlled data in ring 3 (a crash kills only `fetch`). A compromised shell is a compromised trusted path: it can grant anything.
 
+## Limits (not defended; from the Zukunftsplan spec section 4)
+These are stated as limits of the design, not as tested behaviour; none of them has a test.
+- **Manipulated firmware** (UEFI/BIOS, SMM) is not covered. Secure Boot / verified boot is not implemented (planned M6).
+- **Hardware keyloggers** and other hardware between keyboard and machine are not covered.
+- **DMA attacks**: there is no IOMMU, so devices (NIC, USB, anything on the bus) are trusted; the same holds for the NIC once a real one is supported.
+- **Cold boot**: RAM contents are readable after power-off for a short time. Today nothing is wiped (no amnesic mode exists yet); the planned wipe (M2) only mitigates this, and its duration is **[assumed]** until M2 measures it.
+- **Tor** (planned M3, not present today; the system has no Tor code): Tor is not a guarantee against fingerprinting or global observers, and the design does not claim otherwise.
+- The status bar currently shows "amnesisch: nein" (`src/aurora.rs`, `tests/aurora.rs`): that is the true state; no amnesic mode exists until M2.
+Already covered above: console output is mirrored to COM1 by default (feature `serial-console`) and OVMF/firmware may emit frames before the kernel runs.
+
 ## Principles for upcoming work
 - Enforcement lives in the kernel at a boundary untrusted code cannot bypass (syscalls/IPC capability checks), never in the shell.
 - DNS is a network operation and needs the same authorization as TCP.

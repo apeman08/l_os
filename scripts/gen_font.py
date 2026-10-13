@@ -3,6 +3,7 @@
 
 Input : ter-u16n.bdf from Terminus Font 4.49.1 (SIL OFL 1.1)
         https://downloads.sourceforge.net/project/terminus-font/terminus-font-4.49/terminus-font-4.49.1.tar.gz
+        (inside the tarball: terminus-font-4.49.1/ter-u16n.bdf, checked with `tar tzf`)
 Kept codepoints: U+0020-007E, U+00A0-00FF, U+2500-259F (where Terminus has
         them), plus U+2013 2014 2018 2019 201C 201D 2022 2026 20AC and
         U+2190-2193 2713 2717 25CB 25CF 2588.
