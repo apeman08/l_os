@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+pub mod acpi;
 pub mod anim;
 pub mod cell;
 pub mod dns;
