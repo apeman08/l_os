@@ -37,10 +37,10 @@ const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 const GATEWAY: [u8; 4] = [10, 0, 2, 2];
 pub const DEFAULT_RESOLVER: ([u8; 4], u16) = ([10, 0, 2, 3], 53);
 
-const CONNECT_TIMEOUT_TICKS: u64 = 10 * 18;
-const DNS_TIMEOUT_TICKS: u64 = 5 * 18;
-const IO_TIMEOUT_TICKS: u64 = 30 * 18;
-const CLOSE_GRACE_TICKS: u64 = 5 * 18;
+const CONNECT_TIMEOUT_TICKS: u64 = 10 * time::TICK_HZ as u64; // 10 s
+const DNS_TIMEOUT_TICKS: u64 = 5 * time::TICK_HZ as u64; // 5 s
+const IO_TIMEOUT_TICKS: u64 = 30 * time::TICK_HZ as u64; // 30 s
+const CLOSE_GRACE_TICKS: u64 = 5 * time::TICK_HZ as u64; // 5 s
 
 struct Slot {
     tcp: SocketHandle,
@@ -66,8 +66,7 @@ static STACK: Mutex<Option<Stack>> = Mutex::new(None);
 static RESOLVER: Mutex<([u8; 4], u16)> = Mutex::new(DEFAULT_RESOLVER);
 
 fn now() -> Instant {
-    // PIT tick = 65536 / 1193182 s; keep integer math.
-    Instant::from_millis((time::ticks() * 65_536_000 / 1_193_182) as i64)
+    Instant::from_millis(time::ticks_to_ms(time::ticks()).min(i64::MAX as u64) as i64)
 }
 
 /// Run `f` with the stack locked and interrupts off (the lock is also taken

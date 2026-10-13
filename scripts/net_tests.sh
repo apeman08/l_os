@@ -2,6 +2,9 @@
 # Network tests: they need host-side servers (the guest reaches the host's
 # loopback as 10.0.2.2 through QEMU's user-mode networking) and they check QEMU's
 # own packet capture to prove that nothing is sent without authorization.
+# `cargo test` boots each test through the cargo runner l_os_run
+# (tools/image/src/bin/l_os_run.rs: UEFI image, OVMF), which records the NIC's
+# traffic in target/net-trace.pcap.
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"

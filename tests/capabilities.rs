@@ -6,7 +6,7 @@
 #![test_runner(l_os::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
-use bootloader::{BootInfo, entry_point};
+use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use l_core::{
     handles::{Object, Rights},
@@ -17,9 +17,9 @@ use l_os::{
     usermode::{self, Program, RunError, Spec},
 };
 
-entry_point!(main);
+entry_point!(main, config = &l_os::BOOTLOADER_CONFIG);
 
-fn main(boot_info: &'static BootInfo) -> ! {
+fn main(boot_info: &'static mut BootInfo) -> ! {
     l_os::init();
     l_os::init_memory(boot_info);
     test_main();
@@ -31,7 +31,7 @@ fn panic(info: &PanicInfo) -> ! {
     l_os::test_panic_handler(info)
 }
 
-const BUDGET: u64 = 100;
+const BUDGET: u64 = l_os::time::ticks_from_ms(5500); // about 5.5 s
 const MSG_LEN: u16 = 4; // "hi!\n"
 
 fn ep() -> u16 {

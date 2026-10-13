@@ -1,0 +1,20 @@
+[package]
+name = "l_os_image"
+version = "0.1.0"
+edition = "2024"
+description = "Host tools: UEFI disk image builder (l_os_image) and cargo runner (l_os_run) for l_os"
+publish = false
+
+# A standalone host crate, built by the repository's build.rs into
+# target/l_os-tools (from a neutral directory with a scrubbed environment: the
+# repository's .cargo/config.toml selects the kernel target and build-std, which
+# must not apply here). Needs the pinned nightly: bootloader's build script
+# compiles its stages with build-std.
+# Binaries: src/main.rs = l_os_image, src/bin/l_os_run.rs = l_os_run (the cargo
+# runner); the testable logic lives in src/lib.rs.
+[workspace]
+
+[dependencies]
+# The `uefi` feature only: the BIOS path of 0.11 cannot reach 1024x768
+# (see docs/superpowers/notes/2026-10-12-framebuffer-spike.md).
+bootloader = { version = "=0.11.17", default-features = false, features = ["uefi"] }

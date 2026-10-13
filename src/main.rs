@@ -9,8 +9,10 @@ use core::panic::PanicInfo;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // Serial first on purpose: it needs no framebuffer and no console state.
     l_os::serial::emergency_print(format_args!("KERNEL PANIC: {}\n", info));
-    l_os::vga_buffer::emergency_print(format_args!("\nKERNEL PANIC: {}\n", info));
+    // Screen only (never blocks), so COM1 gets the message exactly once.
+    l_os::fb_console::emergency_print_screen(format_args!("\nKERNEL PANIC: {}\n", info));
     l_os::hlt_loop();
 }
 
@@ -21,14 +23,19 @@ fn panic(info: &PanicInfo) -> ! {
     l_os::test_panic_handler(info)
 }
 
-bootloader::entry_point!(kernel_main);
+bootloader_api::entry_point!(kernel_main, config = &l_os::BOOTLOADER_CONFIG);
 
-fn kernel_main(boot_info: &'static bootloader::BootInfo) -> ! {
+fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     l_os::init();
     l_os::init_memory(boot_info);
 
     #[cfg(test)]
     test_main();
+
+    // Aurora chrome (status bar, hint bar) with its boot fade-in, before the
+    // shell starts; opt-in, so test kernels keep the plain console.
+    #[cfg(not(test))]
+    l_os::aurora::show_chrome();
 
     #[cfg(not(test))]
     l_os::run_shell_forever();

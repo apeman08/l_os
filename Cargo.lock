@@ -21,10 +21,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
-name = "bootloader"
-version = "0.9.35"
+name = "bootloader_api"
+version = "0.11.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e22d5a0b9e11dd5bee9d24a68885de6dc7ed367f897323b1c1286150fd469374"
+checksum = "49f4c2ef60a76c1858ef43c30b6b95c2f5ee4d7c4f9bc47409c3a8dc8910adb9"
 
 [[package]]
 name = "byteorder"
@@ -102,7 +102,7 @@ version = "0.1.0"
 name = "l_os"
 version = "0.1.0"
 dependencies = [
- "bootloader",
+ "bootloader_api",
  "l_core",
  "lazy_static",
  "linked_list_allocator",

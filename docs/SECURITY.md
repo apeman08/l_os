@@ -24,7 +24,7 @@ Larp OS (`l_os`) is an early research kernel. It has **tested process isolation 
 - The user-program build (`build.rs` -> nested `cargo`) downloads crates and uses the host toolchain; there is no reproducible-build or signature check on the produced ELF images.
 - Processes: single CPU, SMEP/SMAP only if the CPU offers them, assumed timer rate, abandoned kernel stacks on kill (see THREAT_MODEL.md).
 - Unhandled exceptions: #NMI, #MC, x87/SIMD, virtualization (they would double fault).
-- Interrupt handlers lock the global PIC mutex; `print!` disables interrupts around the VGA lock. Terminating a process abandons the interrupt frame it was in; no locks may be held at those points (not formally verified).
+- Interrupt handlers lock the global PIC mutex; `print!` disables interrupts around the console lock. Terminating a process abandons the interrupt frame it was in; no locks may be held at those points (not formally verified).
 - Heap allocation from interrupt context would deadlock; there is none today, nothing enforces it.
 - Keyboard scancode queue drops input on overflow (by design, counted).
 - `NetPolicy` has no persistence (grants vanish at reboot, by design) and holds 16 entries. Grants are all-or-nothing per host:port; there is no per-program scoping yet.

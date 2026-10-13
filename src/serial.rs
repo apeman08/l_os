@@ -40,8 +40,8 @@ pub fn emergency_print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
 
     x86_64::instructions::interrupts::disable();
-    // SAFETY: panicking is terminal and interrupts are off; see
-    // `vga_buffer::emergency_print`.
+    // SAFETY: panicking is terminal and interrupts are off: whoever holds the
+    // guard was interrupted by the panic and never resumes, so nothing races.
     unsafe { SERIAL1.force_unlock() };
     let _ = SERIAL1.lock().write_fmt(args);
 }

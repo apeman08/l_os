@@ -10,8 +10,9 @@ use l_os::{exit_qemu, QemuExitCode, serial_println};
 use x86_64::structures::idt::InterruptStackFrame;
 
 
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+bootloader_api::entry_point!(main, config = &l_os::BOOTLOADER_CONFIG);
+
+fn main(_boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     serial_print!("stack_overflow::stack_overflow...\t");
 
     l_os::gdt::init();

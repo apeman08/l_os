@@ -65,6 +65,11 @@ Verified (kernel tests in QEMU, `scripts/net_tests.sh`):
   The capture mechanism was shown to work: the functional run produces a
   non-empty capture, and with the policy check removed (mutation) the denied
   run's capture is no longer empty and its tests fail.
+  This holds only because the runner gives the boot disk `bootindex=0`, so
+  OVMF connects only the disk; otherwise OVMF itself sends IPv6 frames (MLD
+  report, neighbour solicitation with the MAC) before the kernel starts. Real
+  UEFI firmware can likewise send frames before the kernel runs; the kernel's
+  guarantee starts when it takes over.
 * `network` (10 tests): echo through the real stack against a host server,
   repeated connections, denied attempts do not change the transmit counter
   even with the NIC up, revoke-then-deny, revoking cuts an open connection
@@ -136,7 +141,8 @@ code with the test CA instead of the production roots. Do not read
 * DMA is not isolated (no IOMMU); the emulated device is trusted.
 * The packet-capture check proves "no frame in this run", not that no code path
   could ever send one.
-* Timers use the 18 Hz PIT tick; TCP retransmissions are therefore coarse.
+* Timers use the 100 Hz PIT tick (10 ms resolution); connect/DNS/IO timeouts
+  are 10/5/30 s.
 * A process can open at most 6 sockets system-wide; there is no per-process
   quota and no rate limiting.
 * The grant table holds 16 entries.

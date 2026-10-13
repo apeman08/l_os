@@ -1,0 +1,4 @@
+# The remaining POSIX shell and Python scripts break with CRLF line endings
+# (e.g. a Windows checkout with core.autocrlf=true used from WSL or Git Bash).
+*.sh text eol=lf
+*.py text eol=lf

@@ -7,7 +7,7 @@
 #![test_runner(l_os::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
-use bootloader::{BootInfo, entry_point};
+use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use l_core::{
     handles::{Object, Rights},
@@ -15,9 +15,9 @@ use l_core::{
 };
 use l_os::usermode::{self, POLICY, Program, Spec, user_elf};
 
-entry_point!(main);
+entry_point!(main, config = &l_os::BOOTLOADER_CONFIG);
 
-fn main(boot_info: &'static BootInfo) -> ! {
+fn main(boot_info: &'static mut BootInfo) -> ! {
     l_os::init();
     l_os::init_memory(boot_info);
     test_main();
@@ -79,7 +79,7 @@ fn probe(port: u16, host: &str) -> Outcome {
     let spec = Spec {
         program: Program::Elf(user_elf("tls_probe").unwrap()),
         handles: HANDLES,
-        budget_ticks: 1500,
+        budget_ticks: l_os::time::ticks_from_ms(82_400),
         args: &buf[..n],
     };
     usermode::run_all(&[spec]).unwrap().remove(0).outcome
@@ -161,7 +161,7 @@ fn without_a_random_handle_no_connection_is_attempted() {
     let spec = Spec {
         program: Program::Elf(user_elf("tls_probe").unwrap()),
         handles,
-        budget_ticks: 1500,
+        budget_ticks: l_os::time::ticks_from_ms(82_400),
         args: b"test.example 18443 /",
     };
     let r = usermode::run_all(&[spec]).unwrap().remove(0).outcome;
