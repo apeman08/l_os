@@ -39,10 +39,6 @@ fn main() -> ExitCode {
     };
     let root = project_root(env::var_os("CARGO_MANIFEST_DIR"), cwd);
 
-    let image = image_path_for(&kernel);
-    if let Err(e) = build_image(&PathBuf::from(&kernel), &image) {
-        return fail(e);
-    }
     let dirs: Vec<PathBuf> = env::var_os("PATH").map(|p| env::split_paths(&p).collect()).unwrap_or_default();
     let os = HostOs::current();
     let qemu = match find_qemu(os, &dirs, &|p| p.is_file()) {
@@ -53,6 +49,11 @@ fn main() -> ExitCode {
         Ok(f) => f,
         Err(e) => return fail(e),
     };
+    // After QEMU and firmware are found: a missing QEMU fails fast.
+    let image = image_path_for(&kernel);
+    if let Err(e) = build_image(&PathBuf::from(&kernel), &image) {
+        return fail(e);
+    }
     let qargs = match qemu_args(mode, &image, &firmware, &root) {
         Ok(a) => a,
         Err(e) => return fail(e),

@@ -10,20 +10,35 @@ server's certificate (issued by a test CA) MUST be refused. What is asserted:
 fail-closed behaviour on the real shell. The success path with a trusted CA is
 covered by tests/tls.rs (same code, test root store).
 
-Image: scripts/build_image.sh (UEFI, needs OVMF; see scripts/ovmf_path.sh).
+Image: built here (`cargo build`, then the host tool l_os_image from
+tools/image; UEFI, needs OVMF, found like the cargo runner does: OVMF_FD
+overrides). Needs a Unix host (the QEMU monitor is a Unix socket).
 The console is read from the kernel's serial mirror (no VGA text buffer under UEFI).
 """
 import os, re, socket, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-IMG = os.path.join(ROOT, "target/x86_64-l_os/debug/l_os-uefi.img")
 KEYNAMES = {" ": "spc", "\n": "ret", "\b": "backspace", "y": "z", "z": "y", "_": "shift-slash",
             ":": "shift-dot", ".": "dot", "/": "shift-7"}
 ANSI = re.compile(r"\x1b(\[[0-9;=?]*[A-Za-z]|[()][0-9A-Za-z])")
 
-def ovmf():
-    return subprocess.run([os.path.join(ROOT, "scripts/ovmf_path.sh")], check=True,
-                          capture_output=True, text=True).stdout.strip()
+TOOLS = os.path.join(ROOT, "target", "l_os-tools", "debug")
+EXE = ".exe" if os.name == "nt" else ""
+KERNEL = os.path.join(ROOT, "target", "x86_64-l_os", "debug", "l_os")
+IMG = KERNEL + "-uefi.img"
+
+def tool(*args):
+    """Run the host tool l_os_image (built by the repository's build.rs into
+    target/l_os-tools); its stdout, stripped. QEMU and firmware are found the
+    same way the cargo runner finds them (OVMF_FD overrides the firmware)."""
+    return subprocess.run([os.path.join(TOOLS, "l_os_image" + EXE), *args], check=True,
+                          stdout=subprocess.PIPE, text=True).stdout.strip()
+
+def build_image():
+    """`cargo build` (whose build.rs also builds the host tools), then wrap the
+    kernel into the UEFI image IMG, like the cargo runner does."""
+    subprocess.run(["cargo", "build"], cwd=ROOT, check=True)
+    tool(KERNEL, IMG)
 
 def render(raw):
     """Serial bytes -> screen lines (backspace erases, escape sequences dropped)."""
@@ -35,11 +50,12 @@ def render(raw):
     return lines
 
 def main():
+    build_image()
     tmp = tempfile.mkdtemp()
     sock_path, serial = os.path.join(tmp, "mon.sock"), os.path.join(tmp, "serial.log")
-    q = subprocess.Popen(["qemu-system-x86_64", "-drive", f"if=none,id=disk0,format=raw,file={IMG},snapshot=on",
+    q = subprocess.Popen([tool("--print-qemu"), "-drive", f"if=none,id=disk0,format=raw,file={IMG},snapshot=on",
                           # bootindex: OVMF then connects only the disk and leaves the NIC alone.
-                          "-device", "ide-hd,drive=disk0,bootindex=0", "-bios", ovmf(),
+                          "-device", "ide-hd,drive=disk0,bootindex=0", "-bios", tool("--print-firmware"),
                           "-vga", "none", "-device", "VGA,xres=1024,yres=768", "-cpu", "max",
                           "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0,disable-modern=on",
                           "-display", "none", "-serial", f"file:{serial}", "-no-reboot",

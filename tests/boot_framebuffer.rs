@@ -1,5 +1,5 @@
 //! The kernel takes over the framebuffer the bootloader set up (UEFI GOP).
-//! QEMU runs with `-vga none -device VGA,xres=1024,yres=768` (scripts/qemu_runner.sh).
+//! QEMU runs with `-vga none -device VGA,xres=1024,yres=768` (the cargo runner, tools/image/src/lib.rs).
 //! Only the hand-over is checked here; drawing is tested in tests/framebuffer.rs.
 #![no_std]
 #![no_main]

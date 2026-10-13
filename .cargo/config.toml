@@ -7,5 +7,9 @@ build-std-features = ["compiler-builtins-mem"]
 build-std = ["core", "compiler_builtins", "alloc"]
 
 [target.'cfg(target_os = "none")']
-# Builds a UEFI image (tools/image) and boots it in QEMU; see the script.
-runner = "scripts/qemu_runner.sh"
+# l_os_run (tools/image/src/bin/l_os_run.rs) builds a UEFI image and boots it
+# in QEMU. build.rs compiles it before any kernel or test binary exists. A path
+# with a slash is relative to the directory containing .cargo/. No extension:
+# on Windows, std's Command appends .exe to a path without one if that file
+# exists.
+runner = "target/l_os-tools/debug/l_os_run"

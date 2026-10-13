@@ -21,23 +21,39 @@ Checks:
    font's glyphs, rendered by the helper): row 0 must say "Larp OS" and
    "amnesisch: nein", the last row must hold at most three hints.
 
-Usage: scripts/build_image.sh && python3 -I scripts/qemu_shell_smoke.py [--screenshot OUT.png]
+Usage: python3 -I scripts/qemu_shell_smoke.py [--screenshot OUT.png]
+It builds the kernel (`cargo build`) and its UEFI image first (host tool
+l_os_image, see tools/image).
 With --screenshot, the final screendump (the real kernel screen) is saved as PNG.
-Needs: qemu-system-x86_64, OVMF (see scripts/ovmf_path.sh; OVMF_FD overrides),
-and a stable Rust toolchain for the host helper.
+Needs: qemu-system-x86_64, OVMF (found like the cargo runner does: OVMF_FD
+overrides, see tools/image/src/lib.rs), a stable Rust toolchain for the host
+helper, and a Unix host (the QEMU monitor is a Unix socket).
 Characters are mapped to keys for the kernel's German layout.
 """
 import os, re, socket, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-IMG = os.path.join(ROOT, "target/x86_64-l_os/debug/l_os-uefi.img")
 # The kernel uses the German layout (De105Key): the US y/z keys are swapped.
 KEYNAMES = {" ": "spc", "\n": "ret", "\b": "backspace", "y": "z", "z": "y", "_": "shift-slash", ":": "shift-dot", ".": "dot", "/": "shift-7"}
 ANSI = re.compile(r"\x1b(\[[0-9;=?]*[A-Za-z]|[()][0-9A-Za-z])")
 
-def ovmf():
-    return subprocess.run([os.path.join(ROOT, "scripts/ovmf_path.sh")], check=True,
-                          capture_output=True, text=True).stdout.strip()
+TOOLS = os.path.join(ROOT, "target", "l_os-tools", "debug")
+EXE = ".exe" if os.name == "nt" else ""
+KERNEL = os.path.join(ROOT, "target", "x86_64-l_os", "debug", "l_os")
+IMG = KERNEL + "-uefi.img"
+
+def tool(*args):
+    """Run the host tool l_os_image (built by the repository's build.rs into
+    target/l_os-tools); its stdout, stripped. QEMU and firmware are found the
+    same way the cargo runner finds them (OVMF_FD overrides the firmware)."""
+    return subprocess.run([os.path.join(TOOLS, "l_os_image" + EXE), *args], check=True,
+                          stdout=subprocess.PIPE, text=True).stdout.strip()
+
+def build_image():
+    """`cargo build` (whose build.rs also builds the host tools), then wrap the
+    kernel into the UEFI image IMG, like the cargo runner does."""
+    subprocess.run(["cargo", "build"], cwd=ROOT, check=True)
+    tool(KERNEL, IMG)
 
 def render(raw):
     """Serial bytes -> screen lines (backspace erases, escape sequences dropped)."""
@@ -191,14 +207,15 @@ def main():
         screenshot = sys.argv[2]
     elif len(sys.argv) > 1:
         print("usage: qemu_shell_smoke.py [--screenshot OUT.png]"); sys.exit(2)
+    build_image()
     tmp = tempfile.mkdtemp()
     helper = build_render_helper(tmp)
     masks = glyph_masks(helper)
     dump, final_dump = os.path.join(tmp, "screen.ppm"), os.path.join(tmp, "final.ppm")
     sock_path, serial = os.path.join(tmp, "mon.sock"), os.path.join(tmp, "serial.log")
-    q = subprocess.Popen(["qemu-system-x86_64", "-drive", f"if=none,id=disk0,format=raw,file={IMG},snapshot=on",
+    q = subprocess.Popen([tool("--print-qemu"), "-drive", f"if=none,id=disk0,format=raw,file={IMG},snapshot=on",
                           # bootindex: OVMF then connects only the disk and leaves the NIC alone.
-                          "-device", "ide-hd,drive=disk0,bootindex=0", "-bios", ovmf(),
+                          "-device", "ide-hd,drive=disk0,bootindex=0", "-bios", tool("--print-firmware"),
                           "-vga", "none", "-device", "VGA,xres=1024,yres=768",
                           "-cpu", "max", "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0,disable-modern=on", "-display", "none", "-serial", f"file:{serial}", "-no-reboot",
                           "-monitor", f"unix:{sock_path},server,nowait"])
