@@ -55,6 +55,8 @@ pub fn init() {
     }
     time::init_pit();
     x86_64::instructions::interrupts::enable();
+    // Wipe timing (spec §8.6): ~50 ms against the PIT. 0 = uncalibrated.
+    time::calibrate_tsc();
 }
 
 /// Virtual address at which the bootloader maps all physical memory
@@ -255,8 +257,10 @@ pub fn test_panic_handler(info: &PanicInfo) -> ! {
 bootloader_api::entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
 
 #[cfg(test)]
-fn test_kernel_main(_boot_info: &'static mut bootloader_api::BootInfo) -> ! {
+fn test_kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     init();
+    // The in-crate wipe tests need the framebuffer, the heap and the plan.
+    init_memory(boot_info);
     test_main();
     hlt_loop();
 }

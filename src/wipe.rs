@@ -20,18 +20,70 @@
 //!
 //! `ISLAND` is a `static mut` that only this module touches, and only through
 //! raw pointers: [`arm`] writes the plan once while [`PLAN_READY`] is false;
-//! afterwards the plan is only read (and, in Task 10, by the wipe, which never
-//! returns).
+//! afterwards the plan is only read, by the wipe in place (never copied).
+//!
+//! # The executor ([`trigger`], spec §8.2)
+//!
+//! The wipe runs in the context that detected the trigger (keyboard ISR, later
+//! the timer ISR), with interrupts off, and never returns. It takes no lock,
+//! allocates nothing and has no `panic!`/indexing/overflow path of its own
+//! (all loops run over the fixed lists of the plan or the fixed bitmaps).
+//! Stages, exactly in `l_core::wipe::ORDER`:
+//!
+//! 1. `InputLocked`: `cli`, wipe flag (in the island; ISRs drop input), all
+//!    PIC lines masked and NMI disabled by port writes.
+//! 2. `ScreenBlanked`: [`crate::framebuffer::blank_raw`].
+//! 3. `DmaStopped`: bus-master bit of every enumerated PCI function cleared
+//!    ([`crate::pci::disable_all_bus_masters_unlocked`]); the xHCI halt comes
+//!    with the xHCI driver (Task 19).
+//! 4. `StackSwitched`: one `asm!` loads CR3 with the kernel L4 and RSP with the
+//!    top of the island stack and calls [`stage_rest`].
+//! 5.–9. zero key slots, user frames, allocated frames, the rest of `Usable`,
+//!    then the kernel's writable segments and boot stack (island excluded),
+//!    all with `rep stos` through the physical-memory offset mapping.
+//! 10. `Reported`: feature `wipe-test` only, the `WIPE-REPORT` line through
+//!    [`crate::serial::raw_write`].
+//! 11.–13. one `asm!` without stack ([`finish`]): island zeroed by its
+//!    virtual address with `rep stosq`, `wbinvd`, S5 on PM1a/PM1b, wait, then
+//!    `0xCF9` <- 6, `0x64` <- 0xFE, null IDT + `int3`, `cli; hlt`.
+//!
+//! From stage 9 on, only the island, registers, code, `.rodata` and RELRO are
+//! used: everything the later stages need (trigger, stage times, power-off
+//! ports, TSC frequency) is in the island.
+//!
+//! **Without a plan** (arming failed, "amnesisch: nein") the wipe still does
+//! what it safely can: stages 1–3, the key slots (addresses from
+//! [`secrets::slot_ranges`]) and the power-off/reset tail with the ACPI values
+//! read lock-free ([`crate::acpi::power_off_plan_unlocked`]). Stages 4 and
+//! 6–9 are skipped (passed without work): a plan fails exactly when zeroing
+//! `Usable` or kernel memory could destroy what the wipe runs on, and without
+//! the plan's lists there is nothing bounded to iterate.
+//!
+//! **Panic during a wipe:** [`on_panic`] (first thing in the kernel's panic
+//! handler) sees the wipe flag in the island and jumps straight to
+//! [`finish`] (power off / reset), without formatting and without touching a
+//! lock or a `static` outside the island. After stage 9 the IDT is zero, so
+//! any exception is a triple fault (reset) instead.
+//!
+//! In `cfg(test)` and with the feature `test-hooks`, [`trigger`] only counts
+//! ([`test_hook_count`]) and returns; such builds never show "amnesisch: ja".
+
+// Builds whose `trigger` only counts (cfg(test), feature `test-hooks`) do not
+// use the real executor.
+#![cfg_attr(any(test, feature = "test-hooks"), allow(dead_code))]
 
 use crate::acpi::PowerOff;
 use crate::secrets::{self, SLOTS};
-use crate::{BootFacts, memory, println};
+use crate::{BootFacts, memory, println, time};
 use alloc::vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use l_core::elf::{self, ElfError, LoadInfo};
 use l_core::memrange::{PAGE, PhysRange, RangeList};
-use l_core::wipe::Amnesia;
+use l_core::wipe::{Amnesia, Stage, Trigger, WipeState};
 use l_core::wipetime::StageTimes;
+
+#[cfg(all(feature = "test-hooks", feature = "wipe-test"))]
+compile_error!("features `test-hooks` and `wipe-test` exclude each other (a hooked build never wipes)");
 use x86_64::VirtAddr;
 
 /// Size of the wipe stack inside the island.
@@ -56,7 +108,8 @@ pub struct Plan {
     pub fb: (u64, usize),
     /// ACPI S5 poweroff, if the tables provided one (otherwise reset only).
     pub power: Option<PowerOff>,
-    /// TSC frequency in Hz; 0 until TSC calibration exists (Task 10).
+    /// TSC frequency in Hz from `time::calibrate_tsc` at boot; 0 means
+    /// uncalibrated (the report then shows 0 µs).
     pub tsc_hz: u64,
     /// Physical address of the kernel's level-4 table (CR3 for stage 4).
     pub kernel_l4: u64,
@@ -78,16 +131,59 @@ impl Plan {
     };
 }
 
-/// The memory the wipe runs on and from after stage 9: stack, plan and stage
-/// times. Its pages are excluded from stage 9 and zeroed last (stage 11).
+/// Progress of a running wipe, kept in the island so that it survives stage 9.
+#[derive(Clone, Copy, Debug)]
+pub struct Exec {
+    pub state: WipeState,
+    pub times: StageTimes,
+    /// Bytes written with zeros in stages 5–9 (`bytes=` of the report). User
+    /// frames are written in stage 6 and again in stage 7, so they count
+    /// twice; the island (stage 11) is not counted.
+    pub bytes: u64,
+    /// TSC frequency for the report (0 = uncalibrated).
+    pub tsc_hz: u64,
+    /// The full plan is used (false: degraded wipe without a plan).
+    pub full: bool,
+    /// Where stage 11 writes S5; `None`: reset fallback only.
+    pub power: Option<PowerOff>,
+}
+
+impl Exec {
+    const fn new() -> Exec {
+        Exec { state: WipeState::new(), times: StageTimes::new(), bytes: 0, tsc_hz: 0, full: false, power: None }
+    }
+
+    /// Record that `stage` finished at TSC `at`. An order error cannot happen
+    /// with the fixed sequence below and is ignored rather than panicking
+    /// (the dry-run test checks the sequence).
+    fn done(&mut self, stage: Stage, at: u64) {
+        self.times.mark(stage, at);
+        let _ = self.state.advance(stage);
+    }
+
+    fn add_bytes(&mut self, n: u64) {
+        self.bytes = self.bytes.saturating_add(n);
+    }
+}
+
+/// The memory the wipe runs on and from after stage 9: stack, plan, progress
+/// and the wipe flag. Its pages are excluded from stage 9 and zeroed last
+/// (stage 11).
 #[repr(C, align(4096))]
 struct Island {
     stack: [u8; ISLAND_STACK],
     plan: Plan,
-    times: StageTimes,
+    exec: Exec,
+    /// 0: no wipe; 1: a wipe is running (set once by `trigger`).
+    phase: AtomicU8,
 }
 
-static mut ISLAND: Island = Island { stack: [0; ISLAND_STACK], plan: Plan::EMPTY, times: StageTimes::new() };
+static mut ISLAND: Island = Island {
+    stack: [0; ISLAND_STACK],
+    plan: Plan::EMPTY,
+    exec: Exec::new(),
+    phase: AtomicU8::new(0),
+};
 
 static ARMED_ONCE: AtomicBool = AtomicBool::new(false);
 /// True once `ISLAND.plan` holds a complete, valid plan.
@@ -136,20 +232,24 @@ pub fn arm(facts: &BootFacts) -> Result<(), ArmError> {
             // no reference to the `static mut` exists anywhere.
             unsafe { (&raw mut ISLAND.plan).write(plan) };
             PLAN_READY.store(true, Ordering::Release);
+            #[cfg(feature = "wipe-test")]
+            wipe_test_boot_report();
             Ok(())
         }
         Err(e) => {
             PLAN_READY.store(false, Ordering::Release);
             println!("Wipe-Plan ungültig ({:?}): amnesisch: nein", e);
+            #[cfg(feature = "wipe-test")]
+            crate::serial_println!("wipe-test: arm failed ({:?})", e);
             Err(e)
         }
     }
 }
 
 /// A copy of the armed plan, `None` if [`arm`] did not succeed. For tests
-/// and status only: the wipe (Task 10) must read the plan in place in the
-/// island (raw pointer to `ISLAND.plan`), never copy it onto the 16 KiB
-/// island stack (it is about 5.5 KiB).
+/// and status only: the wipe reads the plan in place in the island
+/// ([`island_plan`]), never copies it onto the 16 KiB island stack (it is
+/// about 5.5 KiB).
 pub fn plan() -> Option<Plan> {
     if !PLAN_READY.load(Ordering::Acquire) {
         return None;
@@ -166,11 +266,13 @@ pub fn island_virt() -> (u64, usize) {
 }
 
 /// Status inputs for "amnesisch: ja/nein" (spec E7). There is no USB stick
-/// driver yet, so `stick_sealed` is false.
+/// driver yet, so `stick_sealed` is false. A build whose [`trigger`] only
+/// counts (`test-hooks`, `cfg(test)`) reports `plan_ready = false`, so it can
+/// never show "amnesisch: ja".
 pub fn amnesia() -> Amnesia {
     Amnesia {
         stick_sealed: false,
-        plan_ready: PLAN_READY.load(Ordering::Acquire),
+        plan_ready: PLAN_READY.load(Ordering::Acquire) && !HOOKED,
         serial_mirror: crate::SERIAL_MIRROR,
     }
 }
@@ -431,8 +533,688 @@ fn build_plan(facts: &BootFacts) -> Result<Plan, ArmError> {
     }
     drop(guard);
 
+    plan.tsc_hz = time::tsc_hz();
     plan.keys = secrets::slot_ranges().map(|(v, n)| (v.as_u64(), n));
     plan.fb = crate::framebuffer::raw_region();
     plan.power = crate::acpi::power_off_plan();
     Ok(plan)
+}
+
+// ---------------------------------------------------------------------------
+// The executor (Task 10). See the module documentation for the stage list.
+
+/// Whether [`trigger`] only counts instead of wiping.
+const HOOKED: bool = cfg!(any(test, feature = "test-hooks"));
+
+/// The wipe flag in the island (it must survive stage 9, unlike any other
+/// `static`).
+fn phase() -> &'static AtomicU8 {
+    // SAFETY: `ISLAND` is a static that lives for the whole run; `phase` is
+    // an atomic, so shared references to it are fine. No `&mut` to the whole
+    // island or to this field is ever created: `arm` writes only the `plan`
+    // field and the wipe only the `exec` field through raw pointers; the
+    // final `rep stosq` writes the island after its last Rust access.
+    unsafe { &*(&raw const ISLAND.phase) }
+}
+
+/// True once a wipe has started (it never ends: the machine powers off).
+/// ISRs drop input when this is set (stage `InputLocked`).
+pub fn wiping() -> bool {
+    phase().load(Ordering::SeqCst) != 0
+}
+
+/// The armed plan, in place in the island (never copied).
+///
+/// # Safety
+/// [`PLAN_READY`] must have been observed `true` (Acquire): the single write
+/// in [`arm`] is then complete and the plan is never written again.
+unsafe fn island_plan() -> &'static Plan {
+    // SAFETY: by the caller contract the plan is fully written and immutable
+    // from now on; the reference points into a `static` that lives forever.
+    unsafe { &*(&raw const ISLAND.plan) }
+}
+
+/// The wipe's progress record in the island.
+///
+/// # Safety
+/// Only the wipe may call this, after it won the `phase` swap in [`trigger`]
+/// (so exactly one wipe runs), with interrupts off on the single CPU, and it
+/// must not keep two of these references alive at once.
+unsafe fn island_exec() -> &'static mut Exec {
+    // SAFETY: by the caller contract this is the only reference to `exec`;
+    // no other code touches the field (it is not read outside the wipe).
+    unsafe { &mut *(&raw mut ISLAND.exec) }
+}
+
+/// Write zeros over `[ptr, ptr + len)` with `rep stosq`/`rep stosb`. The
+/// stores are inside `asm!`, so the compiler can neither elide nor reorder
+/// them away (unlike `l_core::zeroize`'s best effort).
+///
+/// # Safety
+/// The range must be mapped, writable memory that no live Rust reference
+/// covers (or whose owners never run again: the wipe path).
+pub(crate) unsafe fn zero_volatile(ptr: *mut u8, len: usize) {
+    let qwords = len / 8;
+    let rest = len % 8;
+    // SAFETY: forwarded caller contract: [ptr, ptr + len) is writable. The
+    // asm writes exactly `qwords * 8 + rest == len` bytes from `ptr` upward
+    // (`cld` makes the direction explicit) and touches no stack.
+    unsafe {
+        core::arch::asm!(
+            "cld",
+            "rep stosq",
+            "mov rcx, {rest}",
+            "rep stosb",
+            rest = in(reg) rest,
+            inout("rcx") qwords => _,
+            inout("rdi") ptr => _,
+            in("rax") 0u64,
+            options(nostack),
+        );
+    }
+}
+
+/// The work of each stage. [`Real`] does it; the dry-run test records it.
+trait StageOps {
+    fn now(&mut self) -> u64;
+    fn lock_input(&mut self);
+    fn blank_screen(&mut self);
+    fn stop_dma(&mut self);
+    /// Each `zero_*` returns the number of bytes it zeroed.
+    fn zero_keys(&mut self) -> u64;
+    fn zero_user(&mut self) -> u64;
+    fn zero_allocated(&mut self) -> u64;
+    fn zero_usable(&mut self) -> u64;
+    fn zero_kernel(&mut self) -> u64;
+    fn report(&mut self, line: &[u8]);
+}
+
+/// Stages 1–3 (on the interrupted context's stack and page tables).
+fn run_front<O: StageOps>(o: &mut O, ex: &mut Exec) {
+    o.lock_input();
+    ex.done(Stage::InputLocked, o.now());
+    o.blank_screen();
+    ex.done(Stage::ScreenBlanked, o.now());
+    o.stop_dma();
+    ex.done(Stage::DmaStopped, o.now());
+}
+
+/// Stages 5–10 (on the island stack, kernel CR3, when a plan exists).
+fn run_back<O: StageOps>(o: &mut O, ex: &mut Exec) {
+    let n = o.zero_keys();
+    ex.add_bytes(n);
+    ex.done(Stage::KeysZeroed, o.now());
+    let n = o.zero_user();
+    ex.add_bytes(n);
+    ex.done(Stage::UserZeroed, o.now());
+    let n = o.zero_allocated();
+    ex.add_bytes(n);
+    ex.done(Stage::AllocatedZeroed, o.now());
+    let n = o.zero_usable();
+    ex.add_bytes(n);
+    ex.done(Stage::UsableZeroed, o.now());
+    let n = o.zero_kernel();
+    ex.add_bytes(n);
+    ex.done(Stage::KernelZeroed, o.now());
+    // `total_us` in this line is the time from the trigger to `KernelZeroed`
+    // only: a lower bound that leaves out this report, the island wipe and
+    // the power-off itself (l_core::wipetime::report_line).
+    if let Some(t) = ex.state.trigger_kind() {
+        let mut line = [0u8; 192];
+        let n = l_core::wipetime::report_line(&ex.times, t, ex.tsc_hz, ex.bytes, &mut line);
+        o.report(line.get(..n).unwrap_or(&line));
+    }
+    ex.done(Stage::Reported, o.now());
+}
+
+/// Run every non-terminal stage against `o` without switching stack or page
+/// tables, from a fresh record (not the island's): for tests.
+#[cfg(test)]
+fn dry_run<O: StageOps>(o: &mut O, t: Trigger) -> Exec {
+    let mut ex = Exec::new();
+    let _ = ex.state.trigger(t);
+    ex.times.start(o.now());
+    ex.tsc_hz = time::tsc_hz();
+    run_front(o, &mut ex);
+    ex.done(Stage::StackSwitched, o.now());
+    run_back(o, &mut ex);
+    ex
+}
+
+/// The real stage work. `plan` is `None` for the degraded wipe.
+struct Real {
+    plan: Option<&'static Plan>,
+}
+
+impl Real {
+    /// Zero `len` bytes at physical `phys` through the offset mapping;
+    /// returns the bytes zeroed (0 if the address would overflow).
+    fn zero_phys(plan: &Plan, phys: u64, len: u64) -> u64 {
+        let Some(virt) = plan.phys_offset.checked_add(phys) else { return 0 };
+        if virt.checked_add(len).is_none() || len == 0 {
+            return 0;
+        }
+        // SAFETY: `phys` lies in a range of the plan (a `Usable` region, a
+        // frame of the allocator's or user bitmap, or a kernel `.data`/`.bss`
+        // /boot-stack run). `arm` checked that all physical memory is mapped
+        // at `phys_offset` through page tables that are not `Usable`, and that
+        // none of these ranges holds the island, kernel code, `.rodata`,
+        // RELRO or a page table the wipe uses. The wipe runs on the island
+        // stack with the kernel CR3 and never returns, so no live reference
+        // into this memory is used again.
+        unsafe { zero_volatile(virt as *mut u8, len as usize) };
+        len
+    }
+
+    /// Zero every frame whose bit is set in the bitmap `word(i)`.
+    fn zero_bitmap(plan: &Plan, word: impl Fn(usize) -> u64) -> u64 {
+        let mut bytes = 0u64;
+        l_core::memrange::for_each_set_bit(memory::TRACKED_FRAMES_WORDS, word, |frame| {
+            bytes = bytes.saturating_add(Real::zero_phys(plan, frame.saturating_mul(PAGE), PAGE));
+        });
+        bytes
+    }
+}
+
+impl StageOps for Real {
+    fn now(&mut self) -> u64 {
+        time::rdtsc()
+    }
+
+    fn lock_input(&mut self) {
+        use x86_64::instructions::port::PortWriteOnly;
+        // SAFETY: 0x21/0xA1 are the data ports of the two 8259 PICs; writing
+        // 0xFF masks every IRQ line (no lock: `PICS` is not used, and the
+        // code that may hold it never runs again). 0x70 bit 7 disables NMI at
+        // the chipset; register 0 is selected, nothing is written to CMOS.
+        unsafe {
+            PortWriteOnly::<u8>::new(0x21).write(0xFF);
+            PortWriteOnly::<u8>::new(0xA1).write(0xFF);
+            PortWriteOnly::<u8>::new(0x70).write(0x80);
+        }
+    }
+
+    fn blank_screen(&mut self) {
+        crate::framebuffer::blank_raw();
+    }
+
+    fn stop_dma(&mut self) {
+        // Task 19 adds the xHCI halt (USBCMD.RS = 0) here.
+        crate::pci::disable_all_bus_masters_unlocked();
+    }
+
+    fn zero_keys(&mut self) -> u64 {
+        let keys = match self.plan {
+            Some(p) => p.keys,
+            None => secrets::slot_ranges().map(|(v, n)| (v.as_u64(), n)),
+        };
+        let mut bytes = 0u64;
+        for (virt, len) in keys {
+            if virt == 0 {
+                continue;
+            }
+            // SAFETY: (virt, len) is one of the `secrets` key slots: a page-
+            // aligned `static` in `.bss`, mapped in the kernel half of every
+            // address space. Its users take `secrets::LOCK`; the wipe does
+            // not, because whoever holds it never runs again (see
+            // `secrets.rs`).
+            unsafe { zero_volatile(virt as *mut u8, len) };
+            bytes = bytes.saturating_add(len as u64);
+        }
+        bytes
+    }
+
+    fn zero_user(&mut self) -> u64 {
+        match self.plan {
+            Some(p) => Real::zero_bitmap(p, memory::user_word),
+            None => 0,
+        }
+    }
+
+    fn zero_allocated(&mut self) -> u64 {
+        match self.plan {
+            Some(p) => Real::zero_bitmap(p, memory::allocated_word),
+            None => 0,
+        }
+    }
+
+    fn zero_usable(&mut self) -> u64 {
+        let Some(plan) = self.plan else { return 0 };
+        let mut bytes = 0u64;
+        let allocated = |frame: u64| {
+            let w = memory::allocated_word((frame / 64) as usize);
+            w >> (frame % 64) & 1 == 1
+        };
+        for r in plan.usable.iter() {
+            let (head, inner, tail) = l_core::memrange::split_partial_pages(r);
+            // Partial pages are never handed out (the allocator gives whole
+            // frames inside a region), so they are zeroed unconditionally.
+            for edge in [head, tail] {
+                bytes = bytes.saturating_add(Real::zero_phys(plan, edge.start, edge.len()));
+            }
+            // Allocated frames were zeroed in stage 7.
+            l_core::memrange::unallocated_runs(inner, memory::TRACKED_FRAMES, allocated, |run| {
+                bytes = bytes.saturating_add(Real::zero_phys(plan, run.start, run.len()));
+            });
+        }
+        bytes
+    }
+
+    fn zero_kernel(&mut self) -> u64 {
+        let Some(plan) = self.plan else { return 0 };
+        let mut bytes = 0u64;
+        for r in plan.kernel_rw.iter() {
+            bytes = bytes.saturating_add(Real::zero_phys(plan, r.start, r.len()));
+        }
+        // From here on: only the island, registers, code, .rodata, RELRO.
+        bytes
+    }
+
+    fn report(&mut self, line: &[u8]) {
+        if cfg!(feature = "wipe-test") {
+            crate::serial::raw_write(line);
+        }
+    }
+}
+
+/// Start the wipe (spec §8). Called from interrupt context (the hotkey in the
+/// keyboard ISR; later stick removal and controller loss in the timer ISR).
+/// Never returns. If a wipe is already running (only reachable from an
+/// exception inside the wipe), the caller is parked in `cli; hlt`.
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub fn trigger(t: Trigger) -> ! {
+    x86_64::instructions::interrupts::disable();
+    if phase().swap(1, Ordering::SeqCst) != 0 {
+        halt_forever();
+    }
+    let ready = PLAN_READY.load(Ordering::Acquire);
+    // SAFETY: `ready` was observed with Acquire.
+    let plan = if ready { Some(unsafe { island_plan() }) } else { None };
+    let kernel_l4 = {
+        // SAFETY: this call won the `phase` swap above, interrupts are off;
+        // the reference ends with this block, before `stage_rest` creates
+        // its own.
+        let ex = unsafe { island_exec() };
+        ex.times.start(time::rdtsc());
+        let _ = ex.state.trigger(t);
+        ex.full = ready;
+        match plan {
+            Some(p) => {
+                ex.power = p.power;
+                ex.tsc_hz = p.tsc_hz;
+            }
+            None => {
+                ex.power = crate::acpi::power_off_plan_unlocked();
+                ex.tsc_hz = time::tsc_hz();
+            }
+        }
+        run_front(&mut Real { plan }, ex);
+        plan.map(|p| p.kernel_l4)
+    };
+    match kernel_l4 {
+        Some(l4) => switch_to_island(l4),
+        // Degraded: no stack switch (nothing that the current stack lives in
+        // gets zeroed).
+        None => stage_rest(),
+    }
+}
+
+/// Test builds: count instead of wiping (spec §5, feature `test-hooks`).
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn trigger(_t: Trigger) {
+    HOOK_COUNT.fetch_add(1, Ordering::SeqCst);
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+static HOOK_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How often [`trigger`] was called (test builds only).
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn test_hook_count() -> u64 {
+    HOOK_COUNT.load(Ordering::SeqCst)
+}
+
+/// Stage 4: load the kernel's own L4 into CR3 (a process's tables are zeroed
+/// in stages 6/7) and move RSP to the top of the island stack (the
+/// interrupted stack may be a process kernel stack in the heap, zeroed in
+/// stage 7), then continue in [`stage_rest`].
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn switch_to_island(kernel_l4: u64) -> ! {
+    // The stack is the first field of the 4096-aligned island, so its top is
+    // 16-byte aligned; `call` pushes 8 bytes, which is the alignment the ABI
+    // expects at function entry.
+    let top = (&raw const ISLAND).addr() as u64 + ISLAND_STACK as u64;
+    // SAFETY: `kernel_l4` is the L4 the kernel booted on (`arm` checked it is
+    // not `Usable`); it maps the kernel's code, statics, island and the
+    // physical-memory window exactly like every process L4 (which copies the
+    // kernel slots), so the next instruction and all wipe data stay mapped.
+    // `top` is the end of the island's 16 KiB stack, which nothing else uses
+    // (the wipe runs once, interrupts are off). `stage_rest` never returns,
+    // so abandoning the old stack (and this function's frame) is fine.
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {l4}",
+            "mov rsp, {top}",
+            "xor ebp, ebp",
+            "call {rest}",
+            "ud2",
+            l4 = in(reg) kernel_l4,
+            top = in(reg) top,
+            rest = sym stage_rest,
+            options(noreturn),
+        );
+    }
+}
+
+/// Stages 4 (bookkeeping) to 13, on the island stack.
+#[cfg(not(any(test, feature = "test-hooks")))]
+extern "C" fn stage_rest() -> ! {
+    // SAFETY: only reached from `trigger` after it won the `phase` swap and
+    // dropped its own reference; interrupts are off.
+    let ex = unsafe { island_exec() };
+    // SAFETY: `full` is set only when PLAN_READY was observed true.
+    let plan = if ex.full { Some(unsafe { island_plan() }) } else { None };
+    ex.done(Stage::StackSwitched, time::rdtsc());
+    run_back(&mut Real { plan }, ex);
+    let power = ex.power;
+    finish(power)
+}
+
+/// First call of the kernel's panic handler: during a wipe, a panic must not
+/// format, lock or touch `static`s that may already be zero. It goes straight
+/// to the terminal stages (island zeroed, power off, reset fallback). Returns
+/// if no wipe is running.
+pub fn on_panic() {
+    if !HOOKED && wiping() {
+        // SAFETY: a wipe is running and was interrupted by the panic; its
+        // reference to `exec` is never used again. Only `power` is read.
+        let power = unsafe { (&raw const ISLAND.exec.power).read() };
+        finish(power);
+    }
+}
+
+fn halt_forever() -> ! {
+    loop {
+        x86_64::instructions::interrupts::disable();
+        x86_64::instructions::hlt();
+    }
+}
+
+/// Pause iterations between power-off attempts (the S5 write takes effect at
+/// once in QEMU; real hardware may need milliseconds).
+const POWER_WAIT: u32 = 1 << 26;
+
+/// Stages 11–13 in one `asm!` that uses only registers: zero the island
+/// (including the stack this runs on and the plan) through its virtual
+/// address with `rep stosq`, `wbinvd`, S5 through PM1a (and PM1b), wait;
+/// then `0xCF9` <- 6, wait, `0x64` <- 0xFE, wait, a null IDT (read from the
+/// now-zero island) and `int3` (triple fault), and finally `cli; hlt`.
+fn finish(power: Option<PowerOff>) -> ! {
+    let (base, len) = island_virt();
+    let (have, pm1a, val_a, pm1b, val_b) = match power {
+        Some(p) => (1u64, p.pm1a_cnt, p.value_a, p.pm1b_cnt, p.value_b),
+        None => (0, 0, 0, 0, 0),
+    };
+    // SAFETY: [base, base + len) is the island, a mapped `static` whose size
+    // is a multiple of 4096 (align 4096); nothing reads it afterwards (this
+    // asm never returns and uses no stack, so overwriting the stack it was
+    // called on is fine). The port writes are the ACPI PM1 control registers
+    // from the FADT with the `_S5` value, then the standard reset ports. The
+    // null IDT descriptor is read from the zeroed island start (limit 0), so
+    // `int3` faults into a triple fault (reset). Interrupts are off.
+    unsafe {
+        core::arch::asm!(
+            "cld",
+            "rep stosq",
+            "wbinvd",
+            "test r12, r12",
+            "jz 3f",
+            // Stage 11: S5.
+            "mov edx, r8d",
+            "mov eax, r9d",
+            "out dx, ax",
+            "test r10d, r10d",
+            "jz 2f",
+            "mov edx, r10d",
+            "mov eax, r11d",
+            "out dx, ax",
+            "2:",
+            "mov ecx, {wait}",
+            "21:",
+            "pause",
+            "dec ecx",
+            "jnz 21b",
+            // Stage 12: reset fallbacks.
+            "3:",
+            "mov dx, 0xcf9",
+            "mov al, 6",
+            "out dx, al",
+            "mov ecx, {wait}",
+            "31:",
+            "pause",
+            "dec ecx",
+            "jnz 31b",
+            "mov al, 0xfe",
+            "out 0x64, al",
+            "mov ecx, {wait}",
+            "32:",
+            "pause",
+            "dec ecx",
+            "jnz 32b",
+            "lidt [rsi]",
+            "int3",
+            // Stage 13.
+            "4:",
+            "cli",
+            "hlt",
+            "jmp 4b",
+            wait = const POWER_WAIT,
+            in("rdi") base,
+            in("rcx") len / 8,
+            in("rax") 0u64,
+            in("rsi") base,
+            in("r12") have,
+            in("r8") u64::from(pm1a),
+            in("r9") u64::from(val_a),
+            in("r10") u64::from(pm1b),
+            in("r11") u64::from(val_b),
+            options(noreturn, nostack),
+        );
+    }
+}
+
+/// Feature `wipe-test` (spec E12): fill key slot 0 from the hardware RNG and
+/// tell the acceptance script (COM1, not the console) where to look.
+#[cfg(feature = "wipe-test")]
+fn wipe_test_boot_report() {
+    use crate::serial_println;
+    let filled = secrets::with_slot(0, |s| crate::rng::fill(s)).unwrap_or(false);
+    if !filled {
+        // Still non-zero, so that the check "zero after the wipe" means something.
+        let _ = secrets::with_slot(0, |s| s.fill(0xA5));
+        serial_println!("wipe-test: no hardware RNG, key slot 0 filled with 0xA5");
+    }
+    let (virt, len) = secrets::slot_ranges()[0];
+    let phys = memory::virt_to_phys(virt).map_or(0, |p| p.as_u64());
+    serial_println!("wipe-test: key-slot phys={:#x} len={}", phys, len);
+    if let Some(plan) = plan() {
+        for r in plan.usable.iter() {
+            serial_println!("wipe-test: usable {:#x}-{:#x}", r.start, r.end);
+        }
+    }
+    serial_println!("wipe-test: armed");
+}
+
+#[cfg(test)]
+struct DryRun<'a> {
+    buf: &'a mut [u8],
+    calls: [Stage; 16],
+    n: usize,
+    line: [u8; 256],
+    line_len: usize,
+}
+
+#[cfg(test)]
+impl<'a> DryRun<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        DryRun { buf, calls: [Stage::Armed; 16], n: 0, line: [0; 256], line_len: 0 }
+    }
+    fn call(&mut self, s: Stage) {
+        self.calls[self.n] = s;
+        self.n += 1;
+    }
+}
+
+#[cfg(test)]
+impl StageOps for DryRun<'_> {
+    fn now(&mut self) -> u64 {
+        time::rdtsc()
+    }
+    fn lock_input(&mut self) {
+        self.call(Stage::InputLocked);
+    }
+    fn blank_screen(&mut self) {
+        self.call(Stage::ScreenBlanked);
+    }
+    fn stop_dma(&mut self) {
+        self.call(Stage::DmaStopped);
+    }
+    fn zero_keys(&mut self) -> u64 {
+        self.call(Stage::KeysZeroed);
+        // SAFETY: `buf` is a `&mut [u8]` we own exclusively.
+        unsafe { zero_volatile(self.buf.as_mut_ptr(), self.buf.len()) };
+        self.buf.len() as u64
+    }
+    fn zero_user(&mut self) -> u64 {
+        self.call(Stage::UserZeroed);
+        0
+    }
+    fn zero_allocated(&mut self) -> u64 {
+        self.call(Stage::AllocatedZeroed);
+        0
+    }
+    fn zero_usable(&mut self) -> u64 {
+        self.call(Stage::UsableZeroed);
+        0
+    }
+    fn zero_kernel(&mut self) -> u64 {
+        self.call(Stage::KernelZeroed);
+        0
+    }
+    fn report(&mut self, line: &[u8]) {
+        self.call(Stage::Reported);
+        self.line[..line.len()].copy_from_slice(line);
+        self.line_len = line.len();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-crate tests (`cargo test --lib`): the non-terminal parts of the wipe.
+// `trigger` only counts here (cfg(test)), so nothing is really wiped.
+
+#[test_case]
+fn feed_pushes_and_detects_hotkey_without_wiping_in_test() {
+    use crate::input::{SCANCODES, feed};
+    while SCANCODES.pop().is_some() {}
+    let before = test_hook_count();
+    for b in [0x1D, 0x38] {
+        feed(b);
+    }
+    assert_eq!(test_hook_count(), before, "modifiers alone must not trigger");
+    feed(0x0E);
+    assert_eq!(test_hook_count(), before + 1, "Ctrl+Alt+Backspace triggers");
+    // Release the modifiers again, so the detector is clean for others.
+    feed(0x8E);
+    feed(0x9D);
+    feed(0xB8);
+    feed(0x0E);
+    assert_eq!(test_hook_count(), before + 1, "Backspace alone does not trigger");
+    // Every byte reached the queue unchanged, in order.
+    for b in [0x1D, 0x38, 0x0E, 0x8E, 0x9D, 0xB8, 0x0E] {
+        assert_eq!(SCANCODES.pop(), Some(b));
+    }
+    assert!(SCANCODES.pop().is_none());
+    assert!(!wiping());
+}
+
+#[test_case]
+fn blank_raw_zeroes_framebuffer() {
+    let (base, len) = crate::framebuffer::raw_region();
+    assert!(base != 0 && len > 0, "test kernel has a framebuffer");
+    let nonzero = crate::fb_console::with_framebuffer(|_, fb| fb.iter().any(|b| *b != 0));
+    assert_eq!(nonzero, Some(true), "console painted something before");
+    crate::framebuffer::blank_raw();
+    let zero = crate::fb_console::with_framebuffer(|_, fb| fb.iter().all(|b| *b == 0));
+    assert_eq!(zero, Some(true));
+}
+
+#[test_case]
+fn disable_bus_master_clears_bit2() {
+    use crate::pci;
+    let nic = pci::find(0x1af4, 0x1000).expect("virtio-net in the test VM");
+    pci::enable_bus_mastering(&nic);
+    assert_ne!(pci::read32(nic.bus, nic.slot, nic.func, 0x04) & 0x4, 0);
+    pci::disable_bus_master_unlocked(&nic);
+    let cmd = pci::read32(nic.bus, nic.slot, nic.func, 0x04);
+    assert_eq!(cmd & 0x4, 0, "bus master off");
+    assert_eq!(cmd & 0x3, 0x3, "I/O and memory decoding untouched");
+    // The same for every device through the lock-free list; afterwards every
+    // command register is restored (status half written as 0: RW1C).
+    let mut saved = [(0u8, 0u8, 0u8, 0u32); pci::MAX_DEVICES];
+    let mut n = 0;
+    for d in pci::devices() {
+        saved[n] = (d.bus, d.slot, d.func, pci::read32(d.bus, d.slot, d.func, 0x04) & 0xffff);
+        n += 1;
+    }
+    pci::enable_bus_mastering(&nic);
+    pci::disable_all_bus_masters_unlocked();
+    for &(b, s, f, _) in &saved[..n] {
+        assert_eq!(pci::read32(b, s, f, 0x04) & 0x4, 0, "{:02x}:{:02x}.{} bus master off", b, s, f);
+    }
+    for &(b, s, f, cmd) in &saved[..n] {
+        pci::write32(b, s, f, 0x04, cmd);
+    }
+    pci::enable_bus_mastering(&nic);
+    assert_ne!(pci::read32(nic.bus, nic.slot, nic.func, 0x04) & 0x4, 0);
+}
+
+#[test_case]
+fn raw_write_needs_no_lock() {
+    let _guard = crate::serial::SERIAL1.lock();
+    // Would deadlock if raw_write took the SERIAL1 lock.
+    crate::serial::raw_write(b"(raw_write while SERIAL1 is held) ");
+    drop(_guard);
+}
+
+#[test_case]
+fn stage_sequence_of_dry_run() {
+    use l_core::wipe::{Stage, Trigger};
+    let mut buf = [0xA5u8; 4100];
+    let mut dry = DryRun::new(&mut buf);
+    let ex = dry_run(&mut dry, Trigger::Hotkey);
+    assert_eq!(ex.state.stage(), Stage::Reported);
+    assert_eq!(ex.state.trigger_kind(), Some(Trigger::Hotkey));
+    assert_eq!(
+        &dry.calls[..dry.n],
+        &[
+            Stage::InputLocked,
+            Stage::ScreenBlanked,
+            Stage::DmaStopped,
+            Stage::KeysZeroed,
+            Stage::UserZeroed,
+            Stage::AllocatedZeroed,
+            Stage::UsableZeroed,
+            Stage::KernelZeroed,
+            Stage::Reported,
+        ]
+    );
+    assert!(dry.buf.iter().all(|b| *b == 0), "test buffer zeroed");
+    assert_eq!(ex.bytes, 4100);
+    for s in [Stage::KeysZeroed, Stage::UserZeroed, Stage::AllocatedZeroed, Stage::UsableZeroed, Stage::KernelZeroed] {
+        assert!(ex.times.us_since_start(s, 1_000_000).is_some(), "{:?} marked", s);
+    }
+    let line = core::str::from_utf8(&dry.line[..dry.line_len]).unwrap();
+    assert!(line.starts_with("WIPE-REPORT trigger=hotkey keys_us="), "{}", line);
+    assert!(line.ends_with(" bytes=4100\n"), "{}", line);
+    assert!(!wiping(), "a dry run does not set the global wipe state");
 }

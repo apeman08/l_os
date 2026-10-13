@@ -45,3 +45,37 @@ pub fn emergency_print(args: ::core::fmt::Arguments) {
     unsafe { SERIAL1.force_unlock() };
     let _ = SERIAL1.lock().write_fmt(args);
 }
+
+/// COM1 base port (the UART `SERIAL1` drives).
+const COM1: u16 = 0x3F8;
+/// Line status register bit: transmit holding register empty.
+const LSR_THRE: u8 = 1 << 5;
+/// Bounded wait per byte (port reads). A missing or stuck UART costs at most
+/// this many reads per byte, then the byte is written anyway (and lost).
+const RAW_POLL_LIMIT: u32 = 100_000;
+
+/// Write `bytes` to COM1 by polling the UART directly: no lock, no `static`,
+/// no heap, no formatting. For the wipe path (spec §8.2 stage `Reported`),
+/// which runs after the kernel's `.data`/`.bss` (including `SERIAL1` and its
+/// lock) were zeroed. Relies on the UART having been configured at boot
+/// (firmware or `SERIAL1`); it does not reprogram it. Interleaves with a
+/// concurrent `SERIAL1` user only at byte granularity.
+pub fn raw_write(bytes: &[u8]) {
+    for &b in bytes {
+        let mut n = 0;
+        while n < RAW_POLL_LIMIT {
+            // SAFETY: reading the 16550 line status register (COM1 + 5) has
+            // no side effect besides reporting state; the port belongs to the
+            // kernel's serial console.
+            let lsr: u8 = unsafe { x86_64::instructions::port::PortReadOnly::new(COM1 + 5).read() };
+            if lsr & LSR_THRE != 0 {
+                break;
+            }
+            core::hint::spin_loop();
+            n += 1;
+        }
+        // SAFETY: writing the transmit holding register (COM1 + 0, DLAB is 0
+        // after initialisation) sends one byte; nothing else is affected.
+        unsafe { x86_64::instructions::port::PortWriteOnly::<u8>::new(COM1).write(b) };
+    }
+}

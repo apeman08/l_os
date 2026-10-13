@@ -1,10 +1,16 @@
-//! Lock-free single-producer/single-consumer scancode queue.
+//! Lock-free scancode queue plus the kernel-side emergency hotkey.
 //!
-//! The keyboard interrupt handler is the only producer and the shell loop is
-//! the only consumer. The ISR does no formatting, locking or decoding: it only
-//! stores the raw byte. Uses atomics only (no `unsafe`, no allocation).
+//! Producers: every raw set-1 byte enters through [`feed`], called only from
+//! interrupt context with IF=0: the PS/2 keyboard ISR today, the timer ISR
+//! (USB HID keyboard, M2 Task 22) later. Both run on the single CPU with
+//! interrupts off, so they never run at the same time and the queue keeps its
+//! single-producer contract. The only consumer is the shell's `read_key`
+//! path. Producers do no formatting, locking or decoding beyond the hotkey
+//! detector (spec E6). Uses atomics only (no `unsafe`, no allocation).
 
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use l_core::hotkey::HotkeyDetector;
+use l_core::wipe::Trigger;
 
 pub const QUEUE_CAPACITY: usize = 128;
 
@@ -61,8 +67,28 @@ impl ScancodeQueue {
     }
 }
 
-/// Raw keyboard scancodes, filled by the keyboard ISR.
+/// Raw keyboard scancodes, filled by [`feed`].
 pub static SCANCODES: ScancodeQueue = ScancodeQueue::new();
+
+/// State of the emergency hotkey detector between bytes
+/// (`HotkeyDetector::to_bits`). Only [`feed`] touches it, with IF=0.
+static HOTKEY: AtomicU8 = AtomicU8::new(HotkeyDetector::new().to_bits());
+
+/// Take one raw set-1 scancode byte from a keyboard (interrupt context, IF=0
+/// only): queue it for the shell, then run the emergency hotkey detector
+/// (Ctrl+Alt+Backspace, spec E6). On a hit the wipe starts here and never
+/// returns ([`crate::wipe::trigger`]; in `cfg(test)` and with the feature
+/// `test-hooks` it is only counted). The byte is queued first: the queue is
+/// zeroed with the rest of memory anyway.
+pub fn feed(byte: u8) {
+    SCANCODES.push(byte);
+    let mut detector = HotkeyDetector::from_bits(HOTKEY.load(Ordering::Relaxed));
+    let hit = detector.feed(byte);
+    HOTKEY.store(detector.to_bits(), Ordering::Relaxed);
+    if hit {
+        crate::wipe::trigger(Trigger::Hotkey);
+    }
+}
 
 #[test_case]
 fn queue_is_fifo() {

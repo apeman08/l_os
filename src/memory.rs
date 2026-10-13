@@ -59,6 +59,12 @@ pub fn allocated_word(i: usize) -> u64 {
     ALLOCATED.get(i).map_or(0, |w| w.load(Ordering::SeqCst))
 }
 
+/// Word `i` of the user-frame bitmap [`USER_FRAMES`] (same layout as
+/// [`allocated_word`]); 0 for `i` out of range. Lock-free.
+pub fn user_word(i: usize) -> u64 {
+    USER_FRAMES.get(i).map_or(0, |w| w.load(Ordering::SeqCst))
+}
+
 /// Record that `frame` is now a user leaf page. Frames above 4 GiB are never
 /// handed out by the allocator, so they never reach this.
 pub fn mark_user_frame(frame: PhysFrame) {

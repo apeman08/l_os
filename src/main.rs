@@ -9,6 +9,8 @@ use core::panic::PanicInfo;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // During a wipe: no formatting, no locks; straight to power-off/reset.
+    l_os::wipe::on_panic();
     // Serial first on purpose: it needs no framebuffer and no console state.
     l_os::serial::emergency_print(format_args!("KERNEL PANIC: {}\n", info));
     // Screen only (never blocks), so COM1 gets the message exactly once.

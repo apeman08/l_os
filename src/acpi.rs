@@ -30,6 +30,10 @@ const RSDP_READ_LEN: usize = 36;
 const SCI_POLL_LIMIT: u32 = 100_000;
 
 static PLAN: Mutex<Option<PowerOff>> = Mutex::new(None);
+/// Lock-free copy of `PLAN` for the wipe without a plan (`wipe::trigger`
+/// when arming failed): `pm1a | pm1b << 16 | value_a << 32 | value_b << 48`,
+/// 0 = none (a PM1a block at port 0 is not usable anyway).
+static RAW_PLAN: AtomicU64 = AtomicU64::new(0);
 /// Exclusive end of the physical range mapped at the offset (0 = nothing).
 static PHYS_LIMIT: AtomicU64 = AtomicU64::new(0);
 
@@ -130,7 +134,25 @@ pub fn init(rsdp_addr: Option<u64>) {
         value_a: parse::s5_value(typ_a),
         value_b: if fadt.pm1b_cnt != 0 { parse::s5_value(typ_b) } else { 0 },
     };
+    if plan.pm1a_cnt != 0 {
+        let raw = u64::from(plan.pm1a_cnt)
+            | u64::from(plan.pm1b_cnt) << 16
+            | u64::from(plan.value_a) << 32
+            | u64::from(plan.value_b) << 48;
+        RAW_PLAN.store(raw, Ordering::Release);
+    }
     *PLAN.lock() = Some(plan);
+}
+
+/// [`power_off_plan`] without the lock, for the wipe path.
+pub fn power_off_plan_unlocked() -> Option<PowerOff> {
+    let raw = RAW_PLAN.load(Ordering::Acquire);
+    (raw != 0).then(|| PowerOff {
+        pm1a_cnt: raw as u16,
+        pm1b_cnt: (raw >> 16) as u16,
+        value_a: (raw >> 32) as u16,
+        value_b: (raw >> 48) as u16,
+    })
 }
 
 pub fn power_off_plan() -> Option<PowerOff> {

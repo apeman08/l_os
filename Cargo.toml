@@ -9,8 +9,12 @@ default = []
 # Mirror every console write to COM1 (the smoke tests read it there). Off by
 # default: a production image must not leak console text. `cargo run-serial`.
 serial-console = []
-# Test visibility for the wipe acceptance script (no effect yet; see the M2 plan).
+# Only for scripts/qemu_wipe_test.py: fills key slot 0, prints the physical
+# ranges and the WIPE-REPORT line on COM1. Never together with test-hooks.
 wipe-test = []
+# Only for tests that must not wipe the test kernel: wipe::trigger counts
+# instead of wiping; such a build never shows "amnesisch: ja". Never default.
+test-hooks = []
 # Tests that need host-side servers: run via scripts/net_tests.sh
 net-tests = []
 

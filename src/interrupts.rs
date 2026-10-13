@@ -155,8 +155,13 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     // SAFETY: 0x60 is the PS/2 controller data port; reading it inside the
     // keyboard IRQ handler is the required way to acknowledge the byte.
     let scancode: u8 = unsafe { port.read() };
-    // Decoding and echo happen in the shell loop, not in interrupt context.
-    crate::input::SCANCODES.push(scancode);
+    // Once a wipe runs, input is discarded (stage `InputLocked`). Decoding
+    // and echo happen in the shell loop, not in interrupt context; `feed`
+    // only queues the byte and checks the emergency hotkey (which starts the
+    // wipe right here and never returns).
+    if !crate::wipe::wiping() {
+        crate::input::feed(scancode);
+    }
     // A process may be sleeping in read_key(); the lock is only ever held with
     // interrupts disabled, so taking it here cannot deadlock.
     crate::sched::wake_keyboard();

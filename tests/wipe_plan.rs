@@ -163,6 +163,8 @@ fn amnesia_plan_ready_after_arm() {
     let plan = wipe::plan().expect("plan");
     assert_eq!(plan.power, l_os::acpi::power_off_plan());
     assert!(plan.power.is_some());
+    // The lock-free copy the degraded wipe uses agrees with the plan.
+    assert_eq!(l_os::acpi::power_off_plan_unlocked(), plan.power);
     let (fb, fb_len) = plan.fb;
     assert!(fb != 0 && fb_len > 0, "framebuffer base/len in the plan");
     assert_eq!(plan.fb, l_os::framebuffer::raw_region());
@@ -229,4 +231,25 @@ fn check_walk_rejects_a_usable_table_frame() {
     let leaf = w.phys & !(PAGE - 1);
     fake.push(l_core::memrange::PhysRange { start: leaf, end: leaf + PAGE }).unwrap();
     assert!(matches!(wipe::check_walk(island, &fake), Err(wipe::ArmError::InUsable(_))));
+}
+
+/// Spec §8.6: the TSC is calibrated at boot against the PIT and the plan
+/// carries the frequency (0 would mean "uncalibrated").
+#[test_case]
+fn plan_has_calibrated_tsc() {
+    let plan = wipe::plan().expect("plan");
+    assert!(plan.tsc_hz > 0, "TSC not calibrated");
+    assert_eq!(plan.tsc_hz, l_os::time::tsc_hz());
+    // Cross-check over 10 ticks (100 ms): within 25 % (TCG timing is noisy).
+    let t = l_os::time::ticks();
+    while l_os::time::ticks() == t {
+        x86_64::instructions::hlt();
+    }
+    let (t0, c0) = (l_os::time::ticks(), l_os::time::rdtsc());
+    while l_os::time::ticks() < t0 + 10 {
+        x86_64::instructions::hlt();
+    }
+    let hz = (l_os::time::rdtsc() - c0) * 10;
+    serial_println!("  tsc_hz {} (cross-check {})", plan.tsc_hz, hz);
+    assert!(hz > plan.tsc_hz * 3 / 4 && hz < plan.tsc_hz * 5 / 4, "{} vs {}", hz, plan.tsc_hz);
 }

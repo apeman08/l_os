@@ -56,3 +56,22 @@ pub fn render_info(info: &FrameBufferInfo) -> Option<FbInfo> {
         format,
     })
 }
+
+/// Fill the whole framebuffer with zero bytes (black in RGB and BGR) without
+/// the console lock: base and length come from the atomics set in [`init`].
+/// For the wipe (stage `ScreenBlanked`, spec E9). Writes with `rep stos`,
+/// which the compiler cannot elide. The console is not told: a later console
+/// write would paint again (the wipe never returns to it).
+pub fn blank_raw() {
+    let (base, len) = raw_region();
+    if base == 0 || len == 0 {
+        return;
+    }
+    // SAFETY: `base`/`len` describe the `&'static mut [u8]` framebuffer
+    // memory the bootloader mapped and `init` recorded; it stays mapped for
+    // the whole run. Zero bytes are valid pixel data. A console slice of the
+    // same memory may exist (the wipe interrupted its owner), but that owner
+    // never runs again on the wipe path; in tests nothing else holds it
+    // (callers must not call this inside `with_framebuffer`).
+    unsafe { crate::wipe::zero_volatile(base as *mut u8, len) };
+}

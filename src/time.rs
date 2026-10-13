@@ -8,6 +8,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
+/// TSC frequency in Hz measured by [`calibrate_tsc`]; 0 = not calibrated.
+static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+/// PIT ticks the calibration measures over (spec §8.6).
+pub const TSC_CALIBRATION_TICKS: u64 = 5;
+/// Upper bound on `hlt`s while waiting for one tick (a dead PIT must not hang
+/// the boot): the PIT fires every 10 ms, other interrupts are rare at boot.
+const TICK_WAIT_LIMIT: u32 = 10_000;
 
 /// Program PIT channel 0 as a rate generator firing IRQ0 `TICK_HZ` times per
 /// second. Call once during boot, before interrupts are enabled.
@@ -37,3 +44,56 @@ pub fn ticks() -> u64 {
 }
 
 pub use l_core::time::{TICK_HZ, approx_seconds, ticks_from_ms, ticks_from_seconds, ticks_to_ms};
+
+/// Read the time stamp counter.
+pub fn rdtsc() -> u64 {
+    // SAFETY: RDTSC only reads the counter; CR4.TSD is not set by this
+    // kernel, so it is allowed at any privilege the kernel runs at.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Wait until the tick counter differs from `from`; `false` if the PIT never
+/// ticked within [`TICK_WAIT_LIMIT`] halts.
+fn wait_tick_after(from: u64) -> bool {
+    for _ in 0..TICK_WAIT_LIMIT {
+        if ticks() != from {
+            return true;
+        }
+        x86_64::instructions::hlt();
+    }
+    ticks() != from
+}
+
+/// Measure the TSC frequency against [`TSC_CALIBRATION_TICKS`] PIT ticks
+/// (about 50 ms) and remember it for [`tsc_hz`]. Called once at boot from
+/// [`crate::init`] after interrupts are on. Stays uncalibrated (0) if
+/// interrupts are off or the PIT does not tick.
+pub fn calibrate_tsc() -> u64 {
+    if !x86_64::instructions::interrupts::are_enabled() {
+        return 0;
+    }
+    // Start on a tick edge, so that exactly N whole tick periods are timed.
+    let t = ticks();
+    if !wait_tick_after(t) {
+        return 0;
+    }
+    let start_tick = ticks();
+    let start = rdtsc();
+    let mut now = start_tick;
+    while now.wrapping_sub(start_tick) < TSC_CALIBRATION_TICKS {
+        if !wait_tick_after(now) {
+            return 0;
+        }
+        now = ticks();
+    }
+    let cycles = rdtsc().wrapping_sub(start);
+    let hz = l_core::wipetime::tsc_hz(cycles, now.wrapping_sub(start_tick), TICK_HZ).unwrap_or(0);
+    TSC_HZ.store(hz, Ordering::Relaxed);
+    hz
+}
+
+/// TSC frequency in Hz from [`calibrate_tsc`]; 0 means "not calibrated" (the
+/// wipe report then shows 0 µs for every stage).
+pub fn tsc_hz() -> u64 {
+    TSC_HZ.load(Ordering::Relaxed)
+}
