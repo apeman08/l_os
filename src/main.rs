@@ -32,6 +32,11 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     #[cfg(test)]
     test_main();
 
+    // Aurora chrome (status bar, hint bar) with its boot fade-in, before the
+    // shell starts; opt-in, so test kernels keep the plain console.
+    #[cfg(not(test))]
+    l_os::aurora::show_chrome();
+
     #[cfg(not(test))]
     l_os::run_shell_forever();
 

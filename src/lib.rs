@@ -12,6 +12,7 @@ use core::panic::PanicInfo;
 
 pub mod serial;
 pub mod fb_console;
+pub mod aurora;
 pub mod framebuffer;
 pub mod interrupts;
 pub mod gdt;

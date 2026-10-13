@@ -13,6 +13,14 @@
 //! glyph. Any other character is drawn with the font (which falls back to the
 //! replacement glyph for characters it does not have).
 //!
+//! Chrome (opt-in, [`enable_chrome`], called by the real kernel entry via
+//! `crate::aurora`): the first text row becomes a status bar and the last one a
+//! hint bar, drawn with the `l_core` widgets. Console text then lives only in
+//! the region between them: the cursor starts at the region's first row,
+//! scrolling, clearing and backspace never touch the bars. The bars can be
+//! faded in from the background colour ([`fade_in_chrome`]); each fade frame
+//! re-renders only the two bar rows. Without the call every row is text.
+//!
 //! Cost: after each print call only the rows that changed are rendered. A
 //! scroll moves the already drawn pixels up with one memory copy per print call
 //! (however many rows it scrolled) and renders only the new rows, so long
@@ -21,12 +29,15 @@
 //! With the cargo feature `serial-console` (on by default) every console write
 //! is also mirrored to COM1.
 
+use alloc::string::String;
 use core::fmt;
 use core::ops::Range;
+use l_core::anim::{Fade, fade_theme};
 use l_core::cell::{Cell, Grid, Rgb};
 use l_core::font::{GLYPH_H, GLYPH_W, glyph};
 use l_core::render::{FbInfo, PixelFormat, grid_size_for, render};
 use l_core::theme::AURORA;
+use l_core::widgets::{HintBar, status_bar};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 
@@ -57,11 +68,24 @@ static SCREEN: Once<Screen> = Once::new();
 /// The console, `None` until [`init`] (no framebuffer, or before the heap).
 pub static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
 
+/// Status bar and hint bar (see the module docs).
+struct Chrome {
+    left: String,
+    right: String,
+    hints: HintBar,
+    /// Fade-in opacity: 0 = drawn in the background colour, 255 = final.
+    alpha: u8,
+}
+
 pub struct Console {
     grid: Grid,
     screen: Screen,
     col: usize,
     row: usize,
+    /// Text region: rows `top..bottom` (all rows without chrome).
+    top: usize,
+    bottom: usize,
+    chrome: Option<Chrome>,
     fg: Rgb,
     /// Rows (in current grid coordinates) not yet drawn.
     pending: Option<Range<usize>>,
@@ -94,6 +118,9 @@ impl Console {
             screen,
             col: 0,
             row: 0,
+            top: 0,
+            bottom: rows,
+            chrome: None,
             fg: AURORA.text,
             pending: Some(0..rows),
             scrolled: 0,
@@ -154,23 +181,24 @@ impl Console {
 
     fn new_line(&mut self) {
         self.col = 0;
-        if self.row + 1 < self.grid.rows() {
+        if self.row + 1 < self.bottom {
             self.row += 1;
             return;
         }
-        // Remember what was dirty before the scroll (Grid::scroll_up marks
-        // every row dirty, which would mean a full redraw).
+        // Scroll the text region only. Remember what was dirty before the
+        // scroll (the scroll marks the whole region dirty, which would mean
+        // redrawing all of it).
         let dirty = self.grid.take_dirty();
         self.mark_opt(dirty);
-        self.grid.scroll_up(1, blank(AURORA.text));
+        self.grid.scroll_rows_up(self.top..self.bottom, 1, blank(AURORA.text));
         let _ = self.grid.take_dirty();
         self.scrolled += 1;
-        let last = self.grid.rows() - 1;
+        let (top, last) = (self.top, self.bottom - 1);
         self.pending = self
             .pending
             .take()
-            .map(|r| r.start.saturating_sub(1)..r.end.saturating_sub(1))
-            .filter(|r| !r.is_empty());
+            .map(|r| r.start.saturating_sub(1).max(top)..r.end.saturating_sub(1))
+            .filter(|r| r.start < r.end);
         self.mark(last..last + 1);
     }
 
@@ -186,37 +214,61 @@ impl Console {
         self.grid.set(self.col, self.row, blank(self.fg));
     }
 
+    /// Blanks the text region (never the bars) and homes the cursor to its
+    /// first row.
     fn clear(&mut self) {
-        for row in 0..self.grid.rows() {
+        for row in self.top..self.bottom {
             for col in 0..self.grid.cols() {
                 self.grid.set(col, row, blank(AURORA.text));
             }
         }
         self.col = 0;
-        self.row = 0;
+        self.row = self.top;
     }
 
-    /// Brings the pixels up to date with the grid: moves the drawn rows up by
-    /// the number of rows scrolled, then renders only the rows that changed.
+    /// Draws both bars into the grid in the current fade colours and renders
+    /// just those two rows (the region is flushed first, so nothing else is
+    /// pending afterwards).
+    fn draw_chrome(&mut self) {
+        self.flush();
+        let Some(chrome) = &self.chrome else { return };
+        let theme = fade_theme(&AURORA, chrome.alpha);
+        let last = self.grid.rows() - 1;
+        status_bar(&mut self.grid, 0, &chrome.left, &chrome.right, &theme);
+        chrome.hints.draw(&mut self.grid, last, &theme);
+        // Only rows 0 and `last` changed; they are rendered right here.
+        let _ = self.grid.take_dirty();
+        let info = self.screen.info;
+        // SAFETY: as in `fb` (CONSOLE lock held through `&mut self`);
+        // taken directly so that `self.grid` can be borrowed alongside.
+        let fb = unsafe { core::slice::from_raw_parts_mut(self.screen.base, self.screen.len) };
+        render(&self.grid, 0..1, fb, &info);
+        render(&self.grid, last..last + 1, fb, &info);
+        self.rendered_rows += 2;
+    }
+
+    /// Brings the pixels up to date with the grid: moves the drawn rows of
+    /// the text region up by the number of rows scrolled, then renders only
+    /// the rows that changed.
     fn flush(&mut self) {
         let dirty = self.grid.take_dirty();
         self.mark_opt(dirty);
-        let rows = self.grid.rows();
+        let (top, bottom) = (self.top, self.bottom);
         let scrolled = core::mem::take(&mut self.scrolled);
-        let everything = self.pending.as_ref().is_some_and(|r| r.start == 0 && r.end >= rows);
+        let everything = self.pending.as_ref().is_some_and(|r| r.start <= top && r.end >= bottom);
         if scrolled > 0 && !everything {
             let info = self.screen.info;
             let row_bytes = GLYPH_H
                 .checked_mul(info.stride_px)
                 .and_then(|v| v.checked_mul(info.bytes_per_px));
-            let fits = row_bytes.and_then(|b| b.checked_mul(rows)).is_some_and(|end| end <= self.screen.len);
+            let fits = row_bytes.and_then(|b| b.checked_mul(bottom)).is_some_and(|end| end <= self.screen.len);
             match row_bytes {
-                Some(row_bytes) if scrolled < rows && fits => {
-                    // The rows that scrolled in at the bottom are pending
-                    // (each scroll marked its new bottom row).
-                    self.fb().copy_within(scrolled * row_bytes..rows * row_bytes, 0);
+                Some(row_bytes) if scrolled < bottom - top && fits => {
+                    // The rows that scrolled in at the bottom of the region
+                    // are pending (each scroll marked its new last row).
+                    self.fb().copy_within((top + scrolled) * row_bytes..bottom * row_bytes, top * row_bytes);
                 }
-                _ => self.mark(0..rows),
+                _ => self.mark(top..bottom),
             }
         }
         if let Some(range) = self.pending.take() {
@@ -443,7 +495,80 @@ fn paint_cell(fb: &mut [u8], info: &FbInfo, col: usize, row: usize, ch: char, fg
     }
 }
 
-// ---- Introspection (used by tests/framebuffer.rs) -------------------------
+// ---- Chrome ----------------------------------------------------------------
+
+/// Turns the chrome on: status bar (`left` in text, `right` muted and
+/// right-aligned) on the first row, `hints` on the last row, both drawn at
+/// fade alpha 0 (i.e. in the background colour; see [`fade_in_chrome`]). The
+/// text region becomes the rows in between; it is cleared and the cursor
+/// homed to its first row. Returns `false` (and changes nothing) without a
+/// console or with fewer than three rows.
+pub fn enable_chrome(left: &str, right: &str, hints: HintBar) -> bool {
+    interrupts::without_interrupts(|| {
+        let mut guard = CONSOLE.lock();
+        let Some(console) = guard.as_mut() else { return false };
+        let rows = console.grid.rows();
+        if rows < 3 {
+            return false;
+        }
+        console.flush();
+        console.top = 1;
+        console.bottom = rows - 1;
+        console.chrome = Some(Chrome { left: String::from(left), right: String::from(right), hints, alpha: 0 });
+        console.clear();
+        console.draw_chrome();
+        true
+    })
+}
+
+/// Redraws the bars at fade opacity `alpha` (255 = the final AURORA colours).
+/// Returns whether anything was drawn: nothing happens without chrome or when
+/// the opacity is unchanged.
+pub fn set_chrome_alpha(alpha: u8) -> bool {
+    interrupts::without_interrupts(|| {
+        let mut guard = CONSOLE.lock();
+        let Some(console) = guard.as_mut() else { return false };
+        match console.chrome.as_mut() {
+            Some(chrome) if chrome.alpha != alpha => chrome.alpha = alpha,
+            _ => return false,
+        }
+        console.draw_chrome();
+        true
+    })
+}
+
+/// Current fade opacity of the bars, `None` without chrome.
+pub fn chrome_alpha() -> Option<u8> {
+    with_console(|c| c.chrome.as_ref().map(|chrome| chrome.alpha)).flatten()
+}
+
+/// Fades the bars in from the background colour over `duration_ticks` timer
+/// ticks ([`l_core::anim::Fade`]), sleeping in `hlt` between frames, so other
+/// interrupts keep being served. Each frame re-renders only the two bar rows,
+/// and only when the opacity changed. With `reduce_motion` (or interrupts
+/// off, when no tick would ever wake `hlt`) the final colours are drawn at
+/// once. Returns the number of frames drawn; the bars end at alpha 255.
+pub fn fade_in_chrome(duration_ticks: u64, reduce_motion: bool) -> u32 {
+    let fade = Fade { start: crate::time::ticks(), duration: duration_ticks };
+    let mut frames = 0;
+    loop {
+        let alpha = if interrupts::are_enabled() { fade.alpha(crate::time::ticks(), reduce_motion) } else { 255 };
+        if set_chrome_alpha(alpha) {
+            frames += 1;
+        }
+        if alpha == 255 || chrome_alpha().is_none() {
+            return frames;
+        }
+        x86_64::instructions::hlt();
+    }
+}
+
+// ---- Introspection (used by tests/framebuffer.rs, tests/aurora.rs) --------
+
+/// Rows of the text region (all rows without chrome).
+pub fn region() -> Option<Range<usize>> {
+    with_console(|c| c.top..c.bottom)
+}
 
 /// Grid size in cells (columns, rows), or `None` without a console.
 pub fn grid_size() -> Option<(usize, usize)> {
@@ -478,3 +603,4 @@ pub fn with_framebuffer<R>(f: impl FnOnce(&FbInfo, &[u8]) -> R) -> Option<R> {
 fn with_console<R>(f: impl FnOnce(&Console) -> R) -> Option<R> {
     interrupts::without_interrupts(|| CONSOLE.lock().as_ref().map(f))
 }
+
