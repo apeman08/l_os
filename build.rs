@@ -31,8 +31,17 @@ fn nested_cargo() -> Command {
             cmd.env_remove(k);
         }
     }
-    cmd.current_dir(env::temp_dir());
+    cmd.current_dir(neutral_dir());
     cmd
+}
+
+/// A directory without a `.cargo/config.toml` above it: cargo reads config
+/// from the current directory upward. On Unix the filesystem root (only root
+/// can write there; `/tmp` would let any local user plant
+/// `/tmp/.cargo/config.toml`), on Windows the temp directory (no drive root
+/// is assumed to be writable or clean). [Windows: assumed]
+fn neutral_dir() -> PathBuf {
+    if cfg!(unix) { PathBuf::from("/") } else { env::temp_dir() }
 }
 
 /// `tools/image` for the host: `target/l_os-tools/debug/{l_os_image,l_os_run}`
@@ -75,13 +84,22 @@ fn main() {
         println!("cargo:rerun-if-changed={p}");
     }
 
+    // Also rerun when the runner binary is gone (e.g. target/l_os-tools was
+    // deleted on its own); otherwise cargo would not rebuild it. Its mtime is
+    // newer than this script's first run, so the next build reruns this script
+    // once more (the tools build is then a no-op) and then it is stable.
+    let runner = manifest
+        .join("target")
+        .join("l_os-tools")
+        .join("debug")
+        .join(format!("l_os_run{}", env::consts::EXE_SUFFIX));
+    println!("cargo:rerun-if-changed={}", runner.display());
     build_host_tools(&manifest);
 
     let target_dir = out.join("user-target");
     let mut cmd = nested_cargo();
     let link_script = user.join("link.ld");
-    cmd.current_dir(env::temp_dir())
-        .env(
+    cmd.env(
             "RUSTFLAGS",
             // Position-independent code because the user window is far above
             // 4 GiB (the target's small code model cannot reach it); the

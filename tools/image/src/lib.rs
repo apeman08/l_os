@@ -178,6 +178,10 @@ pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<Outc
         }
         if Instant::now() >= deadline {
             // The child may exit between try_wait and kill; that is fine.
+            // `Child::kill` is SIGKILL on Unix (TerminateProcess on Windows):
+            // QEMU gets no chance to clean up, e.g. to restore a terminal it
+            // put into raw mode (the former bash `timeout` sent SIGTERM). Only
+            // test mode uses this, after the 300 s timeout.
             let _ = child.kill();
             let _ = child.wait();
             return Ok(Outcome::TimedOut);

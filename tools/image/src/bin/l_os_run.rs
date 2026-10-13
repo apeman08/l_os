@@ -76,6 +76,9 @@ fn main() -> ExitCode {
             }
             ExitCode::from(code)
         }
+        // Unlike the former bash runner this is not an exec: l_os_run stays
+        // QEMU's parent and waits. Ctrl-C reaches both (same process group on
+        // Unix, same console on Windows [assumed]); QEMU's status is passed on.
         Mode::Run => match cmd.status() {
             Ok(status) => ExitCode::from(run_exit(Outcome::from_status(status))),
             Err(e) => fail(format!("cannot start {}: {e}", qemu.display())),
