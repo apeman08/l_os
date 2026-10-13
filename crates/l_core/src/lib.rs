@@ -5,6 +5,7 @@ extern crate alloc;
 
 pub mod acpi;
 pub mod anim;
+pub mod bootmark;
 pub mod cell;
 pub mod dns;
 pub mod elf;
@@ -23,6 +24,7 @@ pub mod syscall;
 pub mod url;
 pub mod usb_desc;
 pub mod usb_hid;
+pub mod usb_msc;
 pub mod wipe;
 pub mod wipetime;
 pub mod xhci_ctx;
