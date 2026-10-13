@@ -20,6 +20,7 @@ pub mod shell;
 pub mod syscall;
 pub mod url;
 pub mod wipe;
+pub mod wipetime;
 pub mod zeroize;
 pub mod widgets;
 pub mod theme;
