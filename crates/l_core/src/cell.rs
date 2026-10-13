@@ -107,6 +107,26 @@ impl Grid {
         self.dirty_hi = self.rows;
     }
 
+    /// Like [`Grid::scroll_up`], but only within `rows` (clamped to the
+    /// grid): those rows move up by `lines`, the vacated ones at the end of
+    /// the range are filled, and only that range is marked dirty. Rows outside
+    /// the range are untouched.
+    pub fn scroll_rows_up(&mut self, rows: Range<usize>, lines: usize, fill: Cell) {
+        let end = rows.end.min(self.rows);
+        if rows.start >= end || lines == 0 {
+            return;
+        }
+        let height = end - rows.start;
+        let lines = lines.min(height);
+        let (first, stop) = (rows.start * self.cols, end * self.cols);
+        self.cells.copy_within(first + lines * self.cols..stop, first);
+        for c in &mut self.cells[stop - lines * self.cols..stop] {
+            *c = fill;
+        }
+        self.mark_dirty(rows.start);
+        self.mark_dirty(end - 1);
+    }
+
     /// Row range touched since the previous call, or `None` if clean.
     pub fn take_dirty(&mut self) -> Option<Range<usize>> {
         let r = (self.dirty_lo < self.dirty_hi).then(|| self.dirty_lo..self.dirty_hi);
@@ -119,6 +139,7 @@ impl Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::String;
 
     const BLANK: Cell = Cell { ch: ' ', fg: Rgb(1, 1, 1), bg: Rgb(0, 0, 0), bold: false };
     const FG: Rgb = Rgb(200, 200, 200);
@@ -155,6 +176,34 @@ mod tests {
         assert_eq!(g.get(0, 2).unwrap().ch, '.');
         g.scroll_up(100, fill);
         assert_eq!(g.get(0, 0).unwrap().ch, '.');
+    }
+
+    #[test]
+    fn scroll_rows_up_moves_only_the_region() {
+        let mut g = Grid::new(2, 5, BLANK);
+        for (row, s) in ["aa", "bb", "cc", "dd", "ee"].iter().enumerate() {
+            g.put_str(0, row, s, FG, BG);
+        }
+        let _ = g.take_dirty();
+        let fill = Cell { ch: '.', ..BLANK };
+        g.scroll_rows_up(1..4, 1, fill);
+        let col0: String = (0..5).map(|r| g.get(0, r).unwrap().ch).collect();
+        assert_eq!(col0, "acd.e");
+        // Only the region is dirty, not the rows around it.
+        assert_eq!(g.take_dirty(), Some(1..4));
+        g.scroll_rows_up(1..4, 10, fill);
+        let col1: String = (0..5).map(|r| g.get(1, r).unwrap().ch).collect();
+        assert_eq!(col1, "a...e");
+        // Empty, reversed or out-of-range regions change nothing and do not panic.
+        let _ = g.take_dirty();
+        g.scroll_rows_up(3..3, 1, fill);
+        g.scroll_rows_up(5..9, 1, fill);
+        g.scroll_rows_up(2..1, 1, fill);
+        g.scroll_rows_up(1..4, 0, fill);
+        assert_eq!(g.take_dirty(), None);
+        g.scroll_rows_up(3..usize::MAX, 1, fill);
+        assert_eq!(g.get(0, 3).unwrap().ch, 'e');
+        assert_eq!(g.get(0, 4).unwrap().ch, '.');
     }
 
     #[test]

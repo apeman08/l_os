@@ -5,6 +5,7 @@
 //! kernel target without libm.
 
 use crate::cell::Rgb;
+use crate::theme::Theme;
 
 /// Cubic ease-out: fast start, gentle stop. `t` is clamped to `0.0..=1.0`
 /// (NaN counts as 0.0); `ease_out_cubic(0.0) == 0.0`, `ease_out_cubic(1.0) == 1.0`.
@@ -28,6 +29,23 @@ pub fn blend(a: Rgb, b: Rgb, alpha: u8) -> Rgb {
         ((x as u32 * (255 - w) + y as u32 * w + 127) / 255) as u8
     };
     Rgb(mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
+}
+
+/// Every colour of `theme` blended from `theme.bg` towards itself with
+/// [`blend`]: `alpha == 0` turns everything into the background (invisible),
+/// `alpha == 255` gives exactly `theme`. Used to fade UI chrome in.
+pub fn fade_theme(theme: &Theme, alpha: u8) -> Theme {
+    let f = |c: Rgb| blend(theme.bg, c, alpha);
+    Theme {
+        bg: theme.bg,
+        surface: f(theme.surface),
+        text: f(theme.text),
+        muted: f(theme.muted),
+        accent: f(theme.accent),
+        ok: f(theme.ok),
+        warn: f(theme.warn),
+        err: f(theme.err),
+    }
 }
 
 /// A fade-in starting at tick `start` and lasting `duration` ticks.
@@ -119,6 +137,24 @@ mod tests {
         assert_eq!(Fade { start: 5, duration: 0 }.alpha(5, false), 255);
         // start + duration overflowing u64 must not panic.
         assert_eq!(Fade { start: u64::MAX - 1, duration: u64::MAX }.alpha(0, false), 0);
+    }
+
+    #[test]
+    fn fade_theme_255_is_the_theme_and_0_is_the_background() {
+        use crate::theme::AURORA;
+        assert_eq!(fade_theme(&AURORA, 255), AURORA);
+        let t = fade_theme(&AURORA, 0);
+        for c in [t.bg, t.surface, t.text, t.muted, t.accent, t.ok, t.warn, t.err] {
+            assert_eq!(c, AURORA.bg);
+        }
+        // In between every colour is the blend from bg, field by field.
+        let m = fade_theme(&AURORA, 100);
+        assert_eq!(m.text, blend(AURORA.bg, AURORA.text, 100));
+        assert_eq!(m.surface, blend(AURORA.bg, AURORA.surface, 100));
+        assert_eq!(m.accent, blend(AURORA.bg, AURORA.accent, 100));
+        assert_eq!(m.muted, blend(AURORA.bg, AURORA.muted, 100));
+        assert_ne!(m.text, AURORA.text);
+        assert_ne!(m.text, AURORA.bg);
     }
 
     #[test]
