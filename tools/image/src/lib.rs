@@ -332,9 +332,18 @@ fn candidates(os: HostOs, qemu: Option<&Path>) -> Vec<Candidate> {
         }
         // [assumed: not tested on macOS]
         HostOs::MacOs => c.extend(MACOS_QEMU_SHARE.iter().map(|d| pair_in(Path::new(d)))),
-        // QEMU for Windows ships the pair in `share` next to the executable.
+        // QEMU for Windows ships the pair in `share` next to the executable;
+        // then the default install dir, for a QEMU found through a shim
+        // (Scoop, Chocolatey) whose directory has no `share`.
         // [assumed: the file names come from QEMU's descriptor; not tested on Windows]
-        HostOs::Windows => c.extend(qemu.and_then(Path::parent).map(|d| pair_in(&d.join("share")))),
+        HostOs::Windows => {
+            let install = Path::new(WINDOWS_QEMU_DIR);
+            let next_to = qemu.and_then(Path::parent);
+            c.extend(next_to.map(|d| pair_in(&d.join("share"))));
+            if next_to != Some(install) {
+                c.push(pair_in(&install.join("share")));
+            }
+        }
     }
     c
 }
@@ -384,8 +393,13 @@ pub fn find_firmware(
         }
     }
     if let Some(Candidate::Pair(code, vars)) = cands.iter().find(|c| matches!(c, Candidate::Pair(code, _) if exists(code))) {
+        let example = if os == HostOs::Windows {
+            r"set OVMF_CODE=C:\path\to\edk2-x86_64-code.fd and set OVMF_VARS=C:\path\to\edk2-i386-vars.fd (or set OVMF_FD=C:\path\to\OVMF.fd, a combined image)"
+        } else {
+            "set OVMF_CODE=/path/to/OVMF_CODE.fd and OVMF_VARS=/path/to/OVMF_VARS.fd (or OVMF_FD=/path/to/OVMF.fd, a combined image)"
+        };
         return Err(format!(
-            "found the UEFI code image {} but not its variable store {}; set OVMF_CODE and OVMF_VARS=/path/to/the/vars.fd (or OVMF_FD=/path/to/a/combined/OVMF.fd)",
+            "found the UEFI code image {} but not its variable store {}; {example}",
             code.display(),
             vars.display()
         ));
@@ -724,6 +738,41 @@ mod tests {
         assert!(e.contains("OVMF_VARS"), "{e}");
         let e = find_firmware(HostOs::Linux, &FirmwareEnv::default(), None, &fs(&[PAIR4M[0]])).unwrap_err();
         assert!(e.contains(PAIR4M[1]) && e.contains("OVMF_VARS"), "{e}");
+    }
+
+    #[test]
+    fn windows_pair_falls_back_to_install_dir_behind_a_shim() {
+        let qemu = Path::new(r"C:\Users\u\scoop\shims").join("qemu-system-x86_64.exe");
+        let share = Path::new(WINDOWS_QEMU_DIR).join("share");
+        let (code, vars) = (share.join("edk2-x86_64-code.fd"), share.join("edk2-i386-vars.fd"));
+        let (c, v) = (code.clone(), vars.clone());
+        let exists = move |p: &Path| p == c || p == v;
+        assert_eq!(
+            find_firmware(HostOs::Windows, &FirmwareEnv::default(), Some(&qemu), &exists).unwrap(),
+            Firmware::Pflash { code: code.clone(), vars: vars.clone() }
+        );
+        let e = find_firmware(HostOs::Windows, &FirmwareEnv::default(), Some(&qemu), &|_: &Path| false).unwrap_err();
+        let shim_code = Path::new(r"C:\Users\u\scoop\shims").join("share").join("edk2-x86_64-code.fd");
+        assert!(e.contains(&shim_code.display().to_string()), "lists the pair next to qemu: {e}");
+        assert!(e.contains(&code.display().to_string()) && e.contains(&vars.display().to_string()), "lists the install dir pair: {e}");
+    }
+
+    #[test]
+    fn windows_install_dir_pair_is_not_listed_twice() {
+        let qemu = Path::new(WINDOWS_QEMU_DIR).join("qemu-system-x86_64.exe");
+        let e = find_firmware(HostOs::Windows, &FirmwareEnv::default(), Some(&qemu), &|_: &Path| false).unwrap_err();
+        assert_eq!(e.matches("edk2-x86_64-code.fd +").count(), 1, "{e}");
+    }
+
+    #[test]
+    fn missing_vars_hint_is_per_os() {
+        let qemu = Path::new(WINDOWS_QEMU_DIR).join("qemu-system-x86_64.exe");
+        let code = Path::new(WINDOWS_QEMU_DIR).join("share").join("edk2-x86_64-code.fd");
+        let e = find_firmware(HostOs::Windows, &FirmwareEnv::default(), Some(&qemu), &move |p: &Path| p == code).unwrap_err();
+        assert!(e.contains(r"set OVMF_VARS=C:\path\to\edk2-i386-vars.fd"), "{e}");
+        assert!(!e.contains("/path/to"), "no Unix placeholder on Windows: {e}");
+        let e = find_firmware(HostOs::Linux, &FirmwareEnv::default(), None, &fs(&[PAIR4M[0]])).unwrap_err();
+        assert!(e.contains("OVMF_VARS=/path/to/OVMF_VARS.fd"), "{e}");
     }
 
     #[test]
