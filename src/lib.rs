@@ -23,6 +23,8 @@ pub mod rng;
 pub mod rtc;
 pub mod pci;
 pub mod acpi;
+pub mod secrets;
+pub mod wipe;
 pub mod virtio_net;
 pub mod allocator;
 pub mod input;
@@ -78,6 +80,30 @@ pub const BOOTLOADER_CONFIG: bootloader_api::BootloaderConfig = {
     config
 };
 
+/// What the wipe plan needs from the bootloader's `BootInfo`, saved at boot
+/// by [`init_memory`] (spec §8.4). All addresses as the bootloader reports
+/// them: `kernel_addr` physical, `kernel_stack_bottom` virtual.
+#[derive(Debug, Clone, Copy)]
+pub struct BootFacts {
+    pub rsdp_addr: Option<u64>,
+    /// Physical address and length of the kernel ELF file in RAM.
+    pub kernel_addr: u64,
+    pub kernel_len: u64,
+    /// Added to the ELF's virtual addresses (the kernel is a static PIE).
+    pub kernel_image_offset: u64,
+    /// Lowest virtual address and length of the boot kernel stack.
+    pub kernel_stack_bottom: u64,
+    pub kernel_stack_len: u64,
+    pub memory_regions: &'static [bootloader_api::info::MemoryRegion],
+}
+
+static BOOT_FACTS: spin::Mutex<Option<BootFacts>> = spin::Mutex::new(None);
+
+/// The facts saved by [`init_memory`], `None` before it ran.
+pub fn boot_facts() -> Option<BootFacts> {
+    *BOOT_FACTS.lock()
+}
+
 /// Whether console writes are mirrored to COM1 (cargo feature `serial-console`,
 /// off by default; never on in an amnesic image).
 pub const SERIAL_MIRROR: bool = cfg!(feature = "serial-console");
@@ -91,6 +117,16 @@ pub fn init_memory(boot_info: &'static mut bootloader_api::BootInfo) {
     use x86_64::VirtAddr;
     let fb_memory = framebuffer::init(boot_info.framebuffer.take());
     let boot_info: &'static bootloader_api::BootInfo = boot_info;
+    let facts = BootFacts {
+        rsdp_addr: boot_info.rsdp_addr.into_option(),
+        kernel_addr: boot_info.kernel_addr,
+        kernel_len: boot_info.kernel_len,
+        kernel_image_offset: boot_info.kernel_image_offset,
+        kernel_stack_bottom: boot_info.kernel_stack_bottom,
+        kernel_stack_len: boot_info.kernel_stack_len,
+        memory_regions: &boot_info.memory_regions,
+    };
+    *BOOT_FACTS.lock() = Some(facts);
     let offset = boot_info
         .physical_memory_offset
         .into_option()
@@ -114,7 +150,7 @@ pub fn init_memory(boot_info: &'static mut bootloader_api::BootInfo) {
     // Everything up to the end of the highest region is mapped at the offset.
     let phys_end = boot_info.memory_regions.iter().map(|r| r.end).max().unwrap_or(0);
     acpi::set_phys_limit(phys_end);
-    acpi::init(boot_info.rsdp_addr.into_option());
+    acpi::init(facts.rsdp_addr);
     let raw_info = framebuffer::info();
     let fb_info = raw_info.as_ref().and_then(framebuffer::render_info);
     match (fb_info, fb_memory) {
@@ -129,6 +165,10 @@ pub fn init_memory(boot_info: &'static mut bootloader_api::BootInfo) {
             None => serial_println!("no usable framebuffer (format: none, no GOP framebuffer); no screen console"),
         },
     }
+    // After acpi::init (the plan holds the S5 values) and after the console,
+    // so that a failure is visible. Errors are reported by `arm` itself; the
+    // system keeps running with "amnesisch: nein".
+    let _ = wipe::arm(&facts);
 }
 
 /// Run the interactive shell as a ring-3 process, forever. It holds exactly:

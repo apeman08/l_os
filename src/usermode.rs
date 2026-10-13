@@ -242,6 +242,9 @@ fn map_page(
     unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut mem.frames) }
         .map_err(|_| RunError::NoMemory)?
         .ignore(); // not the active address space: nothing to flush
+    // A user leaf page from now on: wipe stage `UserZeroed` zeroes it first;
+    // `destroy_address_space` clears the mark again.
+    memory::mark_user_frame(frame);
     Ok(frame)
 }
 

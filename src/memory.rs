@@ -3,7 +3,7 @@
 //! The bootloader maps all physical memory at a fixed virtual offset
 //! (`crate::BOOTLOADER_CONFIG`); the kernel uses that to walk and edit page tables.
 
-use crate::frames::{Cursor, FrameBitmap, Region};
+use crate::frames::{Cursor, Region};
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
@@ -13,8 +13,74 @@ use x86_64::{
 };
 
 /// Frames above this number (4 GiB of physical memory) are never handed out.
-const TRACKED_FRAMES_WORDS: usize = 16384; // 16384 * 64 = 1 Mi frames = 4 GiB
-static ALLOCATED: Mutex<FrameBitmap<TRACKED_FRAMES_WORDS>> = Mutex::new(FrameBitmap::new());
+pub const TRACKED_FRAMES_WORDS: usize = 16384; // 16384 * 64 = 1 Mi frames = 4 GiB
+/// Number of frames the bitmaps below can describe.
+pub const TRACKED_FRAMES: u64 = TRACKED_FRAMES_WORDS as u64 * 64;
+
+/// One bit per frame below 4 GiB: set while the frame is handed out. Atomic
+/// words (not a lock) so the wipe can read them from any context
+/// ([`allocated_word`]); the read-modify-write in [`bit_set`]/[`bit_clear`]
+/// keeps the double-allocation and double-free checks exact without a lock.
+static ALLOCATED: [AtomicU64; TRACKED_FRAMES_WORDS] = [const { AtomicU64::new(0) }; TRACKED_FRAMES_WORDS];
+
+/// One bit per frame below 4 GiB: set while the frame is a leaf page of a
+/// process's private user half (spec §8.3, wipe stage `UserZeroed`). Set when
+/// a user page is mapped ([`mark_user_frame`]), cleared in
+/// [`destroy_address_space`]. Frames above 4 GiB are never handed out, so the
+/// bitmap covers every user frame.
+pub static USER_FRAMES: [AtomicU64; TRACKED_FRAMES_WORDS] = [const { AtomicU64::new(0) }; TRACKED_FRAMES_WORDS];
+static USER_FRAMES_MARKED: AtomicU64 = AtomicU64::new(0);
+
+/// Set bit `frame` in `map`; `false` if out of range or already set.
+fn bit_set(map: &[AtomicU64; TRACKED_FRAMES_WORDS], frame: u64) -> bool {
+    if frame >= TRACKED_FRAMES {
+        return false;
+    }
+    let bit = 1u64 << (frame % 64);
+    map[(frame / 64) as usize].fetch_or(bit, Ordering::SeqCst) & bit == 0
+}
+
+/// Clear bit `frame` in `map`; `false` if out of range or it was not set.
+fn bit_clear(map: &[AtomicU64; TRACKED_FRAMES_WORDS], frame: u64) -> bool {
+    if frame >= TRACKED_FRAMES {
+        return false;
+    }
+    let bit = 1u64 << (frame % 64);
+    map[(frame / 64) as usize].fetch_and(!bit, Ordering::SeqCst) & bit != 0
+}
+
+fn bit_get(map: &[AtomicU64; TRACKED_FRAMES_WORDS], frame: u64) -> bool {
+    frame < TRACKED_FRAMES && map[(frame / 64) as usize].load(Ordering::SeqCst) >> (frame % 64) & 1 == 1
+}
+
+/// Word `i` of the allocation bitmap (frames `64*i .. 64*i+63`, LSB first);
+/// 0 for `i` out of range. Lock-free: callable from the wipe path.
+pub fn allocated_word(i: usize) -> u64 {
+    ALLOCATED.get(i).map_or(0, |w| w.load(Ordering::SeqCst))
+}
+
+/// Record that `frame` is now a user leaf page. Frames above 4 GiB are never
+/// handed out by the allocator, so they never reach this.
+pub fn mark_user_frame(frame: PhysFrame) {
+    let n = frame.start_address().as_u64() / 4096;
+    assert!(n < TRACKED_FRAMES, "user frame above the tracked range");
+    bit_set(&USER_FRAMES, n);
+    USER_FRAMES_MARKED.fetch_add(1, Ordering::Relaxed);
+}
+
+fn unmark_user_frame(frame: PhysFrame) {
+    bit_clear(&USER_FRAMES, frame.start_address().as_u64() / 4096);
+}
+
+/// Whether frame number `n` (physical address / 4096) is a user leaf page.
+pub fn is_user_frame(n: u64) -> bool {
+    bit_get(&USER_FRAMES, n)
+}
+
+/// How many times a user frame was marked since boot (monotonic; for tests).
+pub fn user_frames_marked() -> u64 {
+    USER_FRAMES_MARKED.load(Ordering::Relaxed)
+}
 
 static FRAMES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
 static FRAMES_FREED: AtomicU64 = AtomicU64::new(0);
@@ -61,8 +127,8 @@ impl BootInfoFrameAllocator {
     /// Mark `addr` allocated and hand out a zeroed frame; `None` if it lies
     /// beyond the tracked range (>4 GiB), which is refused rather than lost.
     fn claim(&mut self, addr: u64) -> Option<PhysFrame> {
-        if !ALLOCATED.lock().mark_allocated(addr / 4096) {
-            assert!(addr / 4096 >= FrameBitmap::<TRACKED_FRAMES_WORDS>::CAPACITY, "frame handed out twice");
+        if !bit_set(&ALLOCATED, addr / 4096) {
+            assert!(addr / 4096 >= TRACKED_FRAMES, "frame handed out twice");
             return None;
         }
         // SAFETY: the frame was just taken exclusively; stale data (including
@@ -123,7 +189,7 @@ impl FrameDeallocator<Size4KiB> for BootInfoFrameAllocator {
     /// frame that is not currently allocated is detected and panics.
     unsafe fn deallocate_frame(&mut self, frame: PhysFrame) {
         let addr = frame.start_address().as_u64();
-        if !ALLOCATED.lock().mark_free(addr / 4096) {
+        if !bit_clear(&ALLOCATED, addr / 4096) {
             panic!("free of frame {:#x} that is not allocated (double free?)", addr);
         }
         // SAFETY: caller guarantees nobody else uses the frame; it is valid RAM
@@ -270,6 +336,13 @@ pub fn phys_offset() -> VirtAddr {
     VirtAddr::new(PHYS_OFFSET.load(Ordering::SeqCst))
 }
 
+/// Physical address behind `virt` in the kernel's own page tables, or `None`
+/// if unmapped or memory is not initialized. Takes the [`MEMORY`] lock.
+pub fn virt_to_phys(virt: VirtAddr) -> Option<PhysAddr> {
+    use x86_64::structures::paging::Translate;
+    MEMORY.lock().as_ref()?.mapper.translate_addr(virt)
+}
+
 fn table_ptr(frame: PhysFrame) -> *mut PageTable {
     (phys_offset() + frame.start_address().as_u64()).as_mut_ptr::<PageTable>()
 }
@@ -333,7 +406,9 @@ pub fn destroy_address_space(mem: &mut Memory, l4: PhysFrame) {
                     let l1f = e2.frame().expect("huge page in user space");
                     let l1 = &*table_ptr(l1f);
                     for e1 in l1.iter().filter(|e| !e.is_unused()) {
-                        mem.frames.deallocate_frame(e1.frame().expect("bad user leaf"));
+                        let leaf = e1.frame().expect("bad user leaf");
+                        unmark_user_frame(leaf);
+                        mem.frames.deallocate_frame(leaf);
                     }
                     mem.frames.deallocate_frame(l1f);
                 }

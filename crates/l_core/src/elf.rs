@@ -172,6 +172,114 @@ pub fn parse(bytes: &[u8], window_start: u64, window_end: u64) -> Result<Image, 
     Ok(Image { entry, segments })
 }
 
+const PT_GNU_RELRO: u32 = 0x6474_e552;
+
+/// Memory layout of an ELF image the loader already placed (the kernel
+/// itself), as reported by [`load_segments`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadInfo {
+    /// `PT_LOAD` segments with `mem_size > 0`, in header order.
+    pub segments: [Option<Segment>; MAX_SEGMENTS],
+    /// `PT_GNU_RELRO` as half-open virtual range `(start, end)`, unrelocated.
+    pub relro: Option<(u64, u64)>,
+}
+
+impl LoadInfo {
+    pub fn segments(&self) -> impl Iterator<Item = &Segment> {
+        self.segments.iter().flatten()
+    }
+}
+
+/// Describe the `PT_LOAD` segments and the `PT_GNU_RELRO` range of an
+/// `ET_EXEC` or `ET_DYN` x86_64 image (the kernel is a static PIE).
+///
+/// Unlike [`parse`] this does not decide whether an image may be loaded: no
+/// address window, no alignment, overlap or entry checks, and dynamic headers
+/// are ignored. It only reads the ELF header and the program header table, so
+/// `bytes` may be just that prefix of the file; segment file ranges are not
+/// checked against `bytes`. Still rejected: malformed headers, `filesz >
+/// memsz`, address overflow, W+X segments, more than [`MAX_SEGMENTS`] loads,
+/// more than one RELRO header.
+pub fn load_segments(bytes: &[u8]) -> Result<LoadInfo, ElfError> {
+    if bytes.len() < 64 {
+        return Err(ElfError::TooShort);
+    }
+    if &bytes[0..4] != b"\x7fELF" {
+        return Err(ElfError::BadMagic);
+    }
+    if bytes[4] != 2 || bytes[5] != 1 || bytes[6] != 1 {
+        return Err(ElfError::NotElf64LittleEndian);
+    }
+    if !matches!(u16_at(bytes, 16), Some(2) | Some(3)) {
+        return Err(ElfError::NotExecutable); // ET_EXEC or ET_DYN
+    }
+    if u16_at(bytes, 18) != Some(62) {
+        return Err(ElfError::WrongMachine);
+    }
+    let phoff = u64_at(bytes, 32).ok_or(ElfError::TooShort)?;
+    let phentsize = u16_at(bytes, 54).ok_or(ElfError::TooShort)?;
+    let phnum = u16_at(bytes, 56).ok_or(ElfError::TooShort)? as u64;
+    if phentsize != 56 || phnum == 0 || phnum > 32 {
+        return Err(ElfError::BadProgramHeaders);
+    }
+    let table_end = phnum
+        .checked_mul(56)
+        .and_then(|n| n.checked_add(phoff))
+        .ok_or(ElfError::BadProgramHeaders)?;
+    if table_end > bytes.len() as u64 {
+        return Err(ElfError::BadProgramHeaders);
+    }
+
+    let mut info = LoadInfo { segments: [None; MAX_SEGMENTS], relro: None };
+    let mut count = 0;
+    for i in 0..phnum {
+        let o = (phoff + i * 56) as usize;
+        let p_type = u32_at(bytes, o).ok_or(ElfError::BadProgramHeaders)?;
+        let flags = u32_at(bytes, o + 4).ok_or(ElfError::BadProgramHeaders)?;
+        let offset = u64_at(bytes, o + 8).ok_or(ElfError::BadProgramHeaders)?;
+        let vaddr = u64_at(bytes, o + 16).ok_or(ElfError::BadProgramHeaders)?;
+        let filesz = u64_at(bytes, o + 32).ok_or(ElfError::BadProgramHeaders)?;
+        let memsz = u64_at(bytes, o + 40).ok_or(ElfError::BadProgramHeaders)?;
+        match p_type {
+            PT_GNU_RELRO => {
+                if info.relro.is_some() {
+                    return Err(ElfError::BadProgramHeaders);
+                }
+                let end = vaddr.checked_add(memsz).ok_or(ElfError::SegmentOutOfRange)?;
+                info.relro = Some((vaddr, end));
+                continue;
+            }
+            PT_LOAD => {}
+            _ => continue,
+        }
+        if memsz == 0 {
+            continue;
+        }
+        let (writable, executable) = (flags & PF_W != 0, flags & PF_X != 0);
+        if writable && executable {
+            return Err(ElfError::WritableAndExecutable);
+        }
+        if filesz > memsz {
+            return Err(ElfError::FileRangeOutOfBounds);
+        }
+        // The page-rounded end must be representable too.
+        vaddr
+            .checked_add(memsz)
+            .and_then(|e| e.checked_next_multiple_of(PAGE))
+            .ok_or(ElfError::SegmentOutOfRange)?;
+        if count == MAX_SEGMENTS {
+            return Err(ElfError::TooManySegments);
+        }
+        info.segments[count] =
+            Some(Segment { vaddr, file_offset: offset, file_size: filesz, mem_size: memsz, writable, executable });
+        count += 1;
+    }
+    if count == 0 {
+        return Err(ElfError::NoLoadSegments);
+    }
+    Ok(info)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +448,100 @@ mod tests {
         let mut phs = phs;
         phs[0].flags = 5;
         assert_eq!(parse(&build(W0, &phs), W0, W1), Err(ElfError::TooManySegments));
+    }
+
+    fn set_type(v: &mut [u8], t: u16) {
+        v[16..18].copy_from_slice(&t.to_le_bytes());
+    }
+
+    /// Shaped like the kernel (static PIE): unaligned segment starts, a
+    /// writable RELRO segment, PT_DYNAMIC, and a separate .data/.bss segment.
+    fn kernel_like() -> Vec<u8> {
+        let mut v = build(
+            0x171940,
+            &[
+                Ph { p_type: 6, flags: 4, offset: 0x40, vaddr: 0x40, filesz: 0x1f8, memsz: 0x1f8 },
+                Ph { p_type: 1, flags: 4, offset: 0, vaddr: 0, filesz: 0x170864, memsz: 0x170864 },
+                Ph { p_type: 1, flags: 5, offset: 0x170870, vaddr: 0x171870, filesz: 0xa0edc, memsz: 0xa0edc },
+                Ph { p_type: 1, flags: 6, offset: 0x211750, vaddr: 0x213750, filesz: 0xa8e0, memsz: 0xb8b0 },
+                Ph { p_type: 1, flags: 6, offset: 0x21c030, vaddr: 0x21f030, filesz: 0x236e, memsz: 0x2db18 },
+                Ph { p_type: 2, flags: 6, offset: 0x21be38, vaddr: 0x21de38, filesz: 0xd0, memsz: 0xd0 },
+                Ph { p_type: 0x6474e552, flags: 4, offset: 0x211750, vaddr: 0x213750, filesz: 0xa8e0, memsz: 0xb8b0 },
+                Ph { p_type: 0x6474e551, flags: 6, offset: 0, vaddr: 0, filesz: 0, memsz: 0 },
+            ],
+        );
+        set_type(&mut v, 3);
+        v
+    }
+
+    #[test]
+    fn load_segments_accepts_et_dyn() {
+        let v = kernel_like();
+        // The strict user-program parser refuses it (ET_DYN, PT_DYNAMIC) ...
+        assert!(parse(&v, W0, W1).is_err());
+        // ... load_segments describes it: no window, unaligned starts allowed,
+        // file ranges beyond the (header-only) buffer are not checked.
+        let info = load_segments(&v).unwrap();
+        let segs: Vec<_> = info.segments.iter().flatten().collect();
+        assert_eq!(segs.len(), 4);
+        assert_eq!((segs[0].vaddr, segs[0].mem_size, segs[0].writable), (0, 0x170864, false));
+        assert!(segs[1].executable && !segs[1].writable);
+        assert_eq!((segs[2].vaddr, segs[2].mem_size), (0x213750, 0xb8b0));
+        assert!(segs[2].writable && segs[3].writable && !segs[3].executable);
+        assert_eq!((segs[3].vaddr, segs[3].file_size, segs[3].mem_size), (0x21f030, 0x236e, 0x2db18));
+        // ET_EXEC is taken as well.
+        let mut e = v.clone();
+        set_type(&mut e, 2);
+        assert_eq!(load_segments(&e).unwrap(), info);
+        // Only the header prefix is needed.
+        assert_eq!(load_segments(&v[..64 + 8 * 56]).unwrap(), info);
+    }
+
+    #[test]
+    fn load_segments_reports_relro() {
+        let info = load_segments(&kernel_like()).unwrap();
+        assert_eq!(info.relro, Some((0x213750, 0x213750 + 0xb8b0)));
+        // Without PT_GNU_RELRO there is none.
+        let v = build(W0, &[rx(W0), Ph { p_type: 1, flags: 6, offset: 0x2000, vaddr: W0 + 0x1000, filesz: 0, memsz: 0x10 }]);
+        assert_eq!(load_segments(&v).unwrap().relro, None);
+        // Two RELRO headers are ambiguous: refused.
+        let relro = || Ph { p_type: 0x6474e552, flags: 4, offset: 0, vaddr: 0x1000, filesz: 0, memsz: 0x1000 };
+        let v = build(W0, &[rx(W0), relro(), relro()]);
+        assert_eq!(load_segments(&v), Err(ElfError::BadProgramHeaders));
+        // Overflowing RELRO end is refused.
+        let v = build(W0, &[rx(W0), Ph { vaddr: u64::MAX - 4, memsz: 0x10, ..relro() }]);
+        assert_eq!(load_segments(&v), Err(ElfError::SegmentOutOfRange));
+    }
+
+    #[test]
+    fn load_segments_rejects_what_it_cannot_describe() {
+        let good = kernel_like();
+        let mut v = good.clone();
+        set_type(&mut v, 4); // ET_CORE
+        assert_eq!(load_segments(&v), Err(ElfError::NotExecutable));
+        let mut v = good.clone();
+        v[18] = 40;
+        assert_eq!(load_segments(&v), Err(ElfError::WrongMachine));
+        assert_eq!(load_segments(&good[..64 + 3 * 56]), Err(ElfError::BadProgramHeaders)); // table cut off
+        assert_eq!(load_segments(&good[..10]), Err(ElfError::TooShort));
+        let v = build(W0, &[Ph { flags: 7, ..rx(W0) }]);
+        assert_eq!(load_segments(&v), Err(ElfError::WritableAndExecutable));
+        let v = build(W0, &[Ph { filesz: 0x200, memsz: 0x100, ..rx(W0) }]);
+        assert_eq!(load_segments(&v), Err(ElfError::FileRangeOutOfBounds));
+        let v = build(W0, &[Ph { vaddr: u64::MAX - 0x10, ..rx(W0) }]);
+        assert_eq!(load_segments(&v), Err(ElfError::SegmentOutOfRange));
+        let v = build(W0, &[Ph { p_type: 4, flags: 4, offset: 0, vaddr: 0, filesz: 0, memsz: 0 }]);
+        assert_eq!(load_segments(&v), Err(ElfError::NoLoadSegments));
+        let phs: Vec<Ph> = (0..7).map(|i| Ph { vaddr: W0 + i * 0x1000, ..rx(W0) }).collect();
+        assert_eq!(load_segments(&build(W0, &phs)), Err(ElfError::TooManySegments));
+        // Fuzz: never panics.
+        for i in 0..good.len().min(64 + 8 * 56) {
+            for x in [0u8, 0xff, 0x80] {
+                let mut v = good.clone();
+                v[i] = x;
+                let _ = load_segments(&v);
+            }
+        }
     }
 
     #[test]

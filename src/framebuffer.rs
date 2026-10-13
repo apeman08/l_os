@@ -8,17 +8,31 @@
 
 use bootloader_api::info::{FrameBuffer, FrameBufferInfo, PixelFormat};
 use l_core::render::{self, FbInfo};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
 /// Layout of the framebuffer, if the bootloader provided one (set once at boot).
 static INFO: Mutex<Option<FrameBufferInfo>> = Mutex::new(None);
+/// Virtual base and byte length of the framebuffer memory (0 = none). Plain
+/// atomics so the wipe can blank the screen without the console's lock.
+static BASE: AtomicU64 = AtomicU64::new(0);
+static LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Record the bootloader's framebuffer and hand out its memory (once, to the
 /// console). Called once from [`crate::init_memory`].
 pub fn init(framebuffer: Option<FrameBuffer>) -> Option<&'static mut [u8]> {
     let framebuffer = framebuffer?;
     *INFO.lock() = Some(framebuffer.info());
-    Some(framebuffer.into_buffer())
+    let buffer = framebuffer.into_buffer();
+    BASE.store(buffer.as_ptr() as u64, Ordering::SeqCst);
+    LEN.store(buffer.len(), Ordering::SeqCst);
+    Some(buffer)
+}
+
+/// `(virtual base, byte length)` of the framebuffer memory, `(0, 0)` if there
+/// is none. Lock-free.
+pub fn raw_region() -> (u64, usize) {
+    (BASE.load(Ordering::SeqCst), LEN.load(Ordering::SeqCst))
 }
 
 /// Layout of the framebuffer, or `None` if there is none.

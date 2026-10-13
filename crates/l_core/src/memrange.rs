@@ -33,7 +33,7 @@ pub struct RangeList<const N: usize> {
 }
 
 impl<const N: usize> RangeList<N> {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         RangeList { ranges: [PhysRange { start: 0, end: 0 }; N], len: 0 }
     }
     pub fn push(&mut self, r: PhysRange) -> Result<(), Full> {

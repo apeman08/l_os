@@ -43,6 +43,10 @@ name = "acpi"
 harness = true
 
 [[test]]
+name = "wipe_plan"
+harness = true
+
+[[test]]
 name = "network_denied"
 harness = true
 required-features = ["net-tests"]
