@@ -18,7 +18,7 @@
 
 use l_os_image::{
     FirmwareEnv, HostOs, Mode, Outcome, TEST_TIMEOUT, build_image, find_firmware, find_qemu, image_path_for, is_test_binary,
-    is_usb_test, project_root, qemu_args, usb_test_args, run_exit, run_with_timeout, test_exit,
+    is_usb_test, project_root, qemu_args, run_exit, run_with_timeout, test_exit, usb_test_args,
 };
 use std::{env, path::PathBuf, process::Command, process::ExitCode};
 

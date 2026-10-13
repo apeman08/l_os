@@ -42,20 +42,33 @@ pub fn build_image(kernel: &Path, out: &Path) -> Result<(), String> {
     // the bootloader's log lines would mix into it. L_OS_BOOT_LOG=1 turns them
     // on for debugging boot problems (e.g. a bootloader panic before the kernel).
     config.serial_logging = std::env::var_os("L_OS_BOOT_LOG").is_some_and(|v| v == "1");
-    // The boot id is patched into a temporary copy of the kernel: the cargo
-    // artifact itself stays untouched (so cargo's fingerprints and the next
-    // run see the same file).
+    build_image_with(kernel, out, &|k, o| {
+        bootloader::UefiBoot::new(k)
+            .set_boot_config(&config)
+            .create_disk_image(o)
+            .map_err(|e| format!("{e:#}"))
+    })
+}
+
+/// `build_image` with the disk-image creator injected (the host tests use a
+/// fake one). The boot id is patched into a temporary copy of the kernel: the
+/// cargo artifact itself stays untouched (so cargo's fingerprints and the next
+/// run see the same file).
+fn build_image_with(kernel: &Path, out: &Path, create: &dyn Fn(&Path, &Path) -> Result<(), String>) -> Result<(), String> {
     let (tmp, id) = prepare_kernel_copy(kernel, out)?;
-    let built = bootloader::UefiBoot::new(&tmp)
-        .set_boot_config(&config)
-        .create_disk_image(out)
-        .map_err(|e| format!("cannot build {} from {}: {e:#}", out.display(), kernel.display()));
+    let built = create(&tmp, out).map_err(|e| format!("cannot build {} from {}: {e}", out.display(), kernel.display()));
     let _ = std::fs::remove_file(&tmp);
     built?;
     if let Some(id) = id {
-        let mut img = std::fs::read(out).map_err(|e| format!("cannot read {}: {e}", out.display()))?;
-        write_lba0_marker(&mut img, &id)?;
-        std::fs::write(out, &img).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+        let marked = std::fs::read(out)
+            .map_err(|e| format!("cannot read {}: {e}", out.display()))
+            .and_then(|mut img| write_lba0_marker(&mut img, &id).map(|()| img))
+            .and_then(|img| std::fs::write(out, &img).map_err(|e| format!("cannot write {}: {e}", out.display())));
+        if let Err(e) = marked {
+            // Never leave an image without its marker behind.
+            let _ = std::fs::remove_file(out);
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -79,7 +92,11 @@ fn prepare_kernel_copy(kernel: &Path, out: &Path) -> Result<(PathBuf, Option<Boo
 pub fn patch_kernel(kernel: &[u8]) -> Result<(Vec<u8>, Option<BootId>), String> {
     match bootmark::find_placeholder(kernel) {
         Err(MarkError::Missing) => Ok((kernel.to_vec(), None)),
-        Err(MarkError::Duplicate) => Err("the boot-id placeholder occurs more than once in the kernel".into()),
+        Err(MarkError::Duplicate) => Err(format!(
+            "the boot-id placeholder occurs more than once in the kernel (offsets {:?}); only the kernel's `BOOT_ID` static may \
+             carry l_core::bootmark::PLACEHOLDER: do not use the constant anywhere else, including test code of the kernel",
+            placeholder_offsets(kernel)
+        )),
         Ok(at) => {
             let id = bootmark::compute_id(kernel, at);
             let mut out = kernel.to_vec();
@@ -87,6 +104,12 @@ pub fn patch_kernel(kernel: &[u8]) -> Result<(Vec<u8>, Option<BootId>), String> 
             Ok((out, Some(id)))
         }
     }
+}
+
+/// All offsets at which the placeholder occurs (diagnostics only).
+fn placeholder_offsets(kernel: &[u8]) -> Vec<usize> {
+    let p = &bootmark::PLACEHOLDER;
+    (0..kernel.len().saturating_sub(31)).filter(|&i| kernel[i..i + 32] == *p).collect()
 }
 
 /// Write the stick marker to bytes 0..32 of LBA 0 (inside the protective MBR's
@@ -931,7 +954,6 @@ mod tests {
         assert!(e.contains(WINDOWS_QEMU_DIR), "{e}");
     }
 
-
     // ---- boot id marker ---------------------------------------------------
 
     fn kernel_with_placeholder() -> Vec<u8> {
@@ -969,7 +991,10 @@ mod tests {
     fn patch_with_two_placeholders_fails() {
         let mut k = kernel_with_placeholder();
         k.extend_from_slice(&l_core::bootmark::PLACEHOLDER);
-        assert!(patch_kernel(&k).is_err());
+        let e = patch_kernel(&k).unwrap_err();
+        let second = 12 + 32 + 10;
+        assert!(e.contains("BOOT_ID") && e.contains("PLACEHOLDER"), "{e}");
+        assert!(e.contains("12") && e.contains(&second.to_string()), "offsets missing: {e}");
     }
 
     #[test]
@@ -1051,8 +1076,73 @@ mod tests {
     #[test]
     fn test_mode_args_unchanged_for_other_tests() {
         let a = args_str(&qemu_args(Mode::Test, Path::new("/r/k-uefi.img"), &Firmware::Bios("/fw/OVMF.fd".into()), Path::new("/r")).unwrap());
-        assert!(!a.iter().any(|x| x.contains("xhci") || x.contains("usb") || x.contains("stick")), "{a:?}");
-        assert!(a.iter().any(|x| x == "isa-debug-exit,iobase=0xf4,iosize=0x04"));
+        let want = [
+            "-drive",
+            "if=none,id=disk0,format=raw,snapshot=on,file=/r/k-uefi.img",
+            "-device",
+            "ide-hd,drive=disk0,bootindex=0",
+            "-bios",
+            "/fw/OVMF.fd",
+            "-cpu",
+            "max",
+            "-vga",
+            "none",
+            "-device",
+            "VGA,xres=1024,yres=768",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-modern=on",
+            "-serial",
+            "stdio",
+            "-object",
+            "filter-dump,id=f0,netdev=n0,file=/r/target/net-trace.pcap",
+            "-device",
+            "isa-debug-exit,iobase=0xf4,iosize=0x04",
+            "-display",
+            "none",
+            "-no-reboot",
+        ];
+        assert_eq!(a, want);
+    }
+
+    #[test]
+    fn image_chain_lba0_embedded_and_computed_id_agree() {
+        use l_core::bootmark::{compute_id, find_placeholder, parse_embedded, parse_lba0};
+        let dir = std::env::temp_dir().join(format!("l_os_image_chain_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("kernel");
+        let k = kernel_with_placeholder();
+        std::fs::write(&src, &k).unwrap();
+        let out = dir.join("k-uefi.img");
+        // Fake disk image creator: a protective-MBR-like image (zero bootstrap,
+        // 55 AA) that contains the (patched) kernel file it was given.
+        let fake = |kernel: &Path, out: &Path| -> Result<(), String> {
+            let mut img = vec![0u8; 4096];
+            img[510] = 0x55;
+            img[511] = 0xAA;
+            img.extend(std::fs::read(kernel).map_err(|e| e.to_string())?);
+            std::fs::write(out, img).map_err(|e| e.to_string())
+        };
+        build_image_with(&src, &out, &fake).unwrap();
+        let img = std::fs::read(&out).unwrap();
+        let lba0 = parse_lba0(&img).expect("LBA0 marker");
+        // embedded id inside the image's copy of the kernel
+        let at = img.windows(8).position(|w| w == b"L_OSID01").expect("embedded marker");
+        let embedded_id = parse_embedded(img[at..at + 32].try_into().unwrap()).expect("embedded id");
+        let want = compute_id(&k, find_placeholder(&k).unwrap());
+        assert_eq!(lba0, want);
+        assert_eq!(embedded_id, want);
+        // the id recomputed from the patched kernel (as the kernel does) is the same
+        assert_eq!(compute_id(&img[4096..], at - 4096), want);
+        // source untouched, temp copy gone
+        assert_eq!(std::fs::read(&src).unwrap(), k);
+        assert!(!dir.join("k-uefi.img.kernel.tmp").exists());
+        // a creator whose image has a non-zero bootstrap: error and no image left
+        let bad = |_: &Path, out: &Path| std::fs::write(out, vec![1u8; 4096]).map_err(|e| e.to_string());
+        assert!(build_image_with(&src, &out, &bad).is_err());
+        assert!(!out.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // ---- root -----------------------------------------------------------
