@@ -13,6 +13,7 @@ mod font_data;
 pub mod frames;
 pub mod http;
 pub mod handles;
+pub mod hotkey;
 pub mod ipc;
 pub mod memrange;
 pub mod policy;
