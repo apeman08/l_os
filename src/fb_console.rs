@@ -46,8 +46,9 @@ use x86_64::instructions::interrupts;
 const REPLACEMENT: char = char::REPLACEMENT_CHARACTER;
 
 /// Where the framebuffer is. Only an address: whoever turns it into a slice
-/// must hold the [`CONSOLE`] lock (the panic path in [`emergency_print`] is
-/// the one documented exception).
+/// must hold the [`CONSOLE`] lock (the one documented exception is
+/// `paint_locked`, reached only via [`emergency_print_screen`] on the panic
+/// path while the lock is held).
 #[derive(Clone, Copy)]
 struct Screen {
     base: *mut u8,
@@ -386,6 +387,13 @@ pub fn clear_screen() {
 
 /// Print from a panic path, on the screen and on COM1 (always, whatever the
 /// `serial-console` feature says). Never blocks; see [`emergency_print_screen`].
+///
+/// Panic/test only: it force-unlocks the serial port (via
+/// `serial::emergency_print`, which disables interrupts; they are turned back
+/// on afterwards only if they were on), and its screen path may write the
+/// framebuffer behind a held console lock. Never call it inside
+/// `with_framebuffer` (that would alias the framebuffer slice).
+#[doc(hidden)]
 pub fn emergency_print(args: fmt::Arguments) {
     emergency_print_screen(args);
     let were_enabled = interrupts::are_enabled();
@@ -603,4 +611,3 @@ pub fn with_framebuffer<R>(f: impl FnOnce(&FbInfo, &[u8]) -> R) -> Option<R> {
 fn with_console<R>(f: impl FnOnce(&Console) -> R) -> Option<R> {
     interrupts::without_interrupts(|| CONSOLE.lock().as_ref().map(f))
 }
-
