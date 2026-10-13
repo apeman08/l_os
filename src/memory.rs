@@ -64,7 +64,8 @@ pub fn allocated_word(i: usize) -> u64 {
 pub fn mark_user_frame(frame: PhysFrame) {
     let n = frame.start_address().as_u64() / 4096;
     assert!(n < TRACKED_FRAMES, "user frame above the tracked range");
-    bit_set(&USER_FRAMES, n);
+    let fresh = bit_set(&USER_FRAMES, n);
+    debug_assert!(fresh, "user frame {:#x} marked twice", n * 4096);
     USER_FRAMES_MARKED.fetch_add(1, Ordering::Relaxed);
 }
 

@@ -111,8 +111,12 @@ pub enum ArmError {
     /// A kernel page (virtual address) that must be planned is not mapped.
     Unmapped(u64),
     /// A kernel, island or page-table page (physical) lies in a `Usable`
-    /// region: stage 8 would zero the code or data the wipe runs on.
+    /// region: stages 7/8 would zero the code, data or page tables the wipe
+    /// runs on.
     InUsable(u64),
+    /// A writable kernel page is also a page of a read-only/executable
+    /// segment: zeroing it in stage 9 would destroy code or `.rodata`.
+    WritableSharesPage(u64),
     /// A fixed list of the plan overflowed (name of the list).
     ListFull(&'static str),
 }
@@ -142,7 +146,10 @@ pub fn arm(facts: &BootFacts) -> Result<(), ArmError> {
     }
 }
 
-/// A copy of the armed plan, `None` if [`arm`] did not succeed.
+/// A copy of the armed plan, `None` if [`arm`] did not succeed. For tests
+/// and status only: the wipe (Task 10) must read the plan in place in the
+/// island (raw pointer to `ISLAND.plan`), never copy it onto the 16 KiB
+/// island stack (it is about 5.5 KiB).
 pub fn plan() -> Option<Plan> {
     if !PLAN_READY.load(Ordering::Acquire) {
         return None;
@@ -200,6 +207,96 @@ fn copy_from_phys(addr: u64, buf: &mut [u8]) {
     unsafe { core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len()) };
 }
 
+const PTE_PRESENT: u64 = 1;
+const PTE_HUGE: u64 = 1 << 7;
+const PTE_ADDR: u64 = 0x000f_ffff_ffff_f000;
+
+/// Result of walking the kernel's page tables for one virtual address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageWalk {
+    /// Physical frames of the tables visited, L4 first; `levels` are valid.
+    pub tables: [u64; 4],
+    pub levels: usize,
+    /// Physical address `virt` translates to.
+    pub phys: u64,
+    /// Size of the leaf mapping (4 KiB, 2 MiB or 1 GiB).
+    pub leaf_size: u64,
+}
+
+/// Walk the kernel's own page tables (`memory::kernel_l4`) for `virt`;
+/// `None` if not mapped or not canonical.
+pub fn page_walk(virt: u64) -> Option<PageWalk> {
+    VirtAddr::try_new(virt).ok()?;
+    let off = memory::phys_offset().as_u64();
+    let mut table = memory::kernel_l4().start_address().as_u64();
+    let mut w = PageWalk { tables: [0; 4], levels: 0, phys: 0, leaf_size: 0 };
+    for level in (1..=4u32).rev() {
+        w.tables[w.levels] = table;
+        w.levels += 1;
+        let shift = 12 + 9 * (level - 1);
+        let idx = (virt >> shift) & 0x1ff;
+        let ptr = (off + table + idx * 8) as *const u64;
+        // SAFETY: `table` is the kernel L4 or a frame a present non-leaf entry
+        // points to, i.e. a page-table frame; all physical memory is mapped
+        // at `off` (BOOTLOADER_CONFIG), and idx < 512 keeps the read inside
+        // the 4 KiB table. Read by value; only boot code edits these tables.
+        let e = unsafe { ptr.read_volatile() };
+        if e & PTE_PRESENT == 0 {
+            return None;
+        }
+        if level == 1 || (level <= 3 && e & PTE_HUGE != 0) {
+            let size = 1u64 << shift;
+            w.leaf_size = size;
+            w.phys = (e & PTE_ADDR & !(size - 1)) + (virt & (size - 1));
+            return Some(w);
+        }
+        table = e & PTE_ADDR;
+    }
+    None
+}
+
+/// Translate `virt` and require that neither its page-table frames (all
+/// levels) nor its leaf frame lie in `usable`. Returns `(phys, leaf_size)`.
+pub fn check_walk(virt: u64, usable: &RangeList<64>) -> Result<(u64, u64), ArmError> {
+    let w = page_walk(virt).ok_or(ArmError::Unmapped(virt))?;
+    for &t in &w.tables[..w.levels] {
+        if usable.contains(t) {
+            return Err(ArmError::InUsable(t));
+        }
+    }
+    let leaf = w.phys & !(w.leaf_size - 1);
+    if usable.contains(leaf) || usable.contains(w.phys) {
+        return Err(ArmError::InUsable(w.phys));
+    }
+    Ok((w.phys, w.leaf_size))
+}
+
+/// Every translation of the physical-offset window that the wipe uses for
+/// the physical range `r` must go through non-`Usable` tables (the leaf of
+/// course is `r` itself, which may be `Usable`).
+fn check_offset_window(r: PhysRange, usable: &RangeList<64>) -> Result<(), ArmError> {
+    if r.is_empty() {
+        return Ok(());
+    }
+    let off = memory::phys_offset().as_u64();
+    let mut a = page_floor(r.start);
+    while a < r.end {
+        let virt = off.checked_add(a).ok_or(ArmError::AddressOverflow)?;
+        let w = page_walk(virt).ok_or(ArmError::Unmapped(virt))?;
+        for &t in &w.tables[..w.levels] {
+            if usable.contains(t) {
+                return Err(ArmError::InUsable(t));
+            }
+        }
+        // Next leaf boundary.
+        a = match (a | (w.leaf_size - 1)).checked_add(1) {
+            Some(n) => n,
+            None => return Ok(()),
+        };
+    }
+    Ok(())
+}
+
 fn page_floor(a: u64) -> u64 {
     a & !(PAGE - 1)
 }
@@ -222,7 +319,6 @@ fn for_each_page(start: u64, end: u64, mut f: impl FnMut(u64) -> Result<(), ArmE
 
 fn build_plan(facts: &BootFacts) -> Result<Plan, ArmError> {
     use bootloader_api::info::MemoryRegionKind;
-    use x86_64::structures::paging::Translate;
 
     let mut plan = Plan::EMPTY;
 
@@ -248,12 +344,14 @@ fn build_plan(facts: &BootFacts) -> Result<Plan, ArmError> {
     };
     let in_relro = |page: u64| relro_pages.is_some_and(|(s, e)| s <= page && page < e);
 
+    // Held so that no one edits the kernel tables while they are walked.
     let guard = memory::MEMORY.lock();
-    let mem = guard.as_ref().ok_or(ArmError::NoMemory)?;
-    let translate = |virt: u64| -> Result<u64, ArmError> {
-        let v = VirtAddr::try_new(virt).map_err(|_| ArmError::Unmapped(virt))?;
-        mem.mapper.translate_addr(v).map(|p| p.as_u64()).ok_or(ArmError::Unmapped(virt))
-    };
+    if guard.is_none() {
+        return Err(ArmError::NoMemory);
+    }
+    // Every page the wipe runs on or reads: leaf AND all table frames must
+    // stay intact through stages 7/8, i.e. must not be `Usable`.
+    let translate = |virt: u64| check_walk(virt, &usable).map(|(p, _)| page_floor(p));
 
     // Island: its physical pages, never `Usable`.
     let (island, island_len) = island_virt();
@@ -276,6 +374,18 @@ fn build_plan(facts: &BootFacts) -> Result<Plan, ArmError> {
         let start = reloc(seg.vaddr)?;
         let end = start.checked_add(seg.mem_size).ok_or(ArmError::AddressOverflow)?;
         if seg.writable {
+            // A writable page must not also be a page of a non-writable
+            // segment (stage 9 would zero code or .rodata).
+            for other in info.segments().filter(|o| !o.writable) {
+                let os = reloc(other.vaddr)?;
+                let oe = os.checked_add(other.mem_size).ok_or(ArmError::AddressOverflow)?;
+                let (op0, op1) = (page_floor(os), page_floor(oe - 1));
+                for page in [page_floor(start), page_floor(end - 1)] {
+                    if op0 <= page && page <= op1 {
+                        return Err(ArmError::WritableSharesPage(page));
+                    }
+                }
+            }
             // A RELRO page must not also hold writable data outside RELRO.
             // The non-RELRO parts lie on either side of RELRO, so checking
             // their first and last page suffices.
@@ -314,6 +424,11 @@ fn build_plan(facts: &BootFacts) -> Result<Plan, ArmError> {
     plan.kernel_l4 = memory::kernel_l4().start_address().as_u64();
     not_usable(plan.kernel_l4)?;
     plan.phys_offset = memory::phys_offset().as_u64();
+    // The offset window through which stages 5-9 zero frames: its tables
+    // must survive the zeroing of every range the wipe touches.
+    for r in usable.iter().chain(plan.kernel_rw.iter()).chain(plan.island_phys.iter()) {
+        check_offset_window(r, &usable)?;
+    }
     drop(guard);
 
     plan.keys = secrets::slot_ranges().map(|(v, n)| (v.as_u64(), n));

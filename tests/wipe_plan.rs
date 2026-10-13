@@ -143,8 +143,8 @@ fn user_frames_marked_and_cleared() {
     let budget = l_os::time::ticks_from_ms(5500);
     let outcome = usermode::run(usermode::prog_stack_11(), handles, budget).expect("run");
     serial_println!("  outcome {:?}, user frames marked {}", outcome, memory::user_frames_marked() - before);
-    // Code page plus stack pages were mapped for the process ...
-    assert!(memory::user_frames_marked() - before >= 2);
+    // Exactly the code page plus the stack pages were mapped for the process ...
+    assert_eq!(memory::user_frames_marked() - before, 1 + usermode::USER_STACK_PAGES);
     // ... and all of them were cleared when its address space was destroyed.
     assert_eq!(user_bits_set(), 0);
     assert!(!memory::is_user_frame(0));
@@ -166,4 +166,67 @@ fn amnesia_plan_ready_after_arm() {
     let (fb, fb_len) = plan.fb;
     assert!(fb != 0 && fb_len > 0, "framebuffer base/len in the plan");
     assert_eq!(plan.fb, l_os::framebuffer::raw_region());
+}
+
+fn assert_tables_not_usable(what: &str, virt: u64) -> wipe::PageWalk {
+    let w = wipe::page_walk(virt).unwrap_or_else(|| panic!("{} {:#x} unmapped", what, virt));
+    assert!(w.levels >= 2, "{} walk too short", what);
+    for &t in &w.tables[..w.levels] {
+        assert!(!in_usable(t), "{} {:#x}: table frame {:#x} is Usable", what, virt, t);
+    }
+    assert_eq!(w.phys, phys(virt), "walk agrees with the mapper");
+    w
+}
+
+#[test_case]
+fn page_tables_of_wipe_path_not_in_usable() {
+    let plan = wipe::plan().expect("plan");
+    let facts = l_os::boot_facts().expect("boot facts");
+    let (island, len) = wipe::island_virt();
+    for v in (island..island + len as u64).step_by(PAGE as usize) {
+        assert_tables_not_usable("island", v);
+    }
+    let info = wipe::kernel_load_info(&facts).expect("kernel ELF");
+    let mut pages_checked = 0;
+    for seg in info.segments() {
+        let s = facts.kernel_image_offset + seg.vaddr;
+        for v in ((s & !(PAGE - 1))..s + seg.mem_size).step_by(PAGE as usize) {
+            assert_tables_not_usable("kernel segment", v);
+            pages_checked += 1;
+        }
+    }
+    for v in (facts.kernel_stack_bottom..facts.kernel_stack_bottom + facts.kernel_stack_len).step_by(PAGE as usize) {
+        assert_tables_not_usable("boot stack", v);
+    }
+    // The offset window over every range the wipe zeroes.
+    let mut windows = 0;
+    for r in plan.usable.iter().chain(plan.kernel_rw.iter()).chain(plan.island_phys.iter()) {
+        let mut a = r.start & !(PAGE - 1);
+        while a < r.end {
+            let w = assert_tables_not_usable("offset window", plan.phys_offset + a);
+            a = (a | (w.leaf_size - 1)) + 1;
+            windows += 1;
+        }
+    }
+    serial_println!("  {} kernel pages, {} offset-window leaves checked", pages_checked, windows);
+}
+
+#[test_case]
+fn check_walk_rejects_a_usable_table_frame() {
+    // Positive control for arm's check: pretend one real table frame of the
+    // island's translation (each level in turn) were Usable.
+    let (island, _) = wipe::island_virt();
+    let w = wipe::page_walk(island).expect("island mapped");
+    let none = l_core::memrange::RangeList::<64>::new();
+    assert!(wipe::check_walk(island, &none).is_ok());
+    for &t in &w.tables[..w.levels] {
+        let mut fake = l_core::memrange::RangeList::<64>::new();
+        fake.push(l_core::memrange::PhysRange { start: t, end: t + PAGE }).unwrap();
+        assert_eq!(wipe::check_walk(island, &fake), Err(wipe::ArmError::InUsable(t)));
+    }
+    // And the leaf itself.
+    let mut fake = l_core::memrange::RangeList::<64>::new();
+    let leaf = w.phys & !(PAGE - 1);
+    fake.push(l_core::memrange::PhysRange { start: leaf, end: leaf + PAGE }).unwrap();
+    assert!(matches!(wipe::check_walk(island, &fake), Err(wipe::ArmError::InUsable(_))));
 }
