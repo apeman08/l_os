@@ -117,12 +117,17 @@ impl<const N: usize> Default for RangeList<N> {
 }
 
 /// 4-KiB page addresses -> maximal runs (any order, duplicates allowed).
+/// Precondition: every address is 4-KiB aligned (debug-asserted). Returns
+/// `Err(Full)` if the list overflows or a page's end would overflow u64.
 pub fn coalesce_pages<const N: usize>(pages: impl Iterator<Item = u64>) -> Result<RangeList<N>, Full> {
     let mut l = RangeList::<N>::new();
     for p in pages {
-        if let Some(end) = p.checked_add(PAGE) {
-            l.push(PhysRange { start: p, end })?;
-        }
+        debug_assert!(p % PAGE == 0, "coalesce_pages: unaligned page address");
+        // A page whose end overflows u64 must not be dropped silently (it would
+        // stay unwiped); report it as an error. `Full` keeps the brief's
+        // signature: the list cannot represent this page.
+        let end = p.checked_add(PAGE).ok_or(Full)?;
+        l.push(PhysRange { start: p, end })?;
     }
     Ok(l)
 }
@@ -141,6 +146,8 @@ pub fn for_each_set_bit(words: usize, word: impl Fn(usize) -> u64, mut f: impl F
 /// Reports maximal runs of unallocated frames inside `region` (page-granular:
 /// start rounded up, end rounded down). Frame number = physical address / 4096.
 /// Frames at or above `tracked_frames` always count as unallocated.
+/// Unaligned region edges are rounded inward (partial pages are NOT reported);
+/// callers must handle any partial head/tail pages themselves.
 pub fn unallocated_runs(
     region: PhysRange,
     tracked_frames: u64,
@@ -281,7 +288,39 @@ mod tests {
         let many = [0u64, 0x2000, 0x4000];
         assert_eq!(coalesce_pages::<2>(many.into_iter()).err(), Some(Full));
         let end = [u64::MAX & !0xfff];
-        assert!(coalesce_pages::<2>(end.into_iter()).is_ok()); // overflow-safe
+        // last page of the address space: end overflows -> loud error, not a drop
+        assert_eq!(coalesce_pages::<2>(end.into_iter()).err(), Some(Full));
+        let ok = [(u64::MAX & !0xfff) - PAGE];
+        assert!(coalesce_pages::<2>(ok.into_iter()).is_ok());
+    }
+
+    #[test]
+    fn near_u64_max_edges() {
+        let top = u64::MAX;
+        let mut l = RangeList::<2>::new();
+        l.push(r(top - 10, top)).unwrap();
+        l.push(r(top - 20, top - 10)).unwrap();
+        assert_eq!(v(&l), [(top - 20, top)]);
+        assert_eq!(l.total_bytes(), 20);
+        assert!(l.contains(top - 1) && !l.contains(top));
+        let d = l.subtract(&[r(top - 5, top)]).unwrap();
+        assert_eq!(v(&d), [(top - 20, top - 5)]);
+        assert!(l.subtract(&[r(0, top)]).unwrap().is_empty());
+        let mut got = Vec::new();
+        let hi = (top / PAGE) * PAGE;
+        unallocated_runs(r(hi - 2 * PAGE, top), u64::MAX, |_| false, |x| got.push((x.start, x.end)));
+        assert_eq!(got, [(hi - 2 * PAGE, hi)]);
+    }
+
+    #[test]
+    fn subtract_exactly_n_pieces_ok_n_plus_one_err() {
+        let mut l = RangeList::<3>::new();
+        l.push(r(0, 100)).unwrap();
+        // two holes -> 3 pieces == N
+        let d = l.subtract(&[r(10, 20), r(50, 60)]).unwrap();
+        assert_eq!(v(&d), [(0, 10), (20, 50), (60, 100)]);
+        // three holes -> 4 pieces > N
+        assert_eq!(l.subtract(&[r(10, 20), r(30, 40), r(50, 60)]).err(), Some(Full));
     }
 
     #[test]
