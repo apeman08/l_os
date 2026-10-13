@@ -33,9 +33,9 @@ Ordered by prerequisite dependency. Each item lists its acceptance check.
 ## Next
 Milestone order from the spec (section 3); each milestone gets its own spec and plan first (brainstorming, spec, writing-plans). M1 and M2 are independent; M3 needs the existing network/TLS base (Phases 3-4); M4 needs M1 and M3; M5 needs M2 and M4.
 1. **M2 Amnesic live system**: xHCI driver (mass storage at boot, keyboard), whole image in RAM, wipe on unplug and by hotkey (order in spec section 5). Acceptance: QEMU `device_del` triggers the wipe; a memory dump shows user and key memory zero afterwards; the measured wipe duration is documented (replaces the **[assumed]** "a few seconds").
-2. **M3 Tor**: first a spike with an abort criterion (Arti bootstrap against a local test Tor network, e.g. chutney, from ring 3 with own runtime, sockets and time adapter); if it fails, a minimal client is evaluated in its own spec. Acceptance: packet capture shows only traffic to guards/bridges; a process without the Tor endpoint cannot open a socket; time deviation against the consensus blocks connection setup.
+2. **M3 Tor**: first a spike with an abort criterion (Arti bootstrap against a local test Tor network, from ring 3; proposed details: chutney as test network, own runtime, sockets and time adapter); if it fails, a minimal client is evaluated in its own spec. Acceptance: packet capture shows only traffic to guards/bridges; a process without the Tor endpoint cannot open a socket; time deviation against the consensus blocks connection setup.
 3. **M4 Terminal browser**: HTML to text in reader layout, link hints, process per tab, no JavaScript. Acceptance: host tests with broken and hostile HTML; open page, follow link, go back, end to end over Tor; command palette (`Strg+K`) and address bar (`Strg+L`).
-4. **M5 Real hardware**: UEFI path, target device list, real NIC (e1000e/RTL8168), xHCI quirks. Acceptance: boot and browse on at least one real device; wipe on unplug measurable.
+4. **M5 Real hardware**: UEFI boot, real NIC, xHCI on real chipsets (proposed details: target device list, e1000e/RTL8168). Acceptance: boot and browse on at least one real device.
 5. **M6 Hardening**: verified boot, WLAN, external audit; spec only after M5.
 
 Older items, still valid and not superseded:

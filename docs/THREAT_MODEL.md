@@ -40,10 +40,10 @@ Network and TLS specifics: a connection needs a `NetClient` handle and an exact 
 
 ## Limits (not defended; from the Zukunftsplan spec section 4)
 These are stated as limits of the design, not as tested behaviour; none of them has a test.
-- **Manipulated firmware** (UEFI/BIOS, SMM) is not covered. Secure Boot / verified boot is not implemented (planned M6).
+- **Manipulated firmware** (UEFI/BIOS, SMM) is not covered (see Out of scope above). Secure Boot / verified boot is not implemented (planned M6).
 - **Hardware keyloggers** and other hardware between keyboard and machine are not covered.
 - **DMA attacks**: there is no IOMMU, so devices (NIC, USB, anything on the bus) are trusted; the same holds for the NIC once a real one is supported.
-- **Cold boot**: RAM contents are readable after power-off for a short time. Today nothing is wiped (no amnesic mode exists yet); the planned wipe (M2) only mitigates this, and its duration is **[assumed]** until M2 measures it.
+- **Cold boot**: RAM contents are readable after power-off for a short time. No wipe on unplug or shutdown exists yet (no amnesic mode; only the per-frame zeroing on alloc/free described in ARCHITECTURE); the planned wipe (M2) only mitigates this, and its duration is **[assumed]** until M2 measures it.
 - **Tor** (planned M3, not present today; the system has no Tor code): Tor is not a guarantee against fingerprinting or global observers, and the design does not claim otherwise.
 - The status bar currently shows "amnesisch: nein" (`src/aurora.rs`, `tests/aurora.rs`): that is the true state; no amnesic mode exists until M2.
 Already covered above: console output is mirrored to COM1 by default (feature `serial-console`) and OVMF/firmware may emit frames before the kernel runs.
