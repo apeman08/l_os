@@ -16,3 +16,5 @@ scripts/net_tests.sh                         # network + TLS tests in QEMU again
 python3 -I scripts/qemu_shell_smoke.py       # drives the real kernel's shell, checks serial text and screen pixels (after scripts/build_image.sh)
 ```
 Try `net status`, `run hello`, `run hello_rs`, `run evil`, `run spin` in the shell. Keyboard layout is German (`De105Key`).
+
+Screenshot of the shell with the Aurora status and hint bars (a QEMU screendump of the real kernel screen, saved by `python3 -I scripts/qemu_shell_smoke.py --screenshot docs/screenshots/aurora-shell.png`): [docs/screenshots/aurora-shell.png](docs/screenshots/aurora-shell.png)
