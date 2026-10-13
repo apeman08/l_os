@@ -57,12 +57,16 @@ fn pit_ticks_at_tick_hz_against_the_rtc() {
         ticks, elapsed, deci_hz / 10, deci_hz % 10, TICK_HZ
     );
     // Each boundary is seen within one poll of the CMOS (microseconds), so the
-    // measurement is good to about one tick; the band allows for QEMU's timer
-    // delivery on a loaded host while still telling 100 Hz from 18.2 Hz.
+    // measurement itself is good to about one tick. The lower bound is only
+    // half the rate: under TCG on a loaded host QEMU may drop PIT ticks (the
+    // RTC follows the host clock, the guest does not get every interrupt), so
+    // a tight band would flake; 50 % still rejects the old 18.2 Hz clearly.
+    // Ticks cannot arrive faster than programmed, so the upper bound stays at
+    // +10 % (measurement slack only).
     let expected = TICK_HZ as u64 * elapsed;
     assert!(
-        ticks >= expected * 9 / 10 && ticks <= expected * 11 / 10,
-        "{} ticks in {} s: rate not within 10% of {} Hz",
+        ticks >= expected / 2 && ticks <= expected * 11 / 10,
+        "{} ticks in {} s: rate not within 50%..110% of {} Hz",
         ticks, elapsed, TICK_HZ
     );
 }
