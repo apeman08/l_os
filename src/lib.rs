@@ -39,10 +39,12 @@ pub fn init() {
     interrupts::idt_init();
     gdt::init();
     // SAFETY: remaps the PICs to the vectors the IDT (loaded above) handles,
-    // then unmasks only lines with a handler. UEFI firmware leaves every PIC
-    // line masked (the BIOS used to leave timer and keyboard on), so the lines
-    // the kernel relies on are enabled explicitly: IRQ0 timer, IRQ1 keyboard,
-    // IRQ2 cascade. Everything else stays masked, as it effectively was.
+    // then unmasks only IRQ0 (timer), IRQ1 (keyboard) and IRQ2 (cascade).
+    // UEFI firmware leaves every PIC line masked (the BIOS used to leave timer
+    // and keyboard on), so these are enabled explicitly. IRQ 9/10/11 do have
+    // handlers (`nic_interrupt`) but stay masked, so those handlers are
+    // dormant: networking still works because every timer tick calls
+    // `sched::wake_net`, which lets waiting processes poll the NIC.
     unsafe {
         let mut pics = interrupts::PICS.lock();
         pics.initialize();
@@ -103,9 +105,19 @@ pub fn init_memory(boot_info: &'static mut bootloader_api::BootInfo) {
     unsafe { memory::remove_boot_identity_map(mem, &boot_info.memory_regions) };
     allocator::init_heap(mem).expect("kernel heap initialization failed");
     drop(guard);
-    let fb_info = framebuffer::info().as_ref().and_then(framebuffer::render_info);
-    if let (Some(info), Some(memory)) = (fb_info, fb_memory) {
-        fb_console::init(info, memory);
+    let raw_info = framebuffer::info();
+    let fb_info = raw_info.as_ref().and_then(framebuffer::render_info);
+    match (fb_info, fb_memory) {
+        (Some(info), Some(memory)) => fb_console::init(info, memory),
+        // Not silent: without a console the screen stays dark. Serial always
+        // works (independent of the `serial-console` feature).
+        _ => match raw_info {
+            Some(raw) => serial_println!(
+                "no usable framebuffer (format {:?}); no screen console",
+                raw.pixel_format
+            ),
+            None => serial_println!("no usable framebuffer (format: none, no GOP framebuffer); no screen console"),
+        },
     }
 }
 
