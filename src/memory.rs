@@ -171,6 +171,78 @@ pub unsafe fn init(physical_memory_offset: VirtAddr, memory_map: &'static [Memor
     *MEMORY.lock() = Some(Memory { mapper, frames });
 }
 
+/// Remove what the bootloader left identity-mapped in the kernel's tables.
+///
+/// bootloader 0.11 identity-maps (virt == phys) the two pages of its
+/// `context_switch` code and its GDT page, with flags PRESENT only, i.e.
+/// supervisor-executable. The code pages lie in UEFI LOADER_CODE memory, which
+/// the memory map reports as `Usable`; left in place, a frame handed to a
+/// process would stay executable in ring 0 at a predictable address in every
+/// address space ([`create_address_space`] copies all kernel L4 slots). The
+/// bootloader reserves the L4 slots covering physical addresses
+/// `[0, highest region end)` for exactly this identity map, so every such slot
+/// is checked to hold nothing but identity mappings and then cleared. Their
+/// table frames are bootloader memory (not `Usable`) and are simply left
+/// unused. Must run before the first address space is created.
+///
+/// # Safety
+/// The kernel's own GDT and IDT must already be loaded ([`crate::init`]), and
+/// nothing may still use an identity-mapped address.
+pub unsafe fn remove_boot_identity_map(mem: &mut Memory, memory_map: &[MemoryRegion]) {
+    use x86_64::instructions::tables::{sgdt, sidt};
+    use x86_64::structures::paging::PageTableFlags as F;
+
+    let max_phys = memory_map.iter().map(|r| r.end).max().unwrap_or(0);
+    let last_slot = (max_phys.saturating_sub(1) >> 39) as usize & 0x1ff;
+    for (name, base) in [("GDT", sgdt().base), ("IDT", sidt().base)] {
+        assert!(
+            usize::from(base.p4_index()) > last_slot || base.as_u64() >= 1 << 47,
+            "{} still in the bootloader's identity map ({:#x}); call crate::init first",
+            name,
+            base.as_u64()
+        );
+    }
+
+    /// Every present leaf below `table` (level `level`, mapping virtual
+    /// `base`) must map virt == phys.
+    fn only_identity(table: &PageTable, level: u8, base: u64) -> bool {
+        let shift = 12 + 9 * (level as u64 - 1);
+        table.iter().enumerate().filter(|(_, e)| e.flags().contains(F::PRESENT)).all(|(i, e)| {
+            let virt = base | ((i as u64) << shift);
+            if level == 1 || e.flags().contains(F::HUGE_PAGE) {
+                e.addr().as_u64() == virt
+            } else {
+                // SAFETY: a present non-leaf entry points at a page table,
+                // which is RAM mapped at the physical-memory offset.
+                let next = unsafe { &*table_ptr(PhysFrame::containing_address(e.addr())) };
+                only_identity(next, level - 1, virt)
+            }
+        })
+    }
+
+    let l4 = mem.mapper.level_4_table_mut();
+    for slot in 0..=last_slot {
+        assert!(
+            slot != USER_L4_INDEX && slot < 256,
+            "bootloader identity map would reach L4 slot {}",
+            slot
+        );
+        if l4[slot].is_unused() {
+            continue;
+        }
+        // SAFETY: as above, the slot's L3 table is RAM at the offset.
+        let l3 = unsafe { &*table_ptr(PhysFrame::containing_address(l4[slot].addr())) };
+        assert!(
+            only_identity(l3, 3, (slot as u64) << 39),
+            "L4 slot {} holds more than the bootloader's identity map",
+            slot
+        );
+        l4[slot].set_unused();
+    }
+    // The removed entries were not GLOBAL, so reloading CR3 drops them all.
+    x86_64::instructions::tlb::flush_all();
+}
+
 pub fn frames_allocated() -> u64 {
     FRAMES_ALLOCATED.load(Ordering::Relaxed)
 }

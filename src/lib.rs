@@ -96,6 +96,11 @@ pub fn init_memory(boot_info: &'static mut bootloader_api::BootInfo) {
     }
     let mut guard = memory::MEMORY.lock();
     let mem = guard.as_mut().expect("memory initialized above");
+    // SAFETY: `init` (called first by every entry point) loaded the kernel's
+    // own GDT and IDT, and the bootloader's context-switch code is never run
+    // again; the function asserts the GDT/IDT part. No address space exists
+    // yet, so no copy of the removed slots survives.
+    unsafe { memory::remove_boot_identity_map(mem, &boot_info.memory_regions) };
     allocator::init_heap(mem).expect("kernel heap initialization failed");
     drop(guard);
     let fb_info = framebuffer::info().as_ref().and_then(framebuffer::render_info);
