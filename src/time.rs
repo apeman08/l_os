@@ -12,9 +12,11 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 /// PIT ticks the calibration measures over (spec §8.6).
 pub const TSC_CALIBRATION_TICKS: u64 = 5;
-/// Upper bound on `hlt`s while waiting for one tick (a dead PIT must not hang
-/// the boot): the PIT fires every 10 ms, other interrupts are rare at boot.
-const TICK_WAIT_LIMIT: u32 = 10_000;
+/// Upper bound on the TSC cycles spent waiting for one tick (a dead PIT must
+/// not hang the boot). The PIT fires every 10 ms; the TSC frequency is not
+/// known yet, so the bound is generous: 2e9 cycles is 0.5 s at 4 GHz and 1 s at
+/// 2 GHz, 50 to 100 tick periods.
+const TICK_WAIT_CYCLES: u64 = 2_000_000_000;
 
 /// Program PIT channel 0 as a rate generator firing IRQ0 `TICK_HZ` times per
 /// second. Call once during boot, before interrupts are enabled.
@@ -52,16 +54,26 @@ pub fn rdtsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
-/// Wait until the tick counter differs from `from`; `false` if the PIT never
-/// ticked within [`TICK_WAIT_LIMIT`] halts.
-fn wait_tick_after(from: u64) -> bool {
-    for _ in 0..TICK_WAIT_LIMIT {
-        if ticks() != from {
+/// Spin (`pause`) until `done()` or until `max_cycles` TSC cycles passed;
+/// `false` on timeout. Spins instead of `hlt`: with a dead timer `hlt` would
+/// never return, so it could not be bounded.
+fn spin_until(max_cycles: u64, mut done: impl FnMut() -> bool) -> bool {
+    let start = rdtsc();
+    loop {
+        if done() {
             return true;
         }
-        x86_64::instructions::hlt();
+        if rdtsc().wrapping_sub(start) >= max_cycles {
+            return done();
+        }
+        core::hint::spin_loop();
     }
-    ticks() != from
+}
+
+/// Wait until the tick counter differs from `from`; `false` if the PIT never
+/// ticked within [`TICK_WAIT_CYCLES`].
+fn wait_tick_after(from: u64) -> bool {
+    spin_until(TICK_WAIT_CYCLES, || ticks() != from)
 }
 
 /// Measure the TSC frequency against [`TSC_CALIBRATION_TICKS`] PIT ticks
@@ -96,4 +108,18 @@ pub fn calibrate_tsc() -> u64 {
 /// wipe report then shows 0 µs for every stage).
 pub fn tsc_hz() -> u64 {
     TSC_HZ.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A condition that never comes true (a dead PIT) times out instead of hanging.
+    #[test_case]
+    fn spin_until_times_out_on_dead_condition() {
+        let t0 = rdtsc();
+        assert!(!spin_until(1_000_000, || false));
+        assert!(rdtsc().wrapping_sub(t0) >= 1_000_000);
+        assert!(spin_until(1_000_000, || true));
+    }
 }

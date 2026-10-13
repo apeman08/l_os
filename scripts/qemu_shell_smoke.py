@@ -368,4 +368,5 @@ def main():
         print("FAIL, missing:", missing); sys.exit(1)
     print("OK")
 
-main()
+if __name__ == "__main__":
+    main()
