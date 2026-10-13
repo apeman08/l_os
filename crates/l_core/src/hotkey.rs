@@ -17,13 +17,17 @@ const E1_SHIFT: u8 = 5;
 const E1_MASK: u8 = 0b11 << E1_SHIFT;
 
 impl HotkeyDetector {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { bits: 0 }
     }
 
     /// Feed one raw set-1 scancode byte. Returns `true` on a Backspace make
     /// code while a Ctrl and an Alt (left or right) are held. Auto-repeat
     /// fires again; the detector is never one-shot.
+    ///
+    /// A lost break code (e.g. a scancode dropped by a full queue upstream)
+    /// leaves its modifier recorded as held until the next break of that key.
+    #[must_use]
     pub fn feed(&mut self, scancode: u8) -> bool {
         let skip = (self.bits & E1_MASK) >> E1_SHIFT;
         if skip > 0 {
@@ -66,11 +70,11 @@ impl HotkeyDetector {
             && self.bits & (ALT_L | ALT_R) != 0
     }
 
-    pub fn to_bits(&self) -> u8 {
+    pub const fn to_bits(&self) -> u8 {
         self.bits
     }
 
-    pub fn from_bits(bits: u8) -> Self {
+    pub const fn from_bits(bits: u8) -> Self {
         // Mask off the unused top bit; E1 count 3 is invalid, clamp to 2.
         let mut bits = bits & 0x7F;
         if (bits & E1_MASK) >> E1_SHIFT == 3 {
@@ -122,10 +126,10 @@ mod tests {
     #[test]
     fn ctrl_backspace_without_alt_does_not_fire() {
         let mut d = HotkeyDetector::new();
-        d.feed(0x1D);
+        let _ = d.feed(0x1D);
         assert!(!d.feed(0x0E));
         let mut d = HotkeyDetector::new();
-        d.feed(0x38);
+        let _ = d.feed(0x38);
         assert!(!d.feed(0x0E));
     }
 
@@ -187,7 +191,7 @@ mod tests {
     #[test]
     fn pause_sequence_does_not_fire() {
         let mut d = HotkeyDetector::new();
-        d.feed(0x38); // Alt held
+        let _ = d.feed(0x38); // Alt held
         assert!(!feed_all(&mut d, &[0xE1, 0x1D, 0x45, 0xE1, 0x9D, 0xC5]));
         // Pause's 1D must not have registered as Ctrl
         assert!(!d.feed(0x0E));
@@ -201,7 +205,7 @@ mod tests {
         assert!(d.feed(0x0E));
         assert!(d.feed(0x0E));
         // modifier auto-repeat is harmless too
-        d.feed(0x1D);
+        let _ = d.feed(0x1D);
         assert!(d.feed(0x0E));
     }
 
@@ -230,8 +234,8 @@ mod tests {
         assert!(r.feed(0x0E));
         // mid-sequence state (pending E0 / E1) survives too
         let mut d = HotkeyDetector::new();
-        d.feed(0x38);
-        d.feed(0xE1);
+        let _ = d.feed(0x38);
+        let _ = d.feed(0xE1);
         let mut r = HotkeyDetector::from_bits(d.to_bits());
         assert!(!feed_all(&mut r, &[0x1D, 0x45]));
         assert!(!r.feed(0x0E));

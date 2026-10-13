@@ -175,6 +175,31 @@ pub fn unallocated_runs(
     }
 }
 
+/// Splits `r` into `(head, inner, tail)`: `inner` is the page-aligned part
+/// (whole pages), `head` and `tail` are the partial pages before and after it.
+/// Together they cover every byte of `r` exactly once, in order; any of them
+/// may be empty. When `r` contains no whole page (or rounding up would
+/// overflow), all of `r` is the head.
+pub fn split_partial_pages(r: PhysRange) -> (PhysRange, PhysRange, PhysRange) {
+    let down = r.end & !(PAGE - 1);
+    let up = match r.start.checked_next_multiple_of(PAGE) {
+        Some(u) if u <= down && !r.is_empty() => u,
+        _ => {
+            let end = r.end.max(r.start);
+            return (
+                PhysRange { start: r.start, end },
+                PhysRange { start: down, end: down },
+                PhysRange { start: end, end },
+            );
+        }
+    };
+    (
+        PhysRange { start: r.start, end: up },
+        PhysRange { start: up, end: down },
+        PhysRange { start: down, end: r.end },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +376,45 @@ mod tests {
         let mut got2 = Vec::new();
         unallocated_runs(r(0, 6 * PAGE), 4, |f| { assert!(f < 4); f < 2 }, |x| got2.push((x.start, x.end)));
         assert_eq!(got2, [(2 * PAGE, 6 * PAGE)]);
+    }
+
+    #[test]
+    fn split_partial_pages_covers_every_byte_exactly_once() {
+        // Aligned: no edges.
+        assert_eq!(split_partial_pages(r(PAGE, 3 * PAGE)), (r(PAGE, PAGE), r(PAGE, 3 * PAGE), r(3 * PAGE, 3 * PAGE)));
+        // Unaligned both ends.
+        assert_eq!(
+            split_partial_pages(r(PAGE + 8, 3 * PAGE + 16)),
+            (r(PAGE + 8, 2 * PAGE), r(2 * PAGE, 3 * PAGE), r(3 * PAGE, 3 * PAGE + 16))
+        );
+        // Inside one page: all of it is the head, inner and tail empty.
+        let (h, i, t) = split_partial_pages(r(PAGE + 8, PAGE + 100));
+        assert_eq!(h, r(PAGE + 8, PAGE + 100));
+        assert!(i.is_empty() && t.is_empty());
+        // Spanning one page boundary without a whole page.
+        let (h, i, t) = split_partial_pages(r(PAGE + 8, 2 * PAGE + 8));
+        assert_eq!((h, t), (r(PAGE + 8, 2 * PAGE), r(2 * PAGE, 2 * PAGE + 8)));
+        assert!(i.is_empty());
+        // Empty and near u64::MAX do not panic.
+        let (h, i, t) = split_partial_pages(r(10, 10));
+        assert!(h.is_empty() && i.is_empty() && t.is_empty());
+        let top = u64::MAX - 5;
+        let (h, i, t) = split_partial_pages(r(top, u64::MAX));
+        assert_eq!(h.len() + i.len() + t.len(), 5);
+        // Exhaustive small check: the three pieces tile the range in order.
+        for s in (0..3 * PAGE).step_by(1000) {
+            for e in (s..4 * PAGE).step_by(777) {
+                let (h, i, t) = split_partial_pages(r(s, e));
+                assert_eq!(h.len() + i.len() + t.len(), e - s);
+                assert!(i.page_aligned());
+                assert_eq!(h.start, s);
+                if !i.is_empty() {
+                    assert_eq!((h.end, i.end), (i.start, t.start));
+                }
+                if !t.is_empty() {
+                    assert_eq!(t.end, e);
+                }
+            }
+        }
     }
 }
