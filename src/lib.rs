@@ -83,8 +83,9 @@ pub const SERIAL_MIRROR: bool = cfg!(feature = "serial-console");
 
 /// Take over what the bootloader handed over: the framebuffer, paging access,
 /// the frame allocator and the kernel heap; then start the framebuffer console
-/// (it needs the heap). Until then, console output goes only to the serial
-/// mirror (feature `serial-console`).
+/// (it needs the heap). Until then there is no screen console: output
+/// reaches only the serial mirror (feature `serial-console`, off by default),
+/// i.e. nowhere in a default build.
 pub fn init_memory(boot_info: &'static mut bootloader_api::BootInfo) {
     use x86_64::VirtAddr;
     let fb_memory = framebuffer::init(boot_info.framebuffer.take());

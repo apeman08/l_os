@@ -30,7 +30,7 @@ OVMF_CODE + OVMF_VARS, override; see tools/image/src/lib.rs), a stable Rust tool
 helper, and a Unix host (the QEMU monitor is a Unix socket).
 Characters are mapped to keys for the kernel's German layout.
 """
-import os, re, socket, subprocess, sys, tempfile, time
+import os, re, shutil, socket, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # The kernel uses the German layout (De105Key): the US y/z keys are swapped.
@@ -83,6 +83,10 @@ def default_build_has_no_serial_mirror():
             if os.path.exists(sock_path): break
             time.sleep(0.1)
         m = socket.socket(socket.AF_UNIX); m.connect(sock_path); m.settimeout(2)
+        def mon(c):
+            m.sendall((c + "\n").encode()); time.sleep(0.15)
+            try: m.recv(65536)
+            except OSError: pass
         # Keys sent before the kernel's keyboard driver is up are lost, and with
         # the mirror off there is no prompt to wait for: type the marker after
         # 5 s and once more after a further 8 s (a cold first boot is slower).
@@ -94,11 +98,26 @@ def default_build_has_no_serial_mirror():
                 except OSError: pass
                 time.sleep(0.05)
         time.sleep(2)
+        # Positive control: the marker was typed AND handled (the shell's output
+        # line `nomirror4711` is on the framebuffer), so its absence from COM1 is real.
+        dump = os.path.join(tmp, "nomirror.ppm")
+        take_dump(mon, dump)
         log = open(serial, "rb").read()
     finally:
         q.terminate(); q.wait()
-    if b"nomirror4711" in log:
-        print("FAIL: default_build_has_no_serial_mirror: typed text reached COM1 in a default build"); sys.exit(1)
+    try:
+        masks = glyph_masks(build_render_helper(tmp))
+        w, h, _ = parse_ppm(open(dump, "rb").read())
+        rows = [read_row(dump, r, masks).rstrip() for r in range(1, h // GLYPH_H - 1)]
+        if not any(r == "nomirror4711" for r in rows):
+            print("FAIL: default_build_has_no_serial_mirror: positive control failed, the shell's echo output "
+                  "is not on the screen (marker not typed/handled):", [r for r in rows if r]); sys.exit(1)
+        if b"nomirror4711" in log:
+            print("FAIL: default_build_has_no_serial_mirror: typed text reached COM1 in a default build"); sys.exit(1)
+        if b"PANIC" in log or b"panicked" in log:
+            print("FAIL: default_build_has_no_serial_mirror: panic text on COM1:", log[-400:]); sys.exit(1)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     print("check default_build_has_no_serial_mirror: OK")
 
 GLYPH_W, GLYPH_H = 8, 16
