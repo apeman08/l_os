@@ -15,6 +15,13 @@ scripts/host_tests.sh                        # host tests: l_core, l_tls (needs 
 scripts/net_tests.sh                         # network + TLS tests in QEMU against host test servers
 python3 -I scripts/qemu_shell_smoke.py       # drives the real kernel's shell, checks serial text and screen pixels (after scripts/build_image.sh)
 ```
+To boot the image from `scripts/build_image.sh` by hand (the same QEMU options `scripts/qemu_runner.sh` uses for `cargo run`; `scripts/ovmf_path.sh` honours `OVMF_FD`; add `-display none` for a headless run with only the serial console):
+```
+qemu-system-x86_64 -bios "$(scripts/ovmf_path.sh)" -cpu max \
+  -drive if=none,id=disk0,format=raw,snapshot=on,file=target/x86_64-l_os/debug/l_os-uefi.img \
+  -device ide-hd,drive=disk0,bootindex=0 -vga none -device VGA,xres=1024,yres=768 \
+  -netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-modern=on -serial stdio
+```
 Try `net status`, `run hello`, `run hello_rs`, `run evil`, `run spin` in the shell. Keyboard layout is German (`De105Key`).
 
 Screenshot of the shell with the Aurora status and hint bars (a QEMU screendump of the real kernel screen, saved by `python3 -I scripts/qemu_shell_smoke.py --screenshot docs/screenshots/aurora-shell.png`): [docs/screenshots/aurora-shell.png](docs/screenshots/aurora-shell.png). It is a real screendump, not a mock-up, and its content (e.g. uptime) changes whenever it is regenerated.

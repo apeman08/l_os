@@ -3,6 +3,7 @@ name = "l_core"
 version = "0.1.0"
 edition = "2024"
 
-# Portable, hardware-independent logic. no_std, no allocation, no unsafe.
-# Host tests: `cd crates/l_core && cargo test`
+# Portable, hardware-independent logic. no_std (uses `alloc`), no unsafe.
+# Host tests: `scripts/host_tests.sh` (a plain `cargo test` in this directory
+# picks up the kernel's .cargo/config.toml and fails).
 [dependencies]
