@@ -21,6 +21,7 @@ pub mod render;
 pub mod shell;
 pub mod syscall;
 pub mod url;
+pub mod usb_desc;
 pub mod wipe;
 pub mod wipetime;
 pub mod xhci_ctx;
