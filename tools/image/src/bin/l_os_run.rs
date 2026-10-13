@@ -18,7 +18,7 @@
 
 use l_os_image::{
     FirmwareEnv, HostOs, Mode, Outcome, TEST_TIMEOUT, build_image, find_firmware, find_qemu, image_path_for, is_test_binary,
-    project_root, qemu_args, run_exit, run_with_timeout, test_exit,
+    is_usb_test, project_root, qemu_args, usb_test_args, run_exit, run_with_timeout, test_exit,
 };
 use std::{env, path::PathBuf, process::Command, process::ExitCode};
 
@@ -61,6 +61,9 @@ fn main() -> ExitCode {
     };
     let mut cmd = Command::new(&qemu);
     cmd.args(&qargs);
+    if mode == Mode::Test && is_usb_test(&kernel.to_string_lossy()) {
+        cmd.args(usb_test_args(&image));
+    }
 
     match mode {
         Mode::Test => {

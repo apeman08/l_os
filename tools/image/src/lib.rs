@@ -13,6 +13,7 @@
 //! Plain std only (no shell): the same code runs on Linux, macOS and Windows.
 //! Paths marked [assumed] below were not tested on that OS.
 
+use l_core::bootmark::{self, BootId, MarkError};
 use std::{
     ffi::{OsStr, OsString},
     io,
@@ -41,10 +42,86 @@ pub fn build_image(kernel: &Path, out: &Path) -> Result<(), String> {
     // the bootloader's log lines would mix into it. L_OS_BOOT_LOG=1 turns them
     // on for debugging boot problems (e.g. a bootloader panic before the kernel).
     config.serial_logging = std::env::var_os("L_OS_BOOT_LOG").is_some_and(|v| v == "1");
-    bootloader::UefiBoot::new(kernel)
+    // The boot id is patched into a temporary copy of the kernel: the cargo
+    // artifact itself stays untouched (so cargo's fingerprints and the next
+    // run see the same file).
+    let (tmp, id) = prepare_kernel_copy(kernel, out)?;
+    let built = bootloader::UefiBoot::new(&tmp)
         .set_boot_config(&config)
         .create_disk_image(out)
-        .map_err(|e| format!("cannot build {} from {}: {e:#}", out.display(), kernel.display()))
+        .map_err(|e| format!("cannot build {} from {}: {e:#}", out.display(), kernel.display()));
+    let _ = std::fs::remove_file(&tmp);
+    built?;
+    if let Some(id) = id {
+        let mut img = std::fs::read(out).map_err(|e| format!("cannot read {}: {e}", out.display()))?;
+        write_lba0_marker(&mut img, &id)?;
+        std::fs::write(out, &img).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    }
+    Ok(())
+}
+
+/// Write the patched kernel next to `out` (`<out>.kernel.tmp`) and return its
+/// path and the boot id (`None`: the kernel has no placeholder).
+fn prepare_kernel_copy(kernel: &Path, out: &Path) -> Result<(PathBuf, Option<BootId>), String> {
+    let bytes = std::fs::read(kernel).map_err(|e| format!("cannot read {}: {e}", kernel.display()))?;
+    let (patched, id) = patch_kernel(&bytes).map_err(|e| format!("{}: {e}", kernel.display()))?;
+    let mut tmp = out.as_os_str().to_os_string();
+    tmp.push(".kernel.tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, &patched).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    Ok((tmp, id))
+}
+
+/// Replace the boot-id placeholder in a kernel image with the embedded marker.
+/// No placeholder: the kernel is returned unchanged with `None`; more than one:
+/// error. The id is a hash of the kernel without the placeholder bytes, so it
+/// is deterministic per kernel.
+pub fn patch_kernel(kernel: &[u8]) -> Result<(Vec<u8>, Option<BootId>), String> {
+    match bootmark::find_placeholder(kernel) {
+        Err(MarkError::Missing) => Ok((kernel.to_vec(), None)),
+        Err(MarkError::Duplicate) => Err("the boot-id placeholder occurs more than once in the kernel".into()),
+        Ok(at) => {
+            let id = bootmark::compute_id(kernel, at);
+            let mut out = kernel.to_vec();
+            out[at..at + 32].copy_from_slice(&bootmark::embedded(&id));
+            Ok((out, Some(id)))
+        }
+    }
+}
+
+/// Write the stick marker to bytes 0..32 of LBA 0 (inside the protective MBR's
+/// bootstrap area). Refuses unless those bytes are all zero: never overwrites.
+pub fn write_lba0_marker(image: &mut [u8], id: &BootId) -> Result<(), String> {
+    let Some(head) = image.get_mut(..32) else {
+        return Err("disk image is smaller than 32 bytes".into());
+    };
+    if head.iter().any(|&b| b != 0) {
+        return Err("LBA 0 bytes 0..32 are not zero; refusing to overwrite the bootstrap area".into());
+    }
+    head.copy_from_slice(&bootmark::lba0_marker(id));
+    Ok(())
+}
+
+/// Tests named `usb_*` boot with an xHCI controller, the image attached as a
+/// read-only USB stick (the one the kernel boots from) and a USB keyboard.
+pub fn is_usb_test(path: &str) -> bool {
+    path.rsplit(['/', '\\']).next().unwrap_or("").starts_with("usb_")
+}
+
+/// Extra QEMU arguments for `usb_*` tests (see `is_usb_test`): the same image
+/// as a read-only stick on the xHCI, plus a keyboard.
+pub fn usb_test_args(image: &Path) -> Vec<OsString> {
+    let file = escape_qemu_value(&image.to_string_lossy());
+    vec![
+        "-device".into(),
+        "qemu-xhci,id=xhci".into(),
+        "-drive".into(),
+        format!("if=none,id=stick,format=raw,readonly=on,file={file}").into(),
+        "-device".into(),
+        "usb-storage,bus=xhci.0,drive=stick,id=stick0".into(),
+        "-device".into(),
+        "usb-kbd,bus=xhci.0,id=kbd0".into(),
+    ]
 }
 
 /// The image the runner writes next to a kernel ELF: `<kernel>-uefi.img`.
@@ -852,6 +929,130 @@ mod tests {
         assert!(e.contains("qemu-system-x86_64") && e.contains("PATH"), "{e}");
         let e = find_qemu(HostOs::Windows, &[], &none).unwrap_err();
         assert!(e.contains(WINDOWS_QEMU_DIR), "{e}");
+    }
+
+
+    // ---- boot id marker ---------------------------------------------------
+
+    fn kernel_with_placeholder() -> Vec<u8> {
+        let mut k = b"ELF-ish head".to_vec();
+        k.extend_from_slice(&l_core::bootmark::PLACEHOLDER);
+        k.extend_from_slice(b"tail bytes");
+        k
+    }
+
+    #[test]
+    fn patch_replaces_placeholder_with_embedded_id() {
+        use l_core::bootmark::{compute_id, embedded, find_placeholder, parse_embedded};
+        let k = kernel_with_placeholder();
+        let at = find_placeholder(&k).unwrap();
+        let (patched, id) = patch_kernel(&k).unwrap();
+        let id = id.expect("id");
+        assert_eq!(id, compute_id(&k, at));
+        assert_eq!(patched.len(), k.len());
+        assert_eq!(&patched[at..at + 32], &embedded(&id));
+        assert_eq!(parse_embedded(patched[at..at + 32].try_into().unwrap()), Some(id));
+        assert_eq!(&patched[..at], &k[..at]);
+        assert_eq!(&patched[at + 32..], &k[at + 32..]);
+        // deterministic, and the input slice is untouched
+        assert_eq!(patch_kernel(&k).unwrap(), (patched, Some(id)));
+        assert_eq!(k, kernel_with_placeholder());
+    }
+
+    #[test]
+    fn patch_without_placeholder_is_noop() {
+        let k = b"no marker in here at all".to_vec();
+        assert_eq!(patch_kernel(&k).unwrap(), (k, None));
+    }
+
+    #[test]
+    fn patch_with_two_placeholders_fails() {
+        let mut k = kernel_with_placeholder();
+        k.extend_from_slice(&l_core::bootmark::PLACEHOLDER);
+        assert!(patch_kernel(&k).is_err());
+    }
+
+    #[test]
+    fn lba0_marker_written_at_offset_0() {
+        use l_core::bootmark::{lba0_marker, parse_lba0};
+        let id = [9u8; 16];
+        let mut img = vec![0u8; 1024];
+        img[32] = 0x55; // protective MBR data after the bootstrap marker area
+        img[510] = 0x55;
+        img[511] = 0xAA;
+        write_lba0_marker(&mut img, &id).unwrap();
+        assert_eq!(&img[..32], &lba0_marker(&id));
+        assert_eq!(parse_lba0(&img), Some(id));
+        assert_eq!((img[32], img[510], img[511]), (0x55, 0x55, 0xAA));
+        assert!(img[512..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn lba0_nonzero_bootstrap_is_refused() {
+        for pos in [0usize, 17, 31] {
+            let mut img = vec![0u8; 512];
+            img[pos] = 1;
+            let before = img.clone();
+            assert!(write_lba0_marker(&mut img, &[1; 16]).is_err());
+            assert_eq!(img, before, "never overwrite");
+        }
+        assert!(write_lba0_marker(&mut [0u8; 31], &[1; 16]).is_err());
+    }
+
+    #[test]
+    fn build_image_patches_a_temp_copy_only() {
+        // The helper that prepares the kernel copy must not touch the source.
+        let dir = std::env::temp_dir().join(format!("l_os_image_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("kernel");
+        let k = kernel_with_placeholder();
+        std::fs::write(&src, &k).unwrap();
+        let out = dir.join("k-uefi.img");
+        let (tmp, id) = prepare_kernel_copy(&src, &out).unwrap();
+        assert!(id.is_some());
+        assert_eq!(std::fs::read(&src).unwrap(), k);
+        assert_ne!(std::fs::read(&tmp).unwrap(), k);
+        assert_ne!(tmp, src);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- USB tests ----------------------------------------------------------
+
+    #[test]
+    fn usb_test_detection() {
+        assert!(is_usb_test("target/x86_64-l_os/debug/deps/usb_boot-0123456789abcdef"));
+        assert!(is_usb_test(r"deps\usb_xhci-0123456789abcdef.exe"));
+        assert!(is_usb_test("usb_x"));
+        assert!(!is_usb_test("target/x86_64-l_os/debug/deps/memory-0123456789abcdef"));
+        assert!(!is_usb_test("deps/my_usb_boot-0123456789abcdef"));
+        assert!(!is_usb_test("usb/memory-0123456789abcdef"));
+        assert!(!is_usb_test("usbx_boot-0123456789abcdef"));
+        assert!(!is_usb_test(""));
+    }
+
+    #[test]
+    fn usb_args_attach_same_image_readonly() {
+        let a = args_str(&usb_test_args(Path::new("/r/my,dir/k-uefi.img")));
+        assert_eq!(
+            a,
+            [
+                "-device",
+                "qemu-xhci,id=xhci",
+                "-drive",
+                "if=none,id=stick,format=raw,readonly=on,file=/r/my,,dir/k-uefi.img",
+                "-device",
+                "usb-storage,bus=xhci.0,drive=stick,id=stick0",
+                "-device",
+                "usb-kbd,bus=xhci.0,id=kbd0",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_mode_args_unchanged_for_other_tests() {
+        let a = args_str(&qemu_args(Mode::Test, Path::new("/r/k-uefi.img"), &Firmware::Bios("/fw/OVMF.fd".into()), Path::new("/r")).unwrap());
+        assert!(!a.iter().any(|x| x.contains("xhci") || x.contains("usb") || x.contains("stick")), "{a:?}");
+        assert!(a.iter().any(|x| x == "isa-debug-exit,iobase=0xf4,iosize=0x04"));
     }
 
     // ---- root -----------------------------------------------------------

@@ -18,3 +18,4 @@ publish = false
 # The `uefi` feature only: the BIOS path of 0.11 cannot reach 1024x768
 # (see docs/superpowers/notes/2026-10-12-framebuffer-spike.md).
 bootloader = { version = "=0.11.17", default-features = false, features = ["uefi"] }
+l_core = { path = "../../crates/l_core" }

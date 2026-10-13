@@ -106,6 +106,26 @@ pub fn boot_facts() -> Option<BootFacts> {
     *BOOT_FACTS.lock()
 }
 
+/// The boot id slot. The image builder (`tools/image`) finds these 32 bytes in
+/// the kernel ELF and replaces them with the embedded marker; the placeholder
+/// must appear exactly once in the binary, so nothing else may use
+/// `l_core::bootmark::PLACEHOLDER` in non-test code. `#[used]` keeps the slot
+/// even though nothing but `boot_id` reads it.
+#[used]
+#[unsafe(link_section = ".rodata.l_os_bootid")]
+pub static BOOT_ID: [u8; 32] = l_core::bootmark::PLACEHOLDER;
+
+/// The id the image builder embedded in this kernel; `None` when the kernel
+/// was not patched (still the placeholder, e.g. started outside `l_os_run`).
+pub fn boot_id() -> Option<l_core::bootmark::BootId> {
+    // SAFETY: `BOOT_ID` is a valid, initialized, aligned static of 32 bytes
+    // that lives for the whole run. The volatile read keeps the compiler from
+    // constant-folding the placeholder, which the image builder changes after
+    // compilation.
+    let raw = unsafe { core::ptr::read_volatile(&BOOT_ID) };
+    l_core::bootmark::parse_embedded(&raw)
+}
+
 /// Whether console writes are mirrored to COM1 (cargo feature `serial-console`,
 /// off by default; never on in an amnesic image).
 pub const SERIAL_MIRROR: bool = cfg!(feature = "serial-console");

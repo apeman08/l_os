@@ -169,10 +169,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "l_core"
+version = "0.1.0"
+
+[[package]]
 name = "l_os_image"
 version = "0.1.0"
 dependencies = [
  "bootloader",
+ "l_core",
 ]
 
 [[package]]
