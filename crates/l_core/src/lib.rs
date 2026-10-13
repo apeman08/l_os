@@ -18,6 +18,7 @@ pub mod render;
 pub mod shell;
 pub mod syscall;
 pub mod url;
+pub mod wipe;
 pub mod widgets;
 pub mod theme;
 pub mod time;
