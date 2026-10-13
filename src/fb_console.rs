@@ -26,8 +26,9 @@
 //! (however many rows it scrolled) and renders only the new rows, so long
 //! outputs cost O(lines), not a full-screen redraw per line or per character.
 //!
-//! With the cargo feature `serial-console` (on by default) every console write
-//! is also mirrored to COM1.
+//! With the cargo feature `serial-console` (off by default; `cargo run-serial`)
+//! every console write is also mirrored to COM1. Never enable it for an
+//! amnesic image.
 
 use alloc::string::String;
 use core::fmt;

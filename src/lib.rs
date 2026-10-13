@@ -77,6 +77,10 @@ pub const BOOTLOADER_CONFIG: bootloader_api::BootloaderConfig = {
     config
 };
 
+/// Whether console writes are mirrored to COM1 (cargo feature `serial-console`,
+/// off by default; never on in an amnesic image).
+pub const SERIAL_MIRROR: bool = cfg!(feature = "serial-console");
+
 /// Take over what the bootloader handed over: the framebuffer, paging access,
 /// the frame allocator and the kernel heap; then start the framebuffer console
 /// (it needs the heap). Until then, console output goes only to the serial

@@ -5,9 +5,12 @@ edition = "2024"
 build = "build.rs"
 
 [features]
-default = ["serial-console"]
-# Mirror every console write to COM1 (QEMU tests and the smoke test read it there).
+default = []
+# Mirror every console write to COM1 (the smoke tests read it there). Off by
+# default: a production image must not leak console text. `cargo run-serial`.
 serial-console = []
+# Test visibility for the wipe acceptance script (no effect yet; see the M2 plan).
+wipe-test = []
 # Tests that need host-side servers: run via scripts/net_tests.sh
 net-tests = []
 

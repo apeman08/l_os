@@ -5,7 +5,7 @@ An experimental privacy-first operating system with its own Rust kernel (x86_64,
 ## Build and run
 Requires: rustup (nightly pinned by `rust-toolchain.toml`, with `rust-src`), `qemu-system-x86_64`, OVMF UEFI firmware (Debian/Ubuntu: `apt-get install ovmf`; found at the usual paths, or set `OVMF_FD=/path/to/OVMF.fd` for a combined image, or `OVMF_CODE` + `OVMF_VARS` for a split code/variable-store pair). No shell is needed for `cargo run` / `cargo test`: the cargo runner is a Rust host program. The kernel build (`build.rs`) also compiles the ring-3 programs in `user/` and the host tools in `tools/image` (`l_os_image`, the UEFI image builder, and `l_os_run`, the cargo runner, into `target/l_os-tools/debug/`). The first build compiles the bootloader stages (`bootloader` 0.11) from crates.io: about a minute, needs network.
 
-The kernel boots via UEFI and draws its console on the framebuffer (QEMU window, 1024x768). By default (cargo feature `serial-console`) every console write is also mirrored to the serial port, i.e. the terminal you start QEMU from; build with `--no-default-features` to switch the mirror off. Type into the QEMU window.
+The kernel boots via UEFI and draws its console on the framebuffer (QEMU window, 1024x768). The serial mirror (cargo feature `serial-console`) is off: console text appears only on the framebuffer. `cargo run-serial` switches it on for development (every console write is also mirrored to the serial port, i.e. the terminal you start QEMU from), never for an amnesic image. Type into the QEMU window.
 
 ```
 cargo run                                    # build, make a UEFI image, boot it in QEMU (runner: target/l_os-tools/debug/l_os_run)

@@ -4,7 +4,7 @@ and assert on the console output. This exercises the actual kernel, not host cod
 
 Checks:
 1. Text: the kernel mirrors every console write to COM1 (cargo feature
-   `serial-console`, on by default), which QEMU writes to a file here. The text
+   `serial-console`, off by default; this script builds with it), which QEMU writes to a file here. The text
    is rendered like a terminal (backspace erases, ANSI sequences are dropped)
    and searched for the expected strings.
 2. Pixels: after `clear`, `version` and `help`, a QEMU `screendump` of the
@@ -22,7 +22,7 @@ Checks:
    "amnesisch: nein", the last row must hold at most three hints.
 
 Usage: python3 -I scripts/qemu_shell_smoke.py [--screenshot OUT.png]
-It builds the kernel (`cargo build`) and its UEFI image first (host tool
+It builds the kernel (`cargo build --features serial-console`) and its UEFI image first (host tool
 l_os_image, see tools/image).
 With --screenshot, the final screendump (the real kernel screen) is saved as PNG.
 Needs: qemu-system-x86_64, OVMF (found like the cargo runner does: OVMF_FD, or
@@ -50,10 +50,12 @@ def tool(*args):
     return subprocess.run([os.path.join(TOOLS, "l_os_image" + EXE), *args], check=True,
                           stdout=subprocess.PIPE, text=True).stdout.strip()
 
-def build_image():
-    """`cargo build` (whose build.rs also builds the host tools), then wrap the
-    kernel into the UEFI image IMG, like the cargo runner does."""
-    subprocess.run(["cargo", "build"], cwd=ROOT, check=True)
+def build_image(*features):
+    """`cargo build [--features ...]` (whose build.rs also builds the host
+    tools), then wrap the kernel into the UEFI image IMG, like the cargo runner
+    does."""
+    cmd = ["cargo", "build"] + (["--features", ",".join(features)] if features else [])
+    subprocess.run(cmd, cwd=ROOT, check=True)
     tool(KERNEL, IMG)
 
 def render(raw):
@@ -64,6 +66,40 @@ def render(raw):
         elif ch == "\b": lines[-1] = lines[-1][:-1]
         else: lines[-1] += ch if 32 <= ord(ch) < 127 else "."
     return lines
+
+def default_build_has_no_serial_mirror():
+    """A default build (no cargo features) must not mirror the console to COM1:
+    boot it, type a marker command, and the serial log must not contain it."""
+    build_image()
+    tmp = tempfile.mkdtemp()
+    sock_path, serial = os.path.join(tmp, "mon.sock"), os.path.join(tmp, "serial.log")
+    q = subprocess.Popen([tool("--print-qemu"), "-drive", f"if=none,id=disk0,format=raw,file={IMG},snapshot=on",
+                          "-device", "ide-hd,drive=disk0,bootindex=0", *tool("--print-qemu-firmware-args").splitlines(),
+                          "-vga", "none", "-device", "VGA,xres=1024,yres=768",
+                          "-cpu", "max", "-display", "none", "-serial", f"file:{serial}", "-no-reboot",
+                          "-monitor", f"unix:{sock_path},server,nowait"])
+    try:
+        for _ in range(100):
+            if os.path.exists(sock_path): break
+            time.sleep(0.1)
+        m = socket.socket(socket.AF_UNIX); m.connect(sock_path); m.settimeout(2)
+        # Keys sent before the kernel's keyboard driver is up are lost, and with
+        # the mirror off there is no prompt to wait for: type the marker after
+        # 5 s and once more after a further 8 s (a cold first boot is slower).
+        for wait in (5, 8):
+            time.sleep(wait)
+            for ch in "echo nomirror4711\n":
+                m.sendall(("sendkey " + KEYNAMES.get(ch, ch) + "\n").encode()); time.sleep(0.2)
+                try: m.recv(65536)
+                except OSError: pass
+                time.sleep(0.05)
+        time.sleep(2)
+        log = open(serial, "rb").read()
+    finally:
+        q.terminate(); q.wait()
+    if b"nomirror4711" in log:
+        print("FAIL: default_build_has_no_serial_mirror: typed text reached COM1 in a default build"); sys.exit(1)
+    print("check default_build_has_no_serial_mirror: OK")
 
 GLYPH_W, GLYPH_H = 8, 16
 # The chrome the kernel draws (src/aurora.rs); the helper renders the expected
@@ -208,7 +244,8 @@ def main():
         screenshot = sys.argv[2]
     elif len(sys.argv) > 1:
         print("usage: qemu_shell_smoke.py [--screenshot OUT.png]"); sys.exit(2)
-    build_image()
+    default_build_has_no_serial_mirror()
+    build_image("serial-console")
     tmp = tempfile.mkdtemp()
     helper = build_render_helper(tmp)
     masks = glyph_masks(helper)

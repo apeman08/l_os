@@ -10,7 +10,7 @@ server's certificate (issued by a test CA) MUST be refused. What is asserted:
 fail-closed behaviour on the real shell. The success path with a trusted CA is
 covered by tests/tls.rs (same code, test root store).
 
-Image: built here (`cargo build`, then the host tool l_os_image from
+Image: built here (`cargo build --features serial-console`, then the host tool l_os_image from
 tools/image; UEFI, needs OVMF, found like the cargo runner does: OVMF_FD, or
 OVMF_CODE + OVMF_VARS, override). Needs a Unix host (the QEMU monitor is a Unix socket).
 The console is read from the kernel's serial mirror (no VGA text buffer under UEFI).
@@ -38,7 +38,7 @@ def tool(*args):
 def build_image():
     """`cargo build` (whose build.rs also builds the host tools), then wrap the
     kernel into the UEFI image IMG, like the cargo runner does."""
-    subprocess.run(["cargo", "build"], cwd=ROOT, check=True)
+    subprocess.run(["cargo", "build", "--features", "serial-console"], cwd=ROOT, check=True)
     tool(KERNEL, IMG)
 
 def render(raw):

@@ -13,3 +13,5 @@ build-std = ["core", "compiler_builtins", "alloc"]
 # on Windows, std's Command appends .exe to a path without one if that file
 # exists.
 runner = "target/l_os-tools/debug/l_os_run"
+[alias]
+run-serial = "run --features serial-console"
