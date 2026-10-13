@@ -11,12 +11,13 @@
 //!   stdout; QEMU's exit status is passed on.
 //!
 //! The image is written next to the kernel (`<kernel>-uefi.img`). Firmware:
-//! `$OVMF_FD` or the per-OS defaults (see `l_os_image::find_firmware`).
+//! `$OVMF_FD` (combined image, `-bios`), `$OVMF_CODE` + `$OVMF_VARS` (split
+//! pair, pflash) or the per-OS defaults (see `l_os_image::find_firmware`).
 //! Extra arguments after the kernel are ignored (the kernel has no command
 //! line), as with the former runner.
 
 use l_os_image::{
-    HostOs, Mode, Outcome, TEST_TIMEOUT, build_image, find_firmware, find_qemu, image_path_for, is_test_binary,
+    FirmwareEnv, HostOs, Mode, Outcome, TEST_TIMEOUT, build_image, find_firmware, find_qemu, image_path_for, is_test_binary,
     project_root, qemu_args, run_exit, run_with_timeout, test_exit,
 };
 use std::{env, path::PathBuf, process::Command, process::ExitCode};
@@ -45,7 +46,7 @@ fn main() -> ExitCode {
         Ok(q) => q,
         Err(e) => return fail(e),
     };
-    let firmware = match find_firmware(os, env::var_os("OVMF_FD").as_deref(), Some(&qemu), &|p| p.is_file()) {
+    let firmware = match find_firmware(os, &FirmwareEnv::from_process(), Some(&qemu), &|p| p.is_file()) {
         Ok(f) => f,
         Err(e) => return fail(e),
     };

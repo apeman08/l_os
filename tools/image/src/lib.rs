@@ -83,12 +83,7 @@ pub enum Mode {
 /// QEMU's arguments (without the program name). `root` is the repository root:
 /// the test-mode packet capture goes to `<root>/target/net-trace.pcap`
 /// (scripts/net_tests.sh inspects it).
-pub fn qemu_args(mode: Mode, image: &Path, firmware: &Path, root: &Path) -> Result<Vec<OsString>, String> {
-    let utf8 = |p: &Path| {
-        p.to_str()
-            .map(str::to_owned)
-            .ok_or_else(|| format!("path is not valid UTF-8 (needed for a QEMU option value): {}", p.display()))
-    };
+pub fn qemu_args(mode: Mode, image: &Path, firmware: &Firmware, root: &Path) -> Result<Vec<OsString>, String> {
     // bootindex makes OVMF connect only the boot disk. Otherwise its own network
     // stack brings up the NIC during boot and sends IPv6 frames (MLD report,
     // duplicate-address probe) that the "nothing is sent" pcap check would see.
@@ -98,9 +93,8 @@ pub fn qemu_args(mode: Mode, image: &Path, firmware: &Path, root: &Path) -> Resu
         format!("if=none,id=disk0,format=raw,snapshot=on,file={}", escape_qemu_value(&utf8(image)?)).into(),
         "-device".into(),
         "ide-hd,drive=disk0,bootindex=0".into(),
-        "-bios".into(),
-        firmware.as_os_str().to_owned(),
     ];
+    a.extend(firmware_args(firmware)?);
     a.extend(
         [
             "-cpu",
@@ -250,48 +244,168 @@ pub const LINUX_FIRMWARE: &[&str] = &[
     "/usr/share/edk2-ovmf/x64/OVMF.fd",
 ];
 
-/// Homebrew's QEMU ships edk2 firmware (Apple silicon prefix, then Intel).
-/// [assumed: not tested on macOS]
-pub const MACOS_FIRMWARE: &[&str] = &[
-    "/opt/homebrew/share/qemu/edk2-x86_64-code.fd",
-    "/usr/local/share/qemu/edk2-x86_64-code.fd",
+/// Linux split images (code + variable store template), tried after the
+/// combined images: Debian/Ubuntu's `ovmf` package (4 MiB build), then the
+/// older 2 MiB names.
+pub const LINUX_FIRMWARE_PAIRS: &[(&str, &str)] = &[
+    ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
+    ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
 ];
 
-/// The firmware for QEMU's `-bios`. `$OVMF_FD` wins (an error if that file does
-/// not exist); otherwise the per-OS candidates are tried. On Windows the
-/// candidate is `share\edk2-x86_64-code.fd` next to the QEMU executable.
+/// Homebrew prefixes (Apple silicon, then Intel) whose `share/qemu` holds
+/// QEMU's bundled edk2 pair. [assumed: not tested on macOS]
+pub const MACOS_QEMU_SHARE: &[&str] = &["/opt/homebrew/share/qemu", "/usr/local/share/qemu"];
+
+/// QEMU's bundled edk2 firmware is split: code image + variable store
+/// template (QEMU's own descriptor `60-edk2-x86_64.json` pairs these names).
+pub const EDK2_CODE: &str = "edk2-x86_64-code.fd";
+pub const EDK2_VARS: &str = "edk2-i386-vars.fd";
+
+/// UEFI firmware for QEMU. A combined image (code + variables in one file,
+/// e.g. `OVMF.fd`) is loaded with `-bios`; a split pair cannot be (QEMU then
+/// says "could not load PC BIOS") and goes onto two pflash drives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Firmware {
+    Bios(PathBuf),
+    Pflash { code: PathBuf, vars: PathBuf },
+}
+
+/// The firmware overrides from the environment: `OVMF_FD` (combined image),
+/// `OVMF_CODE` + `OVMF_VARS` (split pair). Empty values count as unset.
+#[derive(Clone, Debug, Default)]
+pub struct FirmwareEnv {
+    pub ovmf_fd: Option<OsString>,
+    pub ovmf_code: Option<OsString>,
+    pub ovmf_vars: Option<OsString>,
+}
+
+impl FirmwareEnv {
+    pub fn from_process() -> Self {
+        FirmwareEnv {
+            ovmf_fd: std::env::var_os("OVMF_FD"),
+            ovmf_code: std::env::var_os("OVMF_CODE"),
+            ovmf_vars: std::env::var_os("OVMF_VARS"),
+        }
+    }
+}
+
+/// QEMU's firmware arguments. `-bios <file>` for a combined image; for a pair
+/// the code is a read-only pflash drive and the variable store a pflash drive
+/// with snapshot=on, so the template file is never written.
+pub fn firmware_args(firmware: &Firmware) -> Result<Vec<OsString>, String> {
+    Ok(match firmware {
+        Firmware::Bios(p) => vec!["-bios".into(), p.as_os_str().to_owned()],
+        Firmware::Pflash { code, vars } => vec![
+            "-drive".into(),
+            format!("if=pflash,format=raw,unit=0,readonly=on,file={}", escape_qemu_value(&utf8(code)?)).into(),
+            "-drive".into(),
+            format!("if=pflash,format=raw,unit=1,snapshot=on,file={}", escape_qemu_value(&utf8(vars)?)).into(),
+        ],
+    })
+}
+
+/// A path as UTF-8, for QEMU option values that need comma escaping.
+fn utf8(p: &Path) -> Result<String, String> {
+    p.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("path is not valid UTF-8 (needed for a QEMU option value): {}", p.display()))
+}
+
+/// Where firmware may be, in the order tried after the environment overrides.
+enum Candidate {
+    Bios(PathBuf),
+    Pair(PathBuf, PathBuf),
+}
+
+fn candidates(os: HostOs, qemu: Option<&Path>) -> Vec<Candidate> {
+    let pair_in = |dir: &Path| Candidate::Pair(dir.join(EDK2_CODE), dir.join(EDK2_VARS));
+    let mut c = Vec::new();
+    match os {
+        HostOs::Linux | HostOs::Other => {
+            c.extend(LINUX_FIRMWARE.iter().map(|p| Candidate::Bios(p.into())));
+            c.extend(LINUX_FIRMWARE_PAIRS.iter().map(|(code, vars)| Candidate::Pair(code.into(), vars.into())));
+            // A QEMU in <prefix>/bin installs its bundled pair into
+            // <prefix>/share/qemu. [assumed: no such QEMU on the test box]
+            if let Some(prefix) = qemu.and_then(Path::parent).and_then(Path::parent) {
+                c.push(pair_in(&prefix.join("share").join("qemu")));
+            }
+        }
+        // [assumed: not tested on macOS]
+        HostOs::MacOs => c.extend(MACOS_QEMU_SHARE.iter().map(|d| pair_in(Path::new(d)))),
+        // QEMU for Windows ships the pair in `share` next to the executable.
+        // [assumed: the file names come from QEMU's descriptor; not tested on Windows]
+        HostOs::Windows => c.extend(qemu.and_then(Path::parent).map(|d| pair_in(&d.join("share")))),
+    }
+    c
+}
+
+/// Find the UEFI firmware. Order: `$OVMF_FD` (combined; an error if the file
+/// does not exist), then `$OVMF_CODE` + `$OVMF_VARS` (both required, each
+/// must exist), then the combined Linux images, then split pairs (Linux
+/// distribution pairs; QEMU's bundled pair in `share` next to the QEMU
+/// executable on Windows [assumed], in the Homebrew prefixes on macOS
+/// [assumed], in `<prefix>/share/qemu` for a QEMU in `<prefix>/bin` on Linux).
+/// A pair counts only if both files exist.
 pub fn find_firmware(
     os: HostOs,
-    ovmf_fd: Option<&OsStr>,
+    env: &FirmwareEnv,
     qemu: Option<&Path>,
     exists: &dyn Fn(&Path) -> bool,
-) -> Result<PathBuf, String> {
-    if let Some(v) = ovmf_fd.filter(|v| !v.is_empty()) {
-        let p = PathBuf::from(v);
-        return if exists(&p) { Ok(p) } else { Err(format!("OVMF_FD={} does not exist", p.display())) };
-    }
-    let candidates: Vec<PathBuf> = match os {
-        HostOs::Linux | HostOs::Other => LINUX_FIRMWARE.iter().map(PathBuf::from).collect(),
-        HostOs::MacOs => MACOS_FIRMWARE.iter().map(PathBuf::from).collect(),
-        // QEMU for Windows ships the edk2 firmware in `share` next to the
-        // executable. [assumed: not tested on Windows]
-        HostOs::Windows => qemu
-            .and_then(Path::parent)
-            .map(|d| d.join("share").join("edk2-x86_64-code.fd"))
-            .into_iter()
-            .collect(),
+) -> Result<Firmware, String> {
+    let set = |v: &Option<OsString>| v.as_ref().filter(|v| !v.is_empty()).map(PathBuf::from);
+    let must_exist = |name: &str, p: PathBuf| {
+        if exists(&p) { Ok(p) } else { Err(format!("{name}={} does not exist", p.display())) }
     };
-    if let Some(found) = candidates.iter().find(|p| exists(p)) {
-        return Ok(found.clone());
+    if let Some(p) = set(&env.ovmf_fd) {
+        return must_exist("OVMF_FD", p).map(Firmware::Bios);
+    }
+    match (set(&env.ovmf_code), set(&env.ovmf_vars)) {
+        (Some(code), Some(vars)) => {
+            return Ok(Firmware::Pflash { code: must_exist("OVMF_CODE", code)?, vars: must_exist("OVMF_VARS", vars)? });
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(format!(
+                "OVMF_CODE and OVMF_VARS must be set together (OVMF_CODE is {}, OVMF_VARS is {})",
+                if set(&env.ovmf_code).is_some() { "set" } else { "not set" },
+                if set(&env.ovmf_vars).is_some() { "set" } else { "not set" },
+            ));
+        }
+        (None, None) => {}
+    }
+
+    let cands = candidates(os, qemu);
+    for c in &cands {
+        match c {
+            Candidate::Bios(p) if exists(p) => return Ok(Firmware::Bios(p.clone())),
+            Candidate::Pair(code, vars) if exists(code) && exists(vars) => {
+                return Ok(Firmware::Pflash { code: code.clone(), vars: vars.clone() });
+            }
+            _ => {}
+        }
+    }
+    if let Some(Candidate::Pair(code, vars)) = cands.iter().find(|c| matches!(c, Candidate::Pair(code, _) if exists(code))) {
+        return Err(format!(
+            "found the UEFI code image {} but not its variable store {}; set OVMF_CODE and OVMF_VARS=/path/to/the/vars.fd (or OVMF_FD=/path/to/a/combined/OVMF.fd)",
+            code.display(),
+            vars.display()
+        ));
     }
     let hint = match os {
-        HostOs::Windows => "the QEMU for Windows installer ships share\\edk2-x86_64-code.fd next to qemu-system-x86_64.exe",
-        HostOs::MacOs => "brew install qemu (ships share/qemu/edk2-x86_64-code.fd)",
+        HostOs::Windows => {
+            "the QEMU for Windows installer ships share\\edk2-x86_64-code.fd and share\\edk2-i386-vars.fd next to qemu-system-x86_64.exe"
+        }
+        HostOs::MacOs => "brew install qemu (ships share/qemu/edk2-x86_64-code.fd and edk2-i386-vars.fd)",
         _ => "Debian/Ubuntu: apt-get install ovmf; Fedora: dnf install edk2-ovmf; Arch: pacman -S edk2-ovmf",
     };
-    let tried: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+    let tried: Vec<String> = cands
+        .iter()
+        .map(|c| match c {
+            Candidate::Bios(p) => p.display().to_string(),
+            Candidate::Pair(code, vars) => format!("{} + {}", code.display(), vars.display()),
+        })
+        .collect();
     Err(format!(
-        "no OVMF (UEFI) firmware found. Set OVMF_FD=/path/to/OVMF.fd or install it ({hint}). Tried: {}",
+        "no OVMF (UEFI) firmware found. Set OVMF_FD=/path/to/OVMF.fd (combined image) or OVMF_CODE + OVMF_VARS (split code and variable store), or install it ({hint}). Tried: {}",
         if tried.is_empty() { "nothing (QEMU not found)".to_owned() } else { tried.join(", ") }
     ))
 }
@@ -372,7 +486,7 @@ mod tests {
 
     #[test]
     fn run_mode_args_match_the_old_runner() {
-        let a = qemu_args(Mode::Run, Path::new("/r/my,dir/k-uefi.img"), Path::new("/fw/OVMF.fd"), Path::new("/r")).unwrap();
+        let a = qemu_args(Mode::Run, Path::new("/r/my,dir/k-uefi.img"), &Firmware::Bios("/fw/OVMF.fd".into()), Path::new("/r")).unwrap();
         let mut want: Vec<String> = COMMON.iter().map(|s| s.to_string()).collect();
         want[1] = "if=none,id=disk0,format=raw,snapshot=on,file=/r/my,,dir/k-uefi.img".into();
         assert_eq!(args_str(&a), want);
@@ -380,7 +494,7 @@ mod tests {
 
     #[test]
     fn test_mode_adds_capture_debug_exit_and_headless() {
-        let a = qemu_args(Mode::Test, Path::new("/r/my,dir/k-uefi.img"), Path::new("/fw/OVMF.fd"), Path::new("/r")).unwrap();
+        let a = qemu_args(Mode::Test, Path::new("/r/my,dir/k-uefi.img"), &Firmware::Bios("/fw/OVMF.fd".into()), Path::new("/r")).unwrap();
         let mut want: Vec<String> = COMMON.iter().map(|s| s.to_string()).collect();
         want[1] = "if=none,id=disk0,format=raw,snapshot=on,file=/r/my,,dir/k-uefi.img".into();
         let pcap = Path::new("/r").join("target").join("net-trace.pcap");
@@ -476,65 +590,183 @@ mod tests {
         move |p: &Path| set.contains(p)
     }
 
+    fn env(fd: Option<&str>, code: Option<&str>, vars: Option<&str>) -> FirmwareEnv {
+        FirmwareEnv { ovmf_fd: fd.map(Into::into), ovmf_code: code.map(Into::into), ovmf_vars: vars.map(Into::into) }
+    }
+
+    fn bios(p: &str) -> Firmware {
+        Firmware::Bios(PathBuf::from(p))
+    }
+
+    fn pflash(code: &str, vars: &str) -> Firmware {
+        Firmware::Pflash { code: PathBuf::from(code), vars: PathBuf::from(vars) }
+    }
+
+    const PAIR4M: [&str; 2] = ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"];
+
     #[test]
-    fn ovmf_fd_env_wins_over_candidates() {
-        let exists = fs(&["/my/OVMF.fd", "/usr/share/qemu/OVMF.fd"]);
-        let fw = find_firmware(HostOs::Linux, Some(OsStr::new("/my/OVMF.fd")), None, &exists).unwrap();
-        assert_eq!(fw, PathBuf::from("/my/OVMF.fd"));
+    fn ovmf_fd_env_wins_over_everything() {
+        let exists = fs(&["/my/OVMF.fd", "/c.fd", "/v.fd", "/usr/share/qemu/OVMF.fd", PAIR4M[0], PAIR4M[1]]);
+        let e = env(Some("/my/OVMF.fd"), Some("/c.fd"), Some("/v.fd"));
+        assert_eq!(find_firmware(HostOs::Linux, &e, None, &exists).unwrap(), bios("/my/OVMF.fd"));
     }
 
     #[test]
     fn missing_ovmf_fd_file_is_an_error_even_if_candidates_exist() {
         let exists = fs(&["/usr/share/qemu/OVMF.fd"]);
-        let e = find_firmware(HostOs::Linux, Some(OsStr::new("/nope/OVMF.fd")), None, &exists).unwrap_err();
+        let e = find_firmware(HostOs::Linux, &env(Some("/nope/OVMF.fd"), None, None), None, &exists).unwrap_err();
         assert!(e.contains("OVMF_FD=/nope/OVMF.fd does not exist"), "{e}");
     }
 
     #[test]
     fn empty_ovmf_fd_is_ignored() {
         let exists = fs(&["/usr/share/ovmf/OVMF.fd"]);
-        let fw = find_firmware(HostOs::Linux, Some(OsStr::new("")), None, &exists).unwrap();
-        assert_eq!(fw, PathBuf::from("/usr/share/ovmf/OVMF.fd"));
+        let fw = find_firmware(HostOs::Linux, &env(Some(""), Some(""), Some("")), None, &exists).unwrap();
+        assert_eq!(fw, bios("/usr/share/ovmf/OVMF.fd"));
     }
 
     #[test]
-    fn linux_candidates_in_order() {
+    fn ovmf_code_and_vars_win_over_candidates() {
+        let exists = fs(&["/c,1.fd", "/v.fd", "/usr/share/qemu/OVMF.fd"]);
+        let fw = find_firmware(HostOs::Linux, &env(None, Some("/c,1.fd"), Some("/v.fd")), None, &exists).unwrap();
+        assert_eq!(fw, pflash("/c,1.fd", "/v.fd"));
+    }
+
+    #[test]
+    fn ovmf_code_without_vars_is_an_error() {
+        let exists = fs(&["/c.fd", "/usr/share/qemu/OVMF.fd"]);
+        let e = find_firmware(HostOs::Linux, &env(None, Some("/c.fd"), None), None, &exists).unwrap_err();
+        assert!(e.contains("OVMF_CODE") && e.contains("OVMF_VARS") && e.contains("together"), "{e}");
+        let e = find_firmware(HostOs::Linux, &env(None, None, Some("/v.fd")), None, &exists).unwrap_err();
+        assert!(e.contains("OVMF_CODE") && e.contains("OVMF_VARS") && e.contains("together"), "{e}");
+    }
+
+    #[test]
+    fn ovmf_code_or_vars_file_missing_is_an_error() {
+        let exists = fs(&["/c.fd", "/usr/share/qemu/OVMF.fd"]);
+        let e = find_firmware(HostOs::Linux, &env(None, Some("/c.fd"), Some("/nope.fd")), None, &exists).unwrap_err();
+        assert!(e.contains("OVMF_VARS=/nope.fd does not exist"), "{e}");
+        let exists = fs(&["/v.fd"]);
+        let e = find_firmware(HostOs::Linux, &env(None, Some("/nope.fd"), Some("/v.fd")), None, &exists).unwrap_err();
+        assert!(e.contains("OVMF_CODE=/nope.fd does not exist"), "{e}");
+    }
+
+    #[test]
+    fn linux_combined_candidates_in_order() {
         let exists = fs(&["/usr/share/edk2-ovmf/x64/OVMF.fd", "/usr/share/OVMF/OVMF.fd"]);
-        assert_eq!(find_firmware(HostOs::Linux, None, None, &exists).unwrap(), PathBuf::from("/usr/share/OVMF/OVMF.fd"));
+        assert_eq!(find_firmware(HostOs::Linux, &FirmwareEnv::default(), None, &exists).unwrap(), bios("/usr/share/OVMF/OVMF.fd"));
         let exists = fs(&["/usr/share/qemu/OVMF.fd", "/usr/share/ovmf/OVMF.fd"]);
-        assert_eq!(find_firmware(HostOs::Linux, None, None, &exists).unwrap(), PathBuf::from("/usr/share/qemu/OVMF.fd"));
+        assert_eq!(find_firmware(HostOs::Linux, &FirmwareEnv::default(), None, &exists).unwrap(), bios("/usr/share/qemu/OVMF.fd"));
     }
 
     #[test]
-    fn macos_homebrew_candidates() {
-        let exists = fs(&["/usr/local/share/qemu/edk2-x86_64-code.fd"]);
+    fn linux_combined_image_beats_pairs() {
+        let exists = fs(&["/usr/share/edk2-ovmf/x64/OVMF.fd", PAIR4M[0], PAIR4M[1]]);
         assert_eq!(
-            find_firmware(HostOs::MacOs, None, None, &exists).unwrap(),
-            PathBuf::from("/usr/local/share/qemu/edk2-x86_64-code.fd")
+            find_firmware(HostOs::Linux, &FirmwareEnv::default(), None, &exists).unwrap(),
+            bios("/usr/share/edk2-ovmf/x64/OVMF.fd")
         );
     }
 
     #[test]
-    fn windows_firmware_next_to_qemu() {
-        let qemu = Path::new(r"D:\tools\qemu").join("qemu-system-x86_64.exe");
-        let fw = Path::new(r"D:\tools\qemu").join("share").join("edk2-x86_64-code.fd");
-        let exists = |p: &Path| p == fw;
-        assert_eq!(find_firmware(HostOs::Windows, None, Some(&qemu), &exists).unwrap(), fw);
+    fn linux_pairs_when_no_combined_image() {
+        let exists = fs(&[PAIR4M[0], PAIR4M[1], "/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"]);
+        assert_eq!(find_firmware(HostOs::Linux, &FirmwareEnv::default(), None, &exists).unwrap(), pflash(PAIR4M[0], PAIR4M[1]));
+        let exists = fs(&["/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"]);
+        assert_eq!(
+            find_firmware(HostOs::Linux, &FirmwareEnv::default(), None, &exists).unwrap(),
+            pflash("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd")
+        );
     }
 
     #[test]
-    fn missing_firmware_names_ovmf_fd_and_os_hint() {
+    fn linux_qemu_prefix_pair() {
+        let qemu = Path::new("/opt/q/bin/qemu-system-x86_64");
+        let exists = fs(&["/opt/q/share/qemu/edk2-x86_64-code.fd", "/opt/q/share/qemu/edk2-i386-vars.fd"]);
+        assert_eq!(
+            find_firmware(HostOs::Linux, &FirmwareEnv::default(), Some(qemu), &exists).unwrap(),
+            pflash("/opt/q/share/qemu/edk2-x86_64-code.fd", "/opt/q/share/qemu/edk2-i386-vars.fd")
+        );
+    }
+
+    #[test]
+    fn macos_homebrew_pair() {
+        let exists = fs(&["/usr/local/share/qemu/edk2-x86_64-code.fd", "/usr/local/share/qemu/edk2-i386-vars.fd"]);
+        assert_eq!(
+            find_firmware(HostOs::MacOs, &FirmwareEnv::default(), None, &exists).unwrap(),
+            pflash("/usr/local/share/qemu/edk2-x86_64-code.fd", "/usr/local/share/qemu/edk2-i386-vars.fd")
+        );
+    }
+
+    #[test]
+    fn windows_pair_next_to_qemu() {
+        let dir = Path::new(r"D:\tools\qemu");
+        let qemu = dir.join("qemu-system-x86_64.exe");
+        let code = dir.join("share").join("edk2-x86_64-code.fd");
+        let vars = dir.join("share").join("edk2-i386-vars.fd");
+        let (c, v) = (code.clone(), vars.clone());
+        let exists = move |p: &Path| p == c || p == v;
+        assert_eq!(
+            find_firmware(HostOs::Windows, &FirmwareEnv::default(), Some(&qemu), &exists).unwrap(),
+            Firmware::Pflash { code, vars }
+        );
+    }
+
+    #[test]
+    fn code_without_vars_names_the_missing_vars_file() {
+        let dir = Path::new(r"C:\Program Files\qemu");
+        let qemu = dir.join("qemu-system-x86_64.exe");
+        let code = dir.join("share").join("edk2-x86_64-code.fd");
+        let vars = dir.join("share").join("edk2-i386-vars.fd");
+        let c = code.clone();
+        let e = find_firmware(HostOs::Windows, &FirmwareEnv::default(), Some(&qemu), &move |p: &Path| p == c).unwrap_err();
+        assert!(e.contains(&vars.display().to_string()), "names the missing vars file: {e}");
+        assert!(e.contains("OVMF_VARS"), "{e}");
+        let e = find_firmware(HostOs::Linux, &FirmwareEnv::default(), None, &fs(&[PAIR4M[0]])).unwrap_err();
+        assert!(e.contains(PAIR4M[1]) && e.contains("OVMF_VARS"), "{e}");
+    }
+
+    #[test]
+    fn missing_firmware_names_overrides_and_os_hint() {
         let none = |_: &Path| false;
-        let e = find_firmware(HostOs::Linux, None, None, &none).unwrap_err();
-        assert!(e.contains("OVMF_FD"), "{e}");
+        let e = find_firmware(HostOs::Linux, &FirmwareEnv::default(), None, &none).unwrap_err();
+        assert!(e.contains("OVMF_FD") && e.contains("OVMF_CODE") && e.contains("OVMF_VARS"), "{e}");
         assert!(e.contains("apt-get install ovmf"), "{e}");
         assert!(e.contains("/usr/share/edk2-ovmf/x64/OVMF.fd"), "lists what was tried: {e}");
+        assert!(e.contains(PAIR4M[0]) && e.contains(PAIR4M[1]), "lists pairs: {e}");
         let qemu = Path::new(r"C:\Program Files\qemu").join("qemu-system-x86_64.exe");
-        let e = find_firmware(HostOs::Windows, None, Some(&qemu), &none).unwrap_err();
-        assert!(e.contains("OVMF_FD"), "{e}");
-        assert!(e.contains("edk2-x86_64-code.fd"), "{e}");
-        let e = find_firmware(HostOs::MacOs, None, None, &none).unwrap_err();
+        let e = find_firmware(HostOs::Windows, &FirmwareEnv::default(), Some(&qemu), &none).unwrap_err();
+        assert!(e.contains("OVMF_FD") && e.contains("edk2-x86_64-code.fd") && e.contains("edk2-i386-vars.fd"), "{e}");
+        let e = find_firmware(HostOs::MacOs, &FirmwareEnv::default(), None, &none).unwrap_err();
         assert!(e.contains("OVMF_FD") && e.contains("brew install qemu"), "{e}");
+    }
+
+    #[test]
+    fn bios_args() {
+        assert_eq!(args_str(&firmware_args(&bios("/fw/my,OVMF.fd")).unwrap()), ["-bios", "/fw/my,OVMF.fd"]);
+    }
+
+    #[test]
+    fn pflash_args_escape_commas() {
+        let a = firmware_args(&pflash("/fw/c,ode.fd", "/fw/v,ars.fd")).unwrap();
+        assert_eq!(
+            args_str(&a),
+            [
+                "-drive",
+                "if=pflash,format=raw,unit=0,readonly=on,file=/fw/c,,ode.fd",
+                "-drive",
+                "if=pflash,format=raw,unit=1,snapshot=on,file=/fw/v,,ars.fd",
+            ]
+        );
+    }
+
+    #[test]
+    fn pflash_replaces_bios_in_full_command_line() {
+        let a = qemu_args(Mode::Run, Path::new("/r/k-uefi.img"), &pflash("/c.fd", "/v.fd"), Path::new("/r")).unwrap();
+        let a = args_str(&a);
+        assert!(!a.iter().any(|x| x == "-bios"));
+        assert_eq!(a[4..8], ["-drive", "if=pflash,format=raw,unit=0,readonly=on,file=/c.fd", "-drive", "if=pflash,format=raw,unit=1,snapshot=on,file=/v.fd"]);
+        assert_eq!(a[8..10], ["-cpu", "max"]);
     }
 
     // ---- (e) QEMU lookup ------------------------------------------------

@@ -11,8 +11,8 @@ fail-closed behaviour on the real shell. The success path with a trusted CA is
 covered by tests/tls.rs (same code, test root store).
 
 Image: built here (`cargo build`, then the host tool l_os_image from
-tools/image; UEFI, needs OVMF, found like the cargo runner does: OVMF_FD
-overrides). Needs a Unix host (the QEMU monitor is a Unix socket).
+tools/image; UEFI, needs OVMF, found like the cargo runner does: OVMF_FD, or
+OVMF_CODE + OVMF_VARS, override). Needs a Unix host (the QEMU monitor is a Unix socket).
 The console is read from the kernel's serial mirror (no VGA text buffer under UEFI).
 """
 import os, re, socket, subprocess, sys, tempfile, time
@@ -30,7 +30,8 @@ IMG = KERNEL + "-uefi.img"
 def tool(*args):
     """Run the host tool l_os_image (built by the repository's build.rs into
     target/l_os-tools); its stdout, stripped. QEMU and firmware are found the
-    same way the cargo runner finds them (OVMF_FD overrides the firmware)."""
+    same way the cargo runner finds them (OVMF_FD, or OVMF_CODE + OVMF_VARS,
+    override the firmware; a split pair becomes two pflash drives)."""
     return subprocess.run([os.path.join(TOOLS, "l_os_image" + EXE), *args], check=True,
                           stdout=subprocess.PIPE, text=True).stdout.strip()
 
@@ -55,7 +56,7 @@ def main():
     sock_path, serial = os.path.join(tmp, "mon.sock"), os.path.join(tmp, "serial.log")
     q = subprocess.Popen([tool("--print-qemu"), "-drive", f"if=none,id=disk0,format=raw,file={IMG},snapshot=on",
                           # bootindex: OVMF then connects only the disk and leaves the NIC alone.
-                          "-device", "ide-hd,drive=disk0,bootindex=0", "-bios", tool("--print-firmware"),
+                          "-device", "ide-hd,drive=disk0,bootindex=0", *tool("--print-qemu-firmware-args").splitlines(),
                           "-vga", "none", "-device", "VGA,xres=1024,yres=768", "-cpu", "max",
                           "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0,disable-modern=on",
                           "-display", "none", "-serial", f"file:{serial}", "-no-reboot",
