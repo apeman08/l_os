@@ -297,11 +297,14 @@ fn command_rejects_link_trb() {
     noop();
 }
 
+/// Drains whatever non-command events the real controller queued. QEMU
+/// sends none after HCRST/RS=1 (CSC is set without an event, spike note
+/// §5), so on QEMU this only checks that draining is clean and bounded;
+/// the queueing and routing logic itself is covered with a scripted event
+/// source by the in-crate tests `xhci::tests::drain_*`.
 #[test_case]
-fn unrelated_events_are_kept() {
+fn queued_events_drain_cleanly() {
     up();
-    // Port events after HCRST/RS=1 (if the controller sends any) must sit in
-    // the queue, not be dropped by command(); drain and show them.
     noop();
     let mut n = 0;
     while let Some(e) = xhci::pop_event() {

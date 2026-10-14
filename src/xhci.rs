@@ -30,6 +30,7 @@
 //! (the controller writes the cycle bit last), then the body.
 
 use crate::{memory, mmio, pci, time};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 use l_core::xhci_ctx::Caps;
 use l_core::xhci_ring::{self as ring, Event, EventRing, ProducerRing, Trb};
@@ -173,27 +174,26 @@ fn cycles_for_ms(ms: u64) -> u64 {
     per_ms.saturating_mul(ms)
 }
 
-/// The DMA structures (physical addresses; each one contiguous run).
+/// The DMA structures (physical addresses; each one contiguous run). The
+/// scratchpad buffers (one page each, not contiguous) are listed in
+/// [`Driver::scratch`], a software copy: the array in DMA memory is never
+/// read back (a hostile controller could have overwritten it).
 #[derive(Debug, Clone, Copy)]
 struct Dma {
     dcbaa: u64,
     /// Scratchpad array and its frame count (0 if no scratchpad).
     scratch_array: u64,
     scratch_array_frames: usize,
-    /// `n` scratchpad buffers, one page each, contiguous.
-    scratch_bufs: u64,
-    scratch_count: usize,
     cmd: u64,
     event: u64,
     erst: u64,
 }
 
 impl Dma {
-    fn runs(&self) -> [(u64, usize); 6] {
+    fn runs(&self) -> [(u64, usize); 5] {
         [
             (self.dcbaa, 1),
             (self.scratch_array, self.scratch_array_frames),
-            (self.scratch_bufs, self.scratch_count),
             (self.cmd, 1),
             (self.event, 1),
             (self.erst, 1),
@@ -235,6 +235,52 @@ impl EventQueue {
     }
 }
 
+/// Outcome of [`drain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drained {
+    /// `route` accepted this event (the awaited completion).
+    Done(Event),
+    /// The source had no further event.
+    Empty,
+    /// `max` events were consumed and more may follow.
+    Limit,
+}
+
+/// Hand at most `max` events from `next` to `route`; stops early when the
+/// source is empty or `route` returns the awaited event. Bounded whatever
+/// the (hardware) source does.
+fn drain<E>(
+    max: usize,
+    mut next: impl FnMut() -> Result<Option<Event>, E>,
+    mut route: impl FnMut(Event) -> Option<Event>,
+) -> Result<Drained, E> {
+    for _ in 0..max {
+        match next()? {
+            None => return Ok(Drained::Empty),
+            Some(e) => {
+                if let Some(done) = route(e) {
+                    return Ok(Drained::Done(done));
+                }
+            }
+        }
+    }
+    Ok(Drained::Limit)
+}
+
+/// Route one event: `Some(event)` if it completes the command at `want`;
+/// the completion of the `stale` (timed-out) command clears it; any other
+/// completion (of nothing we know) is counted as dropped; every
+/// non-command event is queued for [`pop_event`].
+fn route(queue: &mut EventQueue, stale: &mut Option<u64>, e: Event, want: Option<u64>) -> Option<Event> {
+    match e {
+        Event::CommandCompletion { trb, .. } if Some(trb) == want => return Some(e),
+        Event::CommandCompletion { trb, .. } if Some(trb) == *stale => *stale = None,
+        Event::CommandCompletion { .. } => queue.dropped = queue.dropped.saturating_add(1),
+        other => queue.push(other),
+    }
+    None
+}
+
 struct Driver {
     regs: mmio::Mmio,
     caps: Caps,
@@ -252,6 +298,8 @@ struct Driver {
     /// Physical address of a command that timed out and has not completed.
     stale: Option<u64>,
     queue: EventQueue,
+    /// Physical addresses of the scratchpad buffer pages.
+    scratch: Vec<u64>,
 }
 
 static DRIVER: Mutex<Option<Driver>> = Mutex::new(None);
@@ -331,6 +379,12 @@ pub fn halt_for_wipe() {
 }
 
 /// Capabilities of the controller once [`init`] has mapped it.
+///
+/// [`caps`], [`command_ring`], [`pop_event`], [`dropped_events`], [`init`]
+/// and [`command`] take the driver lock (spinning): never call them from an
+/// ISR. Task 20's timer-ISR polling must use `try_lock` (or own the lock
+/// with IF=0); only [`usbsts`], [`usbcmd`] and [`halt_for_wipe`] are
+/// lock-free.
 pub fn caps() -> Option<Caps> {
     DRIVER.lock().as_ref().map(|d| d.caps)
 }
@@ -357,12 +411,16 @@ pub fn dropped_events() -> u64 {
 
 /// Find, map, reset and start the controller and run the No-Op self-test
 /// (spec §7.1 steps 1–4). Rejected with [`XhciError::AlreadyInitialized`]
-/// while the controller runs; after a failure or a halt it resets the
-/// controller again, reusing the mapping and the DMA frames.
+/// while the controller runs normally; after a failure, a halt or a command
+/// that timed out without completing ([`XhciError::Busy`]) it resets the
+/// controller again, reusing the mapping and the DMA frames. Takes the
+/// driver lock: not for ISR context.
 pub fn init() -> Result<(), XhciError> {
     let mut g = DRIVER.lock();
     if let Some(d) = g.as_ref() {
-        if d.started && d.sts().is_ok_and(|s| s & STS_HCH == 0) {
+        // A command that timed out and never completed (`Busy`) is not
+        // "running": init resets the controller and the rings again.
+        if d.started && d.stale.is_none() && d.sts().is_ok_and(|s| s & STS_HCH == 0) {
             return Err(XhciError::AlreadyInitialized);
         }
     }
@@ -391,11 +449,41 @@ pub fn command(trb: Trb, timeout_ms: u64) -> Result<Event, XhciError> {
     }
 }
 
-/// Physical frames for DMA: `n` contiguous zeroed frames.
-fn alloc_frames(n: usize) -> Result<u64, XhciError> {
-    let mut g = memory::MEMORY.lock();
-    let mem = g.as_mut().ok_or(XhciError::NoMemory)?;
-    mem.frames.allocate_contiguous(n).map(|f| f.start_address().as_u64()).ok_or(XhciError::NoMemory)
+/// Frames taken for one first-time DMA setup; [`Frames::free`] gives them
+/// all back if a later step fails (nothing is leaked).
+struct Frames(Vec<(u64, usize)>);
+
+impl Frames {
+    /// `n` contiguous zeroed frames, below 4 GiB unless `ac64`.
+    fn take(&mut self, n: usize, ac64: bool) -> Result<u64, XhciError> {
+        self.0.try_reserve(1).map_err(|_| XhciError::NoMemory)?;
+        let phys = {
+            let mut g = memory::MEMORY.lock();
+            let mem = g.as_mut().ok_or(XhciError::NoMemory)?;
+            mem.frames.allocate_contiguous(n).map(|f| f.start_address().as_u64()).ok_or(XhciError::NoMemory)?
+        };
+        self.0.push((phys, n));
+        if !ac64 && phys + n as u64 * PAGE > FOUR_GIB {
+            return Err(XhciError::NoMemory);
+        }
+        Ok(phys)
+    }
+
+    fn free(self) {
+        use x86_64::structures::paging::{FrameDeallocator, PhysFrame};
+        let mut g = memory::MEMORY.lock();
+        let Some(mem) = g.as_mut() else { return };
+        for (phys, n) in self.0 {
+            for i in 0..n as u64 {
+                let f = PhysFrame::containing_address(x86_64::PhysAddr::new(phys + i * PAGE));
+                // SAFETY: the frame was allocated by `take` during this
+                // setup attempt and its address was never written to a
+                // controller register, so neither the controller nor any
+                // Rust reference uses it.
+                unsafe { mem.frames.deallocate_frame(f) };
+            }
+        }
+    }
 }
 
 /// Virtual address of DMA memory at physical `phys` (offset mapping).
@@ -485,6 +573,7 @@ impl Driver {
             ev: EventRing::new(EVENT_TRBS),
             stale: None,
             queue: EventQueue::new(),
+            scratch: Vec::new(),
         })
     }
 
@@ -595,7 +684,8 @@ impl Driver {
         let caps = self.caps;
         let dma = match self.dma {
             Some(dma) => {
-                for (phys, n) in dma.runs() {
+                let pages = self.scratch.iter().map(|&p| (p, 1));
+                for (phys, n) in dma.runs().into_iter().chain(pages) {
                     if n > 0 {
                         // SAFETY: `phys` starts `n` frames this driver
                         // allocated and owns; the controller is halted and
@@ -606,35 +696,28 @@ impl Driver {
                 dma
             }
             None => {
-                let n = usize::from(caps.max_scratchpad);
-                let array_frames = (n * 8).div_ceil(PAGE as usize);
-                let dma = Dma {
-                    dcbaa: alloc_frames(1)?,
-                    scratch_array: if n > 0 { alloc_frames(array_frames)? } else { 0 },
-                    scratch_array_frames: array_frames,
-                    scratch_bufs: if n > 0 { alloc_frames(n)? } else { 0 },
-                    scratch_count: n,
-                    cmd: alloc_frames(1)?,
-                    event: alloc_frames(1)?,
-                    erst: alloc_frames(1)?,
-                };
-                // Remember them at once: a failure below reuses, never leaks
-                // more frames on the next try.
-                self.dma = Some(dma);
-                dma
+                let mut frames = Frames(Vec::new());
+                match Driver::allocate(&mut frames, caps) {
+                    Ok((dma, scratch)) => {
+                        // Kept for the kernel's lifetime; a restart reuses them.
+                        self.dma = Some(dma);
+                        self.scratch = scratch;
+                        dma
+                    }
+                    Err(e) => {
+                        frames.free();
+                        return Err(e);
+                    }
+                }
             }
         };
-        let above_4g = dma.runs().iter().any(|&(p, n)| n > 0 && p + n as u64 * PAGE > FOUR_GIB);
-        if above_4g && !caps.ac64 {
-            return Err(XhciError::NoMemory);
-        }
         // SAFETY: every address below lies in the frames of `dma` (sizes
         // computed above: DCBAA entry 0 in its frame, `n` 8-byte entries in
         // the scratchpad array, the ERST entry in its frame), 4-byte aligned.
         unsafe {
-            if dma.scratch_count > 0 {
-                for i in 0..dma.scratch_count as u64 {
-                    let buf = dma.scratch_bufs + i * PAGE;
+            if !self.scratch.is_empty() {
+                for (i, &buf) in self.scratch.iter().enumerate() {
+                    let i = i as u64;
                     dma_write32(dma.scratch_array + i * 8, buf as u32);
                     dma_write32(dma.scratch_array + i * 8 + 4, (buf >> 32) as u32);
                 }
@@ -648,11 +731,34 @@ impl Driver {
         Ok(dma)
     }
 
+    /// First-time allocation of every DMA structure (each zeroed); on error
+    /// the caller frees what `frames` holds.
+    fn allocate(frames: &mut Frames, caps: Caps) -> Result<(Dma, Vec<u64>), XhciError> {
+        let ac64 = caps.ac64;
+        let n = usize::from(caps.max_scratchpad);
+        let array_frames = (n * 8).div_ceil(PAGE as usize);
+        let dma = Dma {
+            dcbaa: frames.take(1, ac64)?,
+            scratch_array: if n > 0 { frames.take(array_frames, ac64)? } else { 0 },
+            scratch_array_frames: array_frames,
+            cmd: frames.take(1, ac64)?,
+            event: frames.take(1, ac64)?,
+            erst: frames.take(1, ac64)?,
+        };
+        let mut scratch = Vec::new();
+        scratch.try_reserve_exact(n).map_err(|_| XhciError::NoMemory)?;
+        for _ in 0..n {
+            // One page each: scratchpad buffers need not be contiguous.
+            scratch.push(frames.take(1, ac64)?);
+        }
+        Ok((dma, scratch))
+    }
+
     /// Consume one event TRB, if the controller produced one, and move
     /// ERDP past it (EHB written as 1 to clear it).
-    fn next_event(&mut self, dma: &Dma) -> Result<Option<Event>, XhciError> {
+    fn next_event(ev: &mut EventRing, regs: &mmio::Mmio, ir0: u64, dma: &Dma) -> Result<Option<Event>, XhciError> {
         let base = dma.event;
-        let t = self.ev.poll(|i| {
+        let t = ev.poll(|i| {
             let p = base + (i as u64 % EVENT_TRBS as u64) * 16;
             // SAFETY: `p` is one of the EVENT_TRBS slots of our event ring.
             // Control dword (cycle bit) first: the controller writes it
@@ -664,7 +770,7 @@ impl Driver {
             }
         });
         let Some(t) = t else { return Ok(None) };
-        self.regs.write64(self.ir0 + ERDP, self.ev.erdp(base))?;
+        regs.write64(ir0 + ERDP, ev.erdp(base))?;
         Ok(Some(Event::decode(t)))
     }
 
@@ -680,17 +786,13 @@ impl Driver {
         Ok(())
     }
 
-    /// Route one event: `Some(event)` if it completes the command at
-    /// `want`, otherwise it is queued (or, a completion of nothing we
-    /// know, counted as dropped).
-    fn route(&mut self, e: Event, want: Option<u64>) -> Option<Event> {
-        match e {
-            Event::CommandCompletion { trb, .. } if Some(trb) == want => return Some(e),
-            Event::CommandCompletion { trb, .. } if Some(trb) == self.stale => self.stale = None,
-            Event::CommandCompletion { .. } => self.queue.dropped = self.queue.dropped.saturating_add(1),
-            other => self.queue.push(other),
-        }
-        None
+    /// One bounded pass over the event ring (at most [`EVENT_TRBS`] events,
+    /// so a controller that keeps producing events cannot keep the caller
+    /// from checking its deadline).
+    fn drain_once(&mut self, dma: &Dma, want: Option<u64>) -> Result<Drained, XhciError> {
+        let Driver { ev, regs, ir0, queue, stale, .. } = self;
+        let ir0 = *ir0;
+        drain(EVENT_TRBS, || Driver::next_event(ev, regs, ir0, dma), |e| route(queue, stale, e, want))
     }
 
     fn submit(&mut self, trb: Trb, timeout_ms: u64) -> Result<Event, XhciError> {
@@ -701,9 +803,7 @@ impl Driver {
         self.check_running()?;
         // At most one command in flight (the ring has no full check).
         if self.stale.is_some() {
-            while let Some(e) = self.next_event(&dma)? {
-                self.route(e, None);
-            }
+            self.drain_once(&dma, None)?;
             if self.stale.is_some() {
                 return Err(XhciError::Busy);
             }
@@ -725,10 +825,8 @@ impl Driver {
 
         let dl = Deadline::new(timeout_ms);
         loop {
-            while let Some(e) = self.next_event(&dma)? {
-                if let Some(done) = self.route(e, Some(at)) {
-                    return Ok(done);
-                }
+            if let Drained::Done(e) = self.drain_once(&dma, Some(at))? {
+                return Ok(e);
             }
             let expired = dl.expired();
             if let Err(e) = self.check_running() {
@@ -765,6 +863,65 @@ mod tests {
             q.push(Event::HostController { code: p });
             assert_eq!(q.pop(), Some(Event::HostController { code: p }));
         }
+    }
+
+    /// A hostile controller that never stops producing events: every drain
+    /// pass returns after `EVENT_TRBS` events, so the caller's deadline and
+    /// hardware checks still run.
+    #[test_case]
+    fn drain_is_bounded_with_endless_events() {
+        let mut q = EventQueue::new();
+        let mut stale = None;
+        let mut produced = 0usize;
+        let r: Result<Drained, ()> = drain(
+            EVENT_TRBS,
+            || {
+                produced += 1;
+                Ok(Some(Event::PortStatusChange { port: produced as u8 }))
+            },
+            |e| route(&mut q, &mut stale, e, Some(0x1000)),
+        );
+        assert_eq!(r, Ok(Drained::Limit));
+        assert_eq!(produced, EVENT_TRBS);
+        assert_eq!(q.len, EVENT_QUEUE_LEN);
+        assert_eq!(q.dropped, (EVENT_TRBS - EVENT_QUEUE_LEN) as u64);
+        // Errors from the source propagate at once.
+        let mut calls = 0;
+        let e: Result<Drained, u8> = drain(EVENT_TRBS, || { calls += 1; Err(7) }, |_| None);
+        assert_eq!((e, calls), (Err(7), 1));
+    }
+
+    /// Port events before the awaited completion are queued in order, a
+    /// stray completion is counted, the stale completion clears `stale`.
+    #[test_case]
+    fn drain_routes_and_queues_events() {
+        let script = [
+            Event::PortStatusChange { port: 1 },
+            Event::CommandCompletion { trb: 0x2000, code: 1, slot: 0 }, // stale
+            Event::CommandCompletion { trb: 0xdead, code: 1, slot: 0 }, // stray
+            Event::Transfer { trb: 0, code: 1, residual: 0, slot: 1, endpoint: 1 },
+            Event::CommandCompletion { trb: 0x3000, code: 1, slot: 0 }, // awaited
+            Event::PortStatusChange { port: 9 },
+        ];
+        let mut q = EventQueue::new();
+        let mut stale = Some(0x2000);
+        let mut i = 0;
+        let mut next = || -> Result<Option<Event>, ()> {
+            let e = script.get(i).copied();
+            i += 1;
+            Ok(e)
+        };
+        let r = drain(EVENT_TRBS, &mut next, |e| route(&mut q, &mut stale, e, Some(0x3000)));
+        assert_eq!(r, Ok(Drained::Done(script[4])));
+        assert_eq!(stale, None);
+        assert_eq!(q.dropped, 1);
+        assert_eq!(q.pop(), Some(script[0]));
+        assert_eq!(q.pop(), Some(script[3]));
+        assert_eq!(q.pop(), None);
+        // The rest stays for the next pass; then the source is empty.
+        let r = drain(EVENT_TRBS, &mut next, |e| route(&mut q, &mut stale, e, None));
+        assert_eq!(r, Ok(Drained::Empty));
+        assert_eq!(q.pop(), Some(script[5]));
     }
 
     #[test_case]
