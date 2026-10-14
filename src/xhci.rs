@@ -61,8 +61,15 @@
 //! keyboard's port stops the keyboard for good (no re-arm, no panic, no
 //! wipe: ledger Task 13); its held keys are released first
 //! ([`KeyboardState::release_all`]), so no modifier stays set in the shared
-//! consumers. Port changes on other ports and controller loss are left to
-//! Task 23.
+//! consumers.
+//!
+//! **Wipe triggers** (spec §7.1 step 8, §7.2, Task 23): [`arm_stick_watch`]
+//! arms the watch on the boot stick's root port; from then on every
+//! [`poll_tick`] first reads USBSTS and that port's PORTSC lock-free and
+//! decides with `l_core::xhci_ctx::watch_verdict`: HCE, HSE, HCH or
+//! all-ones ⇒ `Trigger::ControllerLost`, CCS=0 or CSC=1 on the stick port
+//! ⇒ `Trigger::StickRemoved`, at the first reading (no debounce). Keyboard
+//! port changes never trigger; other ports' new connections are counted.
 //!
 //! **Byte budget:** one report yields at most 40 set-1 bytes
 //! (`KeyboardState::MAX_BYTES_PER_REPORT`), so one tick can feed at most
@@ -516,6 +523,20 @@ static POLLING: AtomicBool = AtomicBool::new(false);
 static KBD_REPORTS: AtomicU64 = AtomicU64::new(0);
 /// The started keyboard was stopped (transfer error, disconnect).
 static KBD_LOST: AtomicBool = AtomicBool::new(false);
+/// Root port of the boot stick that [`poll_tick`] watches (0 = not armed).
+/// Set once by [`arm_stick_watch`] (spec §7.1 step 8), never cleared or
+/// changed: there is no disarm.
+static WATCH_PORT: AtomicU8 = AtomicU8::new(0);
+/// The watch called [`crate::wipe::trigger`] (at most once; see [`fire`]).
+static WATCH_FIRED: AtomicBool = AtomicBool::new(false);
+/// Port Status Change events on ports other than the stick's and the
+/// keyboard's that read as a new connection (spec §7.2: counted, ignored).
+static NEW_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+/// Feature `test-hooks` only: the lock-free register reads ([`op_read`]:
+/// [`usbsts`], [`usbcmd`], [`portsc_unlocked`]) return all-ones, as if the
+/// controller had left the bus ([`simulate_read_all_ones`]).
+#[cfg(feature = "test-hooks")]
+static SIM_ALL_ONES: AtomicBool = AtomicBool::new(false);
 
 /// Volatile 32-bit read of a register through the lock-free mirror.
 ///
@@ -523,6 +544,10 @@ static KBD_LOST: AtomicBool = AtomicBool::new(false);
 /// `op` must be the value published in [`OP_VIRT`] and `off` one of
 /// `USBCMD`/`USBSTS` (checked inside the BAR mapping by `probe`).
 unsafe fn op_read(op: u64, off: u64) -> u32 {
+    #[cfg(feature = "test-hooks")]
+    if SIM_ALL_ONES.load(Ordering::Acquire) {
+        return ALL_ONES;
+    }
     // SAFETY: caller contract: `op + off` lies in the uncached window
     // mapping of BAR0, which is never unmapped, and is 4-byte aligned.
     unsafe { core::ptr::read_volatile((op + off) as *const u32) }
@@ -1870,17 +1895,29 @@ pub fn keyboard_lost() -> bool {
 }
 
 /// Timer-ISR polling (spec §7.2; called after EOI, before `sched::on_tick`,
-/// with IF=0). Returns at once (0) before [`enable_polling`], once a wipe
-/// has started, if the driver lock is held (a boot-phase call is waiting:
-/// skip this tick, never spin) or the controller is not running. Otherwise
-/// handles at most [`POLL_EVENTS_MAX`] events: keyboard completions are
-/// decoded and fed to [`crate::input::feed`] and re-armed, a change on the
-/// keyboard's port is checked. Returns the number of events handled.
+/// with IF=0). Returns at once (0) before [`enable_polling`] and once a
+/// wipe has started. Then, once armed ([`arm_stick_watch`]), the stick
+/// watch runs **lock-free** ([`watch_check`]: USBSTS and the stick port's
+/// PORTSC through the [`OP_VIRT`] mirror): a lost stick or controller calls
+/// [`crate::wipe::trigger`] right here, at the first observation. Only then
+/// the driver lock is tried: if it is held (a boot-phase call is waiting)
+/// the event part of this tick is skipped, never spun on; the watch above
+/// already ran, so a held lock cannot delay a removal wipe. Otherwise at
+/// most [`POLL_EVENTS_MAX`] events are handled: keyboard completions are
+/// decoded, fed to [`crate::input::feed`] and re-armed, a change on the
+/// keyboard's port stops the keyboard (never a wipe), a change on the
+/// stick's port re-runs the watch on the port's level after the lock is
+/// released, other ports' new connections are counted. Returns the number
+/// of events handled.
 pub fn poll_tick() -> usize {
     if !POLLING.load(Ordering::Acquire) || crate::wipe::wiping() {
         return 0;
     }
-    let (n, fed) = {
+    if let Some(t) = watch_check() {
+        fire(t);
+        return 0;
+    }
+    let (n, fed, stick_event) = {
         let Some(mut g) = DRIVER.try_lock() else { return 0 };
         match g.as_mut() {
             Some(d) if d.started => d.poll(POLL_EVENTS_MAX),
@@ -1892,7 +1929,116 @@ pub fn poll_tick() -> usize {
         // held with interrupts off, so taking it here cannot deadlock.
         crate::sched::wake_keyboard();
     }
+    if stick_event {
+        // The event only says "look": the level decides (ledger Task 22).
+        if let Some(t) = watch_check() {
+            fire(t);
+        }
+    }
     n
+}
+
+/// Arm the stick watch (spec §7.1 step 8; called by
+/// [`crate::usb::arm_stick_watch`] once the boot stick on root port `port`
+/// is identified and sealed): remember `port`, let the timer ISR poll
+/// ([`enable_polling`]), then read USBSTS and the port's PORTSC once right
+/// here, which closes the window between the identification and the first
+/// ISR poll: a stick already gone (or pulled and replugged, CSC=1) or a lost
+/// controller triggers the wipe now. Before this nothing on the USB path
+/// triggers a wipe (spec E8). Never disarmed; arming again with the same
+/// port is a no-op `Ok`, with another port `Err(BadPort)`. Lock-free.
+pub fn arm_stick_watch(port: u8) -> Result<(), XhciError> {
+    if OP_VIRT.load(Ordering::Acquire) == 0 {
+        return Err(XhciError::NotInitialized);
+    }
+    if port == 0 || port > MAX_PORTS.load(Ordering::Acquire) {
+        return Err(XhciError::BadPort);
+    }
+    match WATCH_PORT.compare_exchange(0, port, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {}
+        Err(p) if p == port => return Ok(()),
+        Err(_) => return Err(XhciError::BadPort),
+    }
+    enable_polling();
+    if let Some(t) = watch_check() {
+        fire(t);
+    }
+    Ok(())
+}
+
+/// The armed stick port ([`arm_stick_watch`]), lock-free.
+pub fn watched_port() -> Option<u8> {
+    match WATCH_PORT.load(Ordering::Acquire) {
+        0 => None,
+        p => Some(p),
+    }
+}
+
+/// The stick watch has called [`crate::wipe::trigger`] (lock-free).
+pub fn watch_fired() -> bool {
+    WATCH_FIRED.load(Ordering::Acquire)
+}
+
+/// New connections seen on ports other than the stick's and the
+/// keyboard's (spec §7.2: counted, otherwise ignored; no hotplug
+/// enumeration). Their change bits are not acknowledged, so a port reports
+/// at most one such event until something acknowledges it: a lower bound.
+pub fn new_connections() -> u64 {
+    NEW_CONNECTIONS.load(Ordering::Acquire)
+}
+
+/// The watch decision for the current register values, lock-free and
+/// allocation-free (ISR-safe): `None` while not armed, else
+/// [`ctx::watch_verdict`] of USBSTS and the stick port's PORTSC, read
+/// through the [`OP_VIRT`] mirror. Reading these registers has no side
+/// effect, so racing a locked driver access (boot phase) is harmless.
+fn watch_check() -> Option<l_core::wipe::Trigger> {
+    let port = WATCH_PORT.load(Ordering::Acquire);
+    if port == 0 {
+        return None;
+    }
+    // Armed implies a published mapping and a valid port (checked by
+    // `arm_stick_watch`); both reads are `Some`. Fail closed anyway.
+    let sts = usbsts().unwrap_or(ALL_ONES);
+    let ps = portsc_unlocked(port).unwrap_or(PortSc(ALL_ONES));
+    ctx::watch_verdict(sts, ps)
+}
+
+/// Start the wipe for `t`, at most once from the watch. In a production
+/// build [`crate::wipe::trigger`] never returns (it also ignores a second
+/// trigger itself); with `test-hooks` it only counts, and the latch keeps a
+/// lasting condition (a stick that stays gone) from counting every tick.
+fn fire(t: l_core::wipe::Trigger) {
+    if WATCH_FIRED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::wipe::trigger(t);
+}
+
+/// Feature `test-hooks` only: make the lock-free register reads (USBSTS,
+/// USBCMD, the watch's PORTSC) return all-ones, as a controller gone from
+/// the bus does, until called with `false`. The locked driver path keeps
+/// reading the real registers.
+#[cfg(feature = "test-hooks")]
+pub fn simulate_read_all_ones(on: bool) {
+    SIM_ALL_ONES.store(on, Ordering::Release);
+}
+
+/// Feature `test-hooks` only: let the watch fire again (reopen the latch
+/// of [`fire`]), so one test kernel can check several trigger conditions.
+#[cfg(feature = "test-hooks")]
+pub fn reopen_watch_latch() {
+    WATCH_FIRED.store(false, Ordering::Release);
+}
+
+/// Feature `test-hooks` only: queue a Port Status Change event for `port`,
+/// handled by the next [`poll_tick`] like one from the event ring (the
+/// handler reads the port's real PORTSC). Takes the lock: thread context.
+#[cfg(feature = "test-hooks")]
+pub fn simulate_port_event(port: u8) {
+    if let Some(d) = DRIVER.lock().as_mut() {
+        d.queue.push(Event::PortStatusChange { port });
+    }
 }
 
 impl Driver {
@@ -1932,14 +2078,16 @@ impl Driver {
     }
 
     /// Up to `max` events: queued ones first, then the event ring. Returns
-    /// the number handled and whether bytes were fed to the input queue.
-    fn poll(&mut self, max: usize) -> (usize, bool) {
-        let Some(dma) = self.dma else { return (0, false) };
-        // Halted or broken: nothing to poll (controller loss is Task 23's).
+    /// the number handled, whether bytes were fed to the input queue and
+    /// whether an event named the watched stick port.
+    fn poll(&mut self, max: usize) -> (usize, bool, bool) {
+        let Some(dma) = self.dma else { return (0, false, false) };
+        // Halted or broken: nothing to poll (the lock-free watch in
+        // `poll_tick` already decided whether that is a controller loss).
         if self.check_running().is_err() {
-            return (0, false);
+            return (0, false, false);
         }
-        let (mut n, mut fed) = (0, false);
+        let (mut n, mut fed, mut stick) = (0, false, false);
         while n < max {
             let e = match self.queue.pop() {
                 Some(e) => e,
@@ -1953,14 +2101,41 @@ impl Driver {
                 Event::Transfer { trb, code, residual, slot, endpoint } => {
                     fed |= self.kbd_transfer(trb, code, residual, slot, endpoint);
                 }
-                Event::PortStatusChange { port } => fed |= self.kbd_port_change(port),
+                Event::PortStatusChange { port } => {
+                    let watched = WATCH_PORT.load(Ordering::Acquire);
+                    if watched != 0 && port == watched {
+                        // Never acknowledged: CSC stays as evidence and the
+                        // level is classified by `poll_tick` after the lock.
+                        stick = true;
+                    } else if self.kbd.is_some_and(|k| k.port == port) {
+                        fed |= self.kbd_port_change(port);
+                    } else {
+                        self.other_port_change(port);
+                    }
+                }
                 Event::CommandCompletion { trb, .. } if Some(trb) == self.stale => self.stale = None,
                 Event::CommandCompletion { .. } => self.queue.dropped = self.queue.dropped.saturating_add(1),
-                // Host controller events: USBSTS is Task 23's.
+                // A Host Controller Event (e.g. event ring full) is no loss
+                // by itself; HCE/HSE/HCH in USBSTS are checked by the watch.
                 Event::HostController { .. } | Event::Other(_) => {}
             }
         }
-        (n, fed)
+        (n, fed, stick)
+    }
+
+    /// Port Status Change on a port that is neither the watched stick's
+    /// nor the keyboard's (spec §7.2): a new connection is counted
+    /// ([`new_connections`]) and otherwise ignored (no hotplug
+    /// enumeration). Nothing is written: the change bits are not
+    /// acknowledged, so before the arming the stick's own port (not yet
+    /// known here) keeps its CSC for [`arm_stick_watch`]'s check, and no
+    /// PORTSC but the keyboard's is ever written from the ISR.
+    fn other_port_change(&mut self, port: u8) {
+        let Ok(off) = self.port_off(port) else { return };
+        let Ok(v) = self.read_port(off) else { return };
+        if let PortChange::Connected(_) = ctx::classify(false, v) {
+            NEW_CONNECTIONS.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// One transfer event. Only a completion of a TD we queued on the
@@ -2030,8 +2205,8 @@ impl Driver {
     /// disconnect, or a new connection (the configured device must have
     /// left in between; no hotplug enumeration, spec §2), stops the keyboard
     /// and nothing else (no wipe, ledger Task 13). Its change bits are
-    /// acknowledged without writing PED. Other ports (the stick's) and an
-    /// all-ones PORTSC are left to Task 23. Returns whether break codes
+    /// acknowledged without writing PED. The stick's port and an all-ones
+    /// PORTSC are the watch's ([`poll_tick`]). Returns whether break codes
     /// were fed ([`stop_keyboard`]).
     fn kbd_port_change(&mut self, port: u8) -> bool {
         let Some(mut kbd) = self.kbd.filter(|k| k.port == port) else { return false };

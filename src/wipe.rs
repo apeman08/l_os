@@ -829,7 +829,10 @@ impl StageOps for Real {
 }
 
 /// Start the wipe (spec §8). Called from interrupt context (the hotkey in the
-/// keyboard ISR; later stick removal and controller loss in the timer ISR).
+/// keyboard ISR or the USB keyboard path of the timer ISR; stick removal and
+/// controller loss in the timer ISR, `xhci::poll_tick`), or once from thread
+/// context by the arming check (`xhci::arm_stick_watch`; interrupts are
+/// disabled first thing here).
 /// Never returns. If a wipe is already running (only reachable from an
 /// exception inside the wipe), the caller is parked in `cli; hlt`.
 #[cfg(not(any(test, feature = "test-hooks")))]
@@ -872,12 +875,22 @@ pub fn trigger(t: Trigger) -> ! {
 
 /// Test builds: count instead of wiping (spec §5, feature `test-hooks`).
 #[cfg(any(test, feature = "test-hooks"))]
-pub fn trigger(_t: Trigger) {
+pub fn trigger(t: Trigger) {
+    HOOK_LAST.store(t as u8, Ordering::SeqCst);
     HOOK_COUNT.fetch_add(1, Ordering::SeqCst);
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 static HOOK_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// `Trigger as u8` of the last [`trigger`] call; `u8::MAX` = none yet.
+#[cfg(any(test, feature = "test-hooks"))]
+static HOOK_LAST: AtomicU8 = AtomicU8::new(u8::MAX);
+
+/// The kind of the last [`trigger`] call (test builds only).
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn test_hook_last() -> Option<Trigger> {
+    Trigger::from_u8(HOOK_LAST.load(Ordering::SeqCst))
+}
 
 /// How often [`trigger`] was called (test builds only).
 #[cfg(any(test, feature = "test-hooks"))]

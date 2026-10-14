@@ -8,7 +8,7 @@ key goes to PS/2), waits for the QMP SHUTDOWN event and then inspects the
 guest: an ELF core from `dump-guest-memory`, a `screendump` and the serial log.
 
 Checks (all are evaluated, every failure is listed):
-  wipe_report_present        exactly one WIPE-REPORT line, trigger=hotkey, plan
+  wipe_report_present        exactly one WIPE-REPORT line, trigger=<--trigger>, plan
                              ready (`wipe-test: armed` seen), total_us > 0, all
                              stage times present and non-decreasing, and
                              sum(usable) <= bytes <= 2*sum(usable). The degraded
@@ -155,12 +155,16 @@ def parse_serial(text):
     reports = [l.strip() for l in text.splitlines() if "WIPE-REPORT" in l]
     return usable, slot, reports
 
-def check_report(reports, armed, usable):
+# --trigger value -> WIPE-REPORT trigger= value (l_core::wipe::Trigger::as_str;
+# "controller" = ControllerLost has no QEMU trigger here).
+REPORT_TRIGGER = {"hotkey": "hotkey", "unplug": "unplug"}
+
+def check_report(reports, armed, usable, want="hotkey"):
     """Returns (ok, message, fields)."""
     if len(reports) != 1: return False, f"{len(reports)} WIPE-REPORT lines (want exactly 1)", {}
     line = reports[0]
     f = dict(re.findall(r"(\w+)=(\S+)", line))
-    if f.get("trigger") != "hotkey": return False, f"trigger is {f.get('trigger')!r}: {line}", f
+    if f.get("trigger") != want: return False, f"trigger is {f.get('trigger')!r} (want {want!r}): {line}", f
     if not armed: return False, "no 'wipe-test: armed' marker (degraded wipe): " + line, f
     try: v = {k: int(f[k]) for k in REPORT_KEYS}
     except (KeyError, ValueError): return False, "report lacks numeric stage fields: " + line, f
@@ -266,7 +270,7 @@ def run(args, tmp):
                    f"SHUTDOWN reasons {reasons}, RESET events {len(resets)}")
         sert = serial_text(serial)
         _, _, reports = parse_serial(sert)
-        ok, msg, fields = check_report(reports, armed, usable)
+        ok, msg, fields = check_report(reports, armed, usable, REPORT_TRIGGER[args.trigger])
         result("wipe_report_present", ok, msg)
 
         have_dump = False

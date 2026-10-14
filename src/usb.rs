@@ -37,9 +37,12 @@
 //! [`keyboard_present`], [`keyboard_reports`]) are atomics, readable
 //! without a lock.
 //!
-//! **Keyboard** (Task 22): [`start_keyboard`] ends the boot phase: it starts
-//! the boot keyboard's interrupt-IN reports and the timer-ISR polling
-//! ([`xhci::poll_tick`]).
+//! **Keyboard** (Task 22): [`start_keyboard`] starts the boot keyboard's
+//! interrupt-IN reports and the timer-ISR polling ([`xhci::poll_tick`]).
+//!
+//! **Arming** (Task 23): [`arm_stick_watch`] ends the boot phase: once the
+//! stick is identified and sealed, its removal or the loss of the
+//! controller wipes (spec §7.1 step 8, §7.2).
 
 use crate::xhci::{self, PortReady, XhciError};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -544,6 +547,38 @@ pub fn start_keyboard() -> Result<(), UsbError> {
     };
     xhci::enable_polling();
     r
+}
+
+/// Why [`arm_stick_watch`] did not arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchError {
+    /// No boot stick was identified (E8: nothing to watch, no wipe on the
+    /// USB path; the hotkey stays armed).
+    NoStick,
+    /// The stick is identified but the storage path is not sealed yet.
+    NotSealed,
+    Xhci(XhciError),
+}
+
+/// Spec §7.1 step 8, "scharf schalten" (M2 Task 23): only once the boot
+/// stick is identified **and** sealed ([`stick_sealed`], [`xhci::bulk_sealed`])
+/// the xHCI watch is armed on its root port ([`xhci::arm_stick_watch`]):
+/// the timer ISR polls, and the port is read once right away. From then on
+/// the stick leaving its port (CCS=0, or CSC=1) wipes with
+/// `Trigger::StickRemoved`, a lost, failed or halted controller with
+/// `Trigger::ControllerLost`, both at the first observation. A stick
+/// already gone at this check wipes too: it was identified, so this is
+/// after "Erkennung" (E8); with no user state yet, the wipe amounts to
+/// blanking and powering off. Without an identified stick nothing is armed
+/// (E8). Idempotent; returns the watched port. Production calls it in
+/// `src/main.rs` after [`start_keyboard`].
+pub fn arm_stick_watch() -> Result<u8, WatchError> {
+    let port = stick_port().ok_or(WatchError::NoStick)?;
+    if !stick_sealed() || !xhci::bulk_sealed() {
+        return Err(WatchError::NotSealed);
+    }
+    xhci::arm_stick_watch(port).map_err(WatchError::Xhci)?;
+    Ok(port)
 }
 
 /// Does `sector` (LBA 0 of a device) carry the marker of boot id `id`?

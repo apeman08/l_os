@@ -55,6 +55,14 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
             Ok(()) | Err(l_os::usb::UsbError::NoKeyboard) => {}
             Err(e) => l_os::println!("usb: tastatur nicht gestartet ({:?})", e),
         }
+        // Spec §7.1 step 8: only an identified and sealed stick arms the
+        // removal/controller-loss wipe (the real `wipe::trigger` in this
+        // build); without one the system runs "amnesisch: nein" (E8).
+        if let Err(e) = l_os::usb::arm_stick_watch() {
+            if e != l_os::usb::WatchError::NoStick {
+                l_os::println!("usb: abzieh-wipe nicht scharf ({:?})", e);
+            }
+        }
     }
 
     // Aurora chrome (status bar, hint bar) with its boot fade-in, before the

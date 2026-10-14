@@ -212,6 +212,46 @@ pub fn classify(was_connected: bool, now: PortSc) -> PortChange {
     PortChange::Nothing
 }
 
+/// USBSTS HCHalted (section 5.4.2).
+pub const USBSTS_HCH: u32 = 1;
+/// USBSTS Host System Error.
+pub const USBSTS_HSE: u32 = 1 << 2;
+/// USBSTS Host Controller Error.
+pub const USBSTS_HCE: u32 = 1 << 12;
+/// What USBSTS reads when the controller is gone from the bus.
+pub const USBSTS_ALL_ONES: u32 = 0xFFFF_FFFF;
+
+/// The wipe decision of the armed stick watch (spec §7.1 step 8, §7.2;
+/// M2 Task 23) for one reading of `USBSTS` and of the boot stick's PORTSC.
+/// Pure and total: every pair of values is classified, nothing panics.
+///
+/// * Controller first (fail-closed: whoever can no longer observe the stick
+///   wipes): `USBSTS` all-ones, `HCE`, `HSE`, or `HCH` (the watch only runs
+///   while the controller must be running; only the wipe itself halts it),
+///   or a PORTSC of all-ones ([`PortChange::ControllerGone`]) ⇒
+///   `ControllerLost`.
+/// * Then the stick's port, classified by its **level** with
+///   [`classify`]`(true, now)` (the driver's view: the stick was connected),
+///   because a Port Status Change event only fires on a 0→1 change-bit
+///   transition (ledger Task 22): CCS=0 ([`PortChange::Disconnected`]) ⇒
+///   `StickRemoved`. So is CSC=1 with CCS=1 (`Connected`, or `Nothing`/
+///   `ResetDone` for an unknown speed): the stick's change bits were
+///   acknowledged at enumeration and are never acknowledged again, so a set
+///   CSC means the identified stick lost its connection in between (pulled
+///   and plugged back, or replaced) ⇒ `StickRemoved`.
+/// * No debounce: the first reading decides.
+pub fn watch_verdict(usbsts: u32, stick: PortSc) -> Option<crate::wipe::Trigger> {
+    use crate::wipe::Trigger;
+    if usbsts == USBSTS_ALL_ONES || usbsts & (USBSTS_HCH | USBSTS_HSE | USBSTS_HCE) != 0 {
+        return Some(Trigger::ControllerLost);
+    }
+    match classify(true, stick) {
+        PortChange::ControllerGone => Some(Trigger::ControllerLost),
+        PortChange::Disconnected | PortChange::Connected(_) => Some(Trigger::StickRemoved),
+        PortChange::ResetDone | PortChange::Nothing => stick.csc().then_some(Trigger::StickRemoved),
+    }
+}
+
 /// Device Context Index of an endpoint address (section 4.5.1): EP0 is 1,
 /// otherwise `number * 2 + direction` (IN = 1).
 pub fn dci(endpoint_address: u8) -> u8 {
@@ -544,6 +584,66 @@ mod tests {
         assert_eq!(d[0], 0b1100);
         assert_eq!(d[1], 0b101);
         assert_eq!(&d[2..], &[0; 6]);
+    }
+
+    /// Real values: the stick's port after enumeration (Task 20) and after
+    /// QMP `device_del` (spike note), USBSTS of a running controller.
+    const STICK_UP: u32 = 0x1203;
+    const STICK_GONE: u32 = 0x0002_02a0;
+    const STS_RUN: u32 = 0x0000_0000;
+
+    #[test]
+    fn watch_running_controller_and_present_stick_is_quiet() {
+        assert_eq!(watch_verdict(STS_RUN, PortSc(STICK_UP)), None);
+        // Event/status bits that are no loss: EINT, PCD, SSS/RSS, a link or
+        // over-current change, a finished warm reset on the stick's port.
+        for sts in [1 << 3, 1 << 4, 1 << 8, 1 << 9] {
+            assert_eq!(watch_verdict(sts, PortSc(STICK_UP)), None, "usbsts {sts:#x}");
+        }
+        for extra in [PEC, WRC, OCC, PLC, CEC] {
+            assert_eq!(watch_verdict(STS_RUN, PortSc(STICK_UP | extra)), None, "portsc bit {extra:#x}");
+        }
+        assert_eq!(watch_verdict(STS_RUN, PortSc(STICK_UP | PRC)), None, "reset done, still connected");
+    }
+
+    #[test]
+    fn watch_stick_disconnect_is_stick_removed_at_first_reading() {
+        use crate::wipe::Trigger;
+        // The device_del value (CCS=0, CSC=1) and the level alone (CCS=0
+        // with CSC already set earlier or acked): no debounce, one reading.
+        assert_eq!(watch_verdict(STS_RUN, PortSc(STICK_GONE)), Some(Trigger::StickRemoved));
+        assert_eq!(watch_verdict(STS_RUN, PortSc(STICK_GONE & !CSC)), Some(Trigger::StickRemoved));
+        assert_eq!(watch_verdict(STS_RUN, PortSc(0)), Some(Trigger::StickRemoved));
+        // Pulled and plugged back (or another device) between two readings:
+        // CCS=1 with CSC=1, whatever the speed field says.
+        assert_eq!(watch_verdict(STS_RUN, PortSc(STICK_UP | CSC)), Some(Trigger::StickRemoved));
+        assert_eq!(watch_verdict(STS_RUN, PortSc((STICK_UP & !(0xF << 10)) | CSC)), Some(Trigger::StickRemoved), "unknown PSI");
+        assert_eq!(watch_verdict(STS_RUN, PortSc(STICK_UP | CSC | PRC)), Some(Trigger::StickRemoved), "reset done + CSC");
+    }
+
+    #[test]
+    fn watch_controller_loss_wins_and_is_fail_closed() {
+        use crate::wipe::Trigger;
+        let lost = Some(Trigger::ControllerLost);
+        assert_eq!(watch_verdict(USBSTS_ALL_ONES, PortSc(STICK_UP)), lost, "USBSTS all-ones");
+        assert_eq!(watch_verdict(STS_RUN, PortSc(u32::MAX)), lost, "PORTSC all-ones");
+        for bit in [USBSTS_HCH, USBSTS_HSE, USBSTS_HCE] {
+            assert_eq!(watch_verdict(bit, PortSc(STICK_UP)), lost, "usbsts {bit:#x}");
+            // Controller first: a gone stick on a dead controller is still
+            // reported as controller loss (same wipe either way).
+            assert_eq!(watch_verdict(bit, PortSc(STICK_GONE)), lost);
+        }
+        assert_eq!(USBSTS_HCH, 1);
+        assert_eq!(USBSTS_HSE, 1 << 2);
+        assert_eq!(USBSTS_HCE, 1 << 12);
+        // Every value is classified without panicking (hostile hardware).
+        let mut x = 0x1234_5678u32;
+        for _ in 0..10_000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let _ = watch_verdict(x, PortSc(x.rotate_left(7)));
+        }
     }
 
     #[test]

@@ -2,13 +2,27 @@
 
 /// What started the wipe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Trigger {
+    /// The boot stick left its root port (spec §7.2; `trigger=unplug`).
     StickRemoved,
+    /// Ctrl+Alt+Backspace (spec E6).
     Hotkey,
+    /// The xHCI controller is gone, failed or stopped while the stick is
+    /// watched (spec §7.2, fail-closed; `trigger=controller`).
     ControllerLost,
 }
 
 impl Trigger {
+    /// Every kind, in `repr(u8)` order.
+    pub const ALL: [Trigger; 3] = [Trigger::StickRemoved, Trigger::Hotkey, Trigger::ControllerLost];
+
+    /// Inverse of `t as u8`; `None` for any other value.
+    pub fn from_u8(v: u8) -> Option<Trigger> {
+        Trigger::ALL.get(usize::from(v)).copied()
+    }
+
+    /// The `trigger=` value of the `WIPE-REPORT` line (one `\w+` token).
     pub fn as_str(&self) -> &'static str {
         match self {
             Trigger::StickRemoved => "unplug",
@@ -201,6 +215,29 @@ mod tests {
         assert_eq!(Trigger::StickRemoved.as_str(), "unplug");
         assert_eq!(Trigger::Hotkey.as_str(), "hotkey");
         assert_eq!(Trigger::ControllerLost.as_str(), "controller");
+    }
+
+    /// Task 23: the WIPE-REPORT `trigger=` value is one `\w+` token per
+    /// kind (scripts/qemu_wipe_test.py parses `(\w+)=(\S+)`), all distinct;
+    /// the u8 code round-trips (test-hooks records the last kind in an atomic).
+    #[test]
+    fn trigger_names_are_distinct_report_tokens_and_codes_roundtrip() {
+        for (i, t) in Trigger::ALL.iter().enumerate() {
+            let s = t.as_str();
+            assert!(!s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'), "{s}");
+            for u in &Trigger::ALL[i + 1..] {
+                assert_ne!(s, u.as_str());
+            }
+            assert_eq!(Trigger::from_u8(*t as u8), Some(*t));
+        }
+        assert_eq!(Trigger::ALL.len(), 3);
+        assert_eq!(Trigger::from_u8(3), None);
+        assert_eq!(Trigger::from_u8(255), None);
+        let mut w = WipeState::new();
+        assert!(w.trigger(Trigger::ControllerLost));
+        assert!(!w.trigger(Trigger::StickRemoved));
+        assert!(!w.trigger(Trigger::Hotkey));
+        assert_eq!(w.trigger_kind(), Some(Trigger::ControllerLost));
     }
 
     #[test]

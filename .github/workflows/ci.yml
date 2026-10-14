@@ -41,5 +41,8 @@ jobs:
       - name: USB smoke (xHCI, boot stick, USB keyboard typing into the shell via QMP send-key, keyboard unplug)
         run: python3 -I scripts/qemu_usb_smoke.py
 
+      - name: USB wipe triggers (stick watch and controller loss; test-hooks build counts instead of wiping)
+        run: cargo test --features test-hooks --test usb_wipe_hooks
+
       - name: Network and TLS tests (host test servers, QEMU packet capture)
         run: scripts/net_tests.sh

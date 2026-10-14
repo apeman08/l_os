@@ -35,6 +35,11 @@ name = "usb_keyboard"
 harness = true
 
 [[test]]
+name = "usb_wipe_hooks"
+harness = true
+required-features = ["test-hooks"]
+
+[[test]]
 name = "usermode"
 harness = true
 
