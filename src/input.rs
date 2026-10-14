@@ -4,7 +4,15 @@
 //! interrupt context with IF=0: the PS/2 keyboard ISR today, the timer ISR
 //! (USB HID keyboard, M2 Task 22) later. Both run on the single CPU with
 //! interrupts off, so they never run at the same time and the queue keeps its
-//! single-producer contract. The only consumer is the shell's `read_key`
+//! single-producer contract. Interleaving caveat: each producer feeds its
+//! bytes of one event in one ISR run, but a PS/2 key with an `E0` prefix
+//! arrives as two IRQs, so USB bytes fed by a timer tick in between can
+//! split it (and the shared hotkey detector sees the mixed stream). Typing
+//! on both keyboards at the same moment can thus misdecode one key; with
+//! one keyboard in use (the normal case) the streams never mix. The USB
+//! path can feed up to 640 bytes per tick (see `crate::xhci`); what does
+//! not fit into [`QUEUE_CAPACITY`] is dropped and counted.
+//! The only consumer is the shell's `read_key`
 //! path. Producers do no formatting, locking or decoding beyond the hotkey
 //! detector (spec E6). Uses atomics only (no `unsafe`, no allocation).
 

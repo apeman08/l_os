@@ -18,8 +18,11 @@ Checks:
   stick_read_count_constant_after_seal   `security` shows the stick sealed;
                                          its read count is the same before and
                                          after `run hello` and `run hello_rs`
-  keyboard_unplug_does_not_wipe          QMP device_del kbd0; then typing (now
-                                         PS/2) still reaches the shell,
+  keyboard_unplug_does_not_wipe          QMP device_del kbd0 while Ctrl is held
+                                         on it; then typing (now PS/2) still
+                                         reaches the shell, a PS/2
+                                         Alt+Backspace does not wipe (no
+                                         stuck Ctrl),
                                          `security` says "usb: tastatur nein",
                                          and there is no SHUTDOWN event
 
@@ -88,9 +91,10 @@ def run(sm, wt, tmp):
         qmp = wt.Qmp(sock)
 
         def lines():
-            return [r.rstrip() for r in sm.render(open(serial, "rb").read())]
+            with open(serial, "rb") as fh:
+                return [r.rstrip() for r in sm.render(fh.read())]
 
-        def wait_for(pred, timeout, what):
+        def wait_for(pred, timeout):
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 if q.poll() is not None: raise Infra("QEMU exited")
@@ -115,9 +119,9 @@ def run(sm, wt, tmp):
                     m = re.search(want, r)
                     if m: return m
                 return None
-            return wait_for(pred, timeout, cmd)
+            return wait_for(pred, timeout)
 
-        if not wait_for(lambda ls: any("l_os>" in r for r in ls), 180, "prompt"):
+        if not wait_for(lambda ls: any("l_os>" in r for r in ls), 180):
             raise Infra("no shell prompt on the serial console:\n" + "\n".join(lines()[-20:]))
         boot = "\n".join(lines())
         for want in ("tastatur", "usb: boot-stick an port"):
@@ -153,28 +157,45 @@ def run(sm, wt, tmp):
                    f"last lines: {lines()[-8:]}")
         reports_before_unplug = int(after.group(4)) if after else None
 
-        # keyboard_unplug_does_not_wipe
+        # keyboard_unplug_does_not_wipe. Left Ctrl is held down on the USB
+        # keyboard while it is unplugged: the kernel must emit its release,
+        # or the shared hotkey detector keeps Ctrl set and a later PS/2
+        # Alt+Backspace wipes. (The shell decodes with HandleControl::Ignore,
+        # so a stuck Ctrl does not change letters; the hotkey is what shows
+        # it.) input-send-event without `device` goes to the active keyboard
+        # (usb-kbd); no up event is ever sent.
+        qmp.cmd("input-send-event", events=[{"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "ctrl"}}}])
+        time.sleep(1)
         qmp.cmd("device_del", id="kbd0")
-        if qmp.wait_event("DEVICE_DELETED", 10) is None:
-            raise Infra("no DEVICE_DELETED event for kbd0")
+        deadline = time.monotonic() + 10
+        while not any(n == "DEVICE_DELETED" and d.get("device") == "kbd0" for _, n, d in qmp.events):
+            if time.monotonic() > deadline:
+                raise Infra("no DEVICE_DELETED event for kbd0")
+            qmp.wait_event("__none__", 0.5)  # only pumps events into qmp.events
         time.sleep(1)
         ps2 = command("echo ps2ok0815", r"^ps2ok0815$")
-        sec2 = command("security", r"usb: tastatur (ja|nein), stick: (\w+), stick-lesezugriffe (\d+), tastatur-berichte (\d+)")
-        time.sleep(1)
-        sec3 = command("security", r"usb: tastatur (ja|nein), stick: (\w+), stick-lesezugriffe (\d+), tastatur-berichte (\d+)")
-        time.sleep(1)
-        shutdowns = [n for _, n, _ in qmp.events if n in ("SHUTDOWN", "RESET")]
-        panic = any("PANIC" in r or "panicked" in r for r in lines())
-        # Typed through PS/2 now: no USB report arrives between the two
-        # `security` outputs. (The count right before the unplug may still
-        # grow by the release report of the last USB-typed Enter.)
-        ok = (bool(ps2) and bool(sec2) and bool(sec3) and sec2.group(1) == "nein" and sec3.group(1) == "nein"
-              and sec2.group(4) == sec3.group(4) and not shutdowns and not panic)
-        result("keyboard_unplug_does_not_wipe", ok,
-               f"PS/2 echo {'seen' if ps2 else 'missing'}, tastatur {sec2.group(1) if sec2 else '?'}, "
-               f"berichte {sec2.group(4) if sec2 else '?'} -> {sec3.group(4) if sec3 else '?'} "
-               f"(before unplug {reports_before_unplug}), SHUTDOWN/RESET events {shutdowns}, panic {panic}")
-        if q.poll() is not None:
+        # Alt+Backspace via PS/2: harmless unless Ctrl is stuck.
+        qmp.cmd("send-key", keys=[{"type": "qcode", "data": k} for k in ("alt", "backspace")], **{"hold-time": 60})
+        stuck = qmp.wait_event("SHUTDOWN", 5) is not None
+        if stuck:
+            result("keyboard_unplug_does_not_wipe", False, "PS/2 Alt+Backspace wiped: Ctrl stuck from the unplugged USB keyboard")
+        else:
+            sec2 = command("security", r"usb: tastatur (ja|nein), stick: (\w+), stick-lesezugriffe (\d+), tastatur-berichte (\d+)")
+            time.sleep(1)
+            sec3 = command("security", r"usb: tastatur (ja|nein), stick: (\w+), stick-lesezugriffe (\d+), tastatur-berichte (\d+)")
+            time.sleep(1)
+            shutdowns = [n for _, n, _ in qmp.events if n in ("SHUTDOWN", "RESET")]
+            panic = any("PANIC" in r or "panicked" in r for r in lines())
+            # Typed through PS/2 now: no USB report arrives between the two
+            # `security` outputs. (The count right before the unplug may still
+            # grow by the release report of the last USB-typed Enter.)
+            ok = (bool(ps2) and bool(sec2) and bool(sec3) and sec2.group(1) == "nein" and sec3.group(1) == "nein"
+                  and sec2.group(4) == sec3.group(4) and not shutdowns and not panic)
+            result("keyboard_unplug_does_not_wipe", ok,
+                   f"PS/2 echo {'seen' if ps2 else 'missing'}, tastatur {sec2.group(1) if sec2 else '?'}, "
+                   f"berichte {sec2.group(4) if sec2 else '?'} -> {sec3.group(4) if sec3 else '?'} "
+                   f"(before unplug {reports_before_unplug}), SHUTDOWN/RESET events {shutdowns}, panic {panic}")
+        if not stuck and q.poll() is not None:
             result("qemu_still_running", False, "QEMU exited")
     finally:
         if q.poll() is None:
@@ -183,7 +204,8 @@ def run(sm, wt, tmp):
     failed = [n for n, ok in results if not ok]
     if failed:
         print("---- console (last 40 lines) ----")
-        print("\n".join(sm.render(open(serial, "rb").read())[-40:]))
+        with open(serial, "rb") as fh:
+            print("\n".join(sm.render(fh.read())[-40:]))
     print("PASS" if not failed else "FAIL: " + ", ".join(failed))
     return 0 if not failed else 1
 

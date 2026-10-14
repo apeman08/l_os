@@ -195,6 +195,17 @@ impl KeyboardState {
         self.prev = now;
         true
     }
+
+    /// The keyboard went away (unplug, stall): emit the break codes of
+    /// every key and modifier still held (at most
+    /// [`KeyboardState::MAX_BYTES_PER_REPORT`] bytes) and forget them, so
+    /// nothing stays pressed in the shared consumers (hotkey detector, shell
+    /// modifier state). A second call emits nothing.
+    pub fn release_all(&mut self, push: impl FnMut(u8)) {
+        let none = BootReport([0; 8]);
+        report_to_set1(&self.prev, &none, push);
+        self.prev = none;
+    }
 }
 
 impl Default for KeyboardState {
@@ -277,6 +288,43 @@ mod tests {
             k.on_report(&r.0, |b| fired |= d.feed(b));
         }
         assert!(fired);
+    }
+
+    /// Review Task 22: when the keyboard stops (unplug, stall), every key and
+    /// modifier it still holds is released exactly once.
+    #[test]
+    fn keyboard_state_release_all_emits_breaks_once() {
+        let mut k = KeyboardState::new();
+        // LCtrl + LAlt + 'a' held.
+        assert_eq!(feed(&mut k, &rep(0x05, &[0x04]).0), (true, vec![0x1D, 0x38, 0x1E]));
+        let mut v = Vec::new();
+        k.release_all(|b| v.push(b));
+        assert_eq!(v, [0x9E, 0xB8, 0x9D], "key break, then modifier breaks");
+        assert_eq!(k.prev(), EMPTY);
+        let mut again = Vec::new();
+        k.release_all(|b| again.push(b));
+        assert!(again.is_empty(), "nothing held any more: no second break");
+        // Nothing held from the start: nothing emitted.
+        let mut fresh = KeyboardState::new();
+        let mut none = Vec::new();
+        fresh.release_all(|b| none.push(b));
+        assert!(none.is_empty());
+    }
+
+    /// The shared hotkey detector: Ctrl held on the USB keyboard when it
+    /// goes away must not combine with a later Alt+Backspace from PS/2.
+    #[test]
+    fn keyboard_state_release_all_clears_hotkey_modifiers() {
+        let mut k = KeyboardState::new();
+        let mut d = HotkeyDetector::new();
+        let mut fired = false;
+        k.on_report(&rep(0x01, &[]).0, |b| fired |= d.feed(b));
+        k.release_all(|b| fired |= d.feed(b));
+        // PS/2: Alt make, Backspace make.
+        for b in [0x38u8, 0x0E] {
+            fired |= d.feed(b);
+        }
+        assert!(!fired);
     }
 
     #[test]

@@ -59,8 +59,18 @@
 //! this lock: [`halt_for_wipe`] is lock-free) and stops once a wipe began.
 //! A transfer error (e.g. a stall) or a disconnect/reconnect on the
 //! keyboard's port stops the keyboard for good (no re-arm, no panic, no
-//! wipe: ledger Task 13). Port changes on other ports and controller loss
-//! are left to Task 23.
+//! wipe: ledger Task 13); its held keys are released first
+//! ([`KeyboardState::release_all`]), so no modifier stays set in the shared
+//! consumers. Port changes on other ports and controller loss are left to
+//! Task 23.
+//!
+//! **Byte budget:** one report yields at most 40 set-1 bytes
+//! (`KeyboardState::MAX_BYTES_PER_REPORT`), so one tick can feed at most
+//! 16 x 40 = 640, more than `input::SCANCODES` holds (128). The queue drops
+//! (and counts) what does not fit; the hotkey detector still sees every
+//! byte (`input::feed` runs it after the push). Real typing produces one
+//! report per key change, a few bytes each; only a hostile device reaches
+//! the bound, and it can only lose its own keystrokes.
 
 use crate::{memory, mmio, pci, time};
 use alloc::vec::Vec;
@@ -1943,7 +1953,7 @@ impl Driver {
                 Event::Transfer { trb, code, residual, slot, endpoint } => {
                     fed |= self.kbd_transfer(trb, code, residual, slot, endpoint);
                 }
-                Event::PortStatusChange { port } => self.kbd_port_change(port),
+                Event::PortStatusChange { port } => fed |= self.kbd_port_change(port),
                 Event::CommandCompletion { trb, .. } if Some(trb) == self.stale => self.stale = None,
                 Event::CommandCompletion { .. } => self.queue.dropped = self.queue.dropped.saturating_add(1),
                 // Host controller events: USBSTS is Task 23's.
@@ -1981,13 +1991,12 @@ impl Driver {
             // Stall or error: the endpoint is halted with the other TDs
             // still queued; no Reset Endpoint recovery exists (M5), so the
             // keyboard stops here: no re-arm, no panic.
-            kbd.stopped = true;
+            let fed = stop_keyboard(&mut kbd);
             self.kbd = Some(kbd);
             if let Some(d) = self.devices[i].as_mut() {
                 d.eps_broken[kbd.k] = true;
             }
-            KBD_LOST.store(true, Ordering::Release);
-            return false;
+            return fed;
         }
         // A residual larger than the request is hostile: 0 bytes.
         let len = REPORT_LEN.saturating_sub(residual) as usize;
@@ -2011,8 +2020,7 @@ impl Driver {
         // Re-arm the same buffer (it is free now).
         let r = self.kbd_arm(&mut kbd, b).and_then(|()| self.kbd_doorbell(&kbd));
         if r.is_err() {
-            kbd.stopped = true;
-            KBD_LOST.store(true, Ordering::Release);
+            fed |= stop_keyboard(&mut kbd);
         }
         self.kbd = Some(kbd);
         fed
@@ -2023,21 +2031,44 @@ impl Driver {
     /// left in between; no hotplug enumeration, spec §2), stops the keyboard
     /// and nothing else (no wipe, ledger Task 13). Its change bits are
     /// acknowledged without writing PED. Other ports (the stick's) and an
-    /// all-ones PORTSC are left to Task 23.
-    fn kbd_port_change(&mut self, port: u8) {
-        let Some(mut kbd) = self.kbd.filter(|k| k.port == port) else { return };
-        let Ok(off) = self.port_off(port) else { return };
-        let Ok(v) = self.read_port(off) else { return };
+    /// all-ones PORTSC are left to Task 23. Returns whether break codes
+    /// were fed ([`stop_keyboard`]).
+    fn kbd_port_change(&mut self, port: u8) -> bool {
+        let Some(mut kbd) = self.kbd.filter(|k| k.port == port) else { return false };
+        let Ok(off) = self.port_off(port) else { return false };
+        let Ok(v) = self.read_port(off) else { return false };
+        let mut fed = false;
         match ctx::classify(!kbd.stopped, v) {
             PortChange::Disconnected | PortChange::Connected(_) => {
-                kbd.stopped = true;
+                fed = stop_keyboard(&mut kbd);
                 self.kbd = Some(kbd);
-                KBD_LOST.store(true, Ordering::Release);
             }
             PortChange::ResetDone | PortChange::Nothing | PortChange::ControllerGone => {}
         }
         let _ = self.ack_port(off, v);
+        fed
     }
+}
+
+/// Stop the keyboard for good (stall, failed re-arm, unplug/reconnect).
+/// On the first stop, the break codes of every key and modifier it still
+/// holds go to [`crate::input::feed`] (review Task 22): otherwise a Ctrl
+/// held during the unplug would stay set in the shared hotkey detector
+/// (a later PS/2 Alt+Backspace would wipe) and in the shell's modifier
+/// state. Bounded (at most `KeyboardState::MAX_BYTES_PER_REPORT` bytes),
+/// lock-free, ISR-safe (IF=0). Returns whether bytes were fed.
+fn stop_keyboard(kbd: &mut Kbd) -> bool {
+    if kbd.stopped {
+        return false;
+    }
+    let mut fed = false;
+    kbd.hid.release_all(|byte| {
+        fed = true;
+        crate::input::feed(byte);
+    });
+    kbd.stopped = true;
+    KBD_LOST.store(true, Ordering::Release);
+    fed
 }
 
 #[cfg(test)]
