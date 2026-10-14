@@ -183,3 +183,156 @@ fn mmio_mapping_is_uncached_and_nx() {
     // was not broken by the window.
     assert!(wipe::plan().is_some(), "wipe plan armed with the MMIO window present");
 }
+
+// ---------------------------------------------------------------------------
+// Task 19: controller reset, rings and command submission (spec §7.1 1–4).
+
+use l_core::xhci_ring::{Event, SUCCESS, Trb};
+use l_os::xhci::{self, XhciError};
+
+const USBCMD_RS: u32 = 1;
+const USBCMD_HCRST: u32 = 1 << 1;
+const USBCMD_INTE: u32 = 1 << 2;
+const USBSTS_HCH: u32 = 1;
+const USBSTS_CNR: u32 = 1 << 11;
+
+/// Bring the driver up for a test that does not care whether an earlier
+/// test already did.
+fn up() {
+    match xhci::init() {
+        Ok(()) | Err(XhciError::AlreadyInitialized) => {}
+        Err(e) => panic!("xhci::init: {:?}", e),
+    }
+}
+
+fn noop() -> u64 {
+    let ring = xhci::command_ring().expect("command ring after init");
+    let ev = xhci::command(Trb::noop_cmd(), 500).expect("no-op command");
+    match ev {
+        Event::CommandCompletion { trb, code, slot } => {
+            assert_eq!(code, SUCCESS, "no-op completion code");
+            assert_eq!(slot, 0, "no-op has no slot");
+            assert_eq!(trb, ring.enqueue, "completion points at the no-op TRB");
+            trb
+        }
+        other => panic!("command() returned {:?}", other),
+    }
+}
+
+/// Before `init` nothing is mapped: the wipe hook must be a harmless no-op.
+/// (The test framework runs tests sorted by name; this one sorts first, and
+/// every other test calls `up()`, so none depends on the order.)
+#[test_case]
+fn before_init_halt_for_wipe_is_noop() {
+    assert_eq!(xhci::caps(), None);
+    assert_eq!(xhci::usbsts(), None);
+    xhci::halt_for_wipe();
+    assert_eq!(xhci::command(Trb::noop_cmd(), 10), Err(XhciError::NotInitialized));
+}
+
+#[test_case]
+fn controller_resets_and_runs() {
+    up();
+    let caps = xhci::caps().expect("caps after init");
+    let (cmd, sts) = (xhci::usbcmd().unwrap(), xhci::usbsts().unwrap());
+    let ring = xhci::command_ring().unwrap();
+    serial_println!("\n  caps {:?}\n  USBCMD {:#x} USBSTS {:#x} cmd ring {:#x}+{}", caps, cmd, sts, ring.base, ring.slots);
+    assert_eq!(sts & USBSTS_HCH, 0, "running (HCH=0): USBSTS {:#x}", sts);
+    assert_eq!(sts & USBSTS_CNR, 0, "controller ready (CNR=0): USBSTS {:#x}", sts);
+    assert_ne!(cmd & USBCMD_RS, 0, "RS=1: USBCMD {:#x}", cmd);
+    assert_eq!(cmd & (USBCMD_HCRST | USBCMD_INTE), 0, "no reset pending, no interrupts: USBCMD {:#x}", cmd);
+    // qemu-xhci (spike note §3).
+    assert_eq!((caps.max_slots, caps.max_ports, caps.max_scratchpad), (64, 8, 0));
+    // DMA structures below 4 GiB, page aligned (no AC64 assumption).
+    assert!(ring.base % 4096 == 0 && ring.base + 64 * 16 <= 1 << 32, "ring {:#x}", ring.base);
+    assert_eq!(ring.slots, 63, "64 TRBs incl. link");
+}
+
+#[test_case]
+fn init_twice_is_rejected_and_keeps_running() {
+    up();
+    let before = xhci::command_ring().unwrap();
+    assert_eq!(xhci::init(), Err(XhciError::AlreadyInitialized));
+    assert_eq!(xhci::usbsts().unwrap() & USBSTS_HCH, 0);
+    assert_eq!(xhci::command_ring().unwrap(), before, "second init touched nothing");
+    noop();
+}
+
+#[test_case]
+fn noop_command_completes() {
+    up();
+    let a = noop();
+    let b = noop();
+    assert_eq!(b, a + 16, "consecutive slots");
+}
+
+#[test_case]
+fn command_ring_wraps() {
+    up();
+    let ring = xhci::command_ring().unwrap();
+    let mut wrapped = 0;
+    let mut prev = None;
+    for i in 0..70 {
+        let at = noop();
+        if let Some(p) = prev {
+            if at == ring.base {
+                assert_eq!(p, ring.base + (ring.slots as u64 - 1) * 16, "wrap after the last usable slot");
+                wrapped += 1;
+            } else {
+                assert_eq!(at, p + 16, "no-op {} at the next slot", i);
+            }
+        }
+        assert!(at >= ring.base && at < ring.base + ring.slots as u64 * 16, "never the link slot");
+        prev = Some(at);
+    }
+    assert!(wrapped >= 1, "70 no-ops over 63 usable slots wrap at least once");
+}
+
+#[test_case]
+fn command_rejects_link_trb() {
+    up();
+    let before = xhci::command_ring().unwrap();
+    assert_eq!(xhci::command(Trb::link(0, true), 100), Err(XhciError::InvalidTrb));
+    assert_eq!(xhci::command_ring().unwrap(), before, "nothing enqueued");
+    noop();
+}
+
+#[test_case]
+fn unrelated_events_are_kept() {
+    up();
+    // Port events after HCRST/RS=1 (if the controller sends any) must sit in
+    // the queue, not be dropped by command(); drain and show them.
+    noop();
+    let mut n = 0;
+    while let Some(e) = xhci::pop_event() {
+        serial_println!("  queued event {:?}", e);
+        assert!(!matches!(e, Event::CommandCompletion { .. }), "command completions are not queued");
+        n += 1;
+        assert!(n <= xhci::EVENT_QUEUE_LEN, "queue is bounded");
+    }
+    serial_println!("  {} queued, {} dropped", n, xhci::dropped_events());
+}
+
+#[test_case]
+fn halt_for_wipe_stops_controller() {
+    up();
+    noop();
+    let t0 = l_os::time::rdtsc();
+    // As on the wipe path: interrupts off (ticks frozen, TSC bound only).
+    x86_64::instructions::interrupts::without_interrupts(xhci::halt_for_wipe);
+    let cycles = l_os::time::rdtsc().wrapping_sub(t0);
+    let (cmd, sts) = (xhci::usbcmd().unwrap(), xhci::usbsts().unwrap());
+    serial_println!("\n  after halt_for_wipe: USBCMD {:#x} USBSTS {:#x} ({} cycles)", cmd, sts, cycles);
+    assert_eq!(cmd & USBCMD_RS, 0, "RS cleared");
+    assert_ne!(sts & USBSTS_HCH, 0, "controller halted (HCH=1)");
+    // A halted controller fails commands cleanly instead of timing out.
+    assert_eq!(xhci::command(Trb::noop_cmd(), 100), Err(XhciError::Halted));
+    // Idempotent and bounded.
+    xhci::halt_for_wipe();
+    assert_ne!(xhci::usbsts().unwrap() & USBSTS_HCH, 0);
+    // The driver can be brought up again (fresh reset and rings).
+    xhci::init().expect("re-init after halt");
+    let ring = xhci::command_ring().unwrap();
+    assert_eq!(ring.enqueue, ring.base + 16, "fresh ring after re-init (slot 0: init's self-test no-op)");
+    noop();
+}

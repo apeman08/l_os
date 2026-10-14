@@ -33,9 +33,11 @@
 //! 1. `InputLocked`: `cli`, wipe flag (in the island; ISRs drop input), all
 //!    PIC lines masked and NMI disabled by port writes.
 //! 2. `ScreenBlanked`: [`crate::framebuffer::blank_raw`].
-//! 3. `DmaStopped`: bus-master bit of every enumerated PCI function cleared
-//!    ([`crate::pci::disable_all_bus_masters_unlocked`]); the xHCI halt comes
-//!    with the xHCI driver (Task 19). That halt is the only use of the MMIO
+//! 3. `DmaStopped`: the xHCI controller halted ([`crate::xhci::halt_for_wipe`]:
+//!    `USBCMD.RS = 0`, bounded wait for `HCH`, lock-free; a no-op if the driver
+//!    never mapped a controller), then the bus-master bit of every enumerated
+//!    PCI function cleared ([`crate::pci::disable_all_bus_masters_unlocked`]).
+//!    That halt is the only use of the MMIO
 //!    window ([`crate::mmio`], L4 slot 144) by the wipe; from stage 4 on the
 //!    window is never touched. Its page-table frames are allocator frames
 //!    and are zeroed in stage 7 like any other; the BAR pages it maps are
@@ -744,7 +746,10 @@ impl StageOps for Real {
     }
 
     fn stop_dma(&mut self) {
-        // Task 19 adds the xHCI halt (USBCMD.RS = 0) here.
+        // xHCI first (RS = 0, bounded wait for HCH; lock-free), then every
+        // bus-master bit: even a controller that does not halt in time can
+        // no longer reach RAM.
+        crate::xhci::halt_for_wipe();
         crate::pci::disable_all_bus_masters_unlocked();
     }
 

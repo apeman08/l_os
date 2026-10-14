@@ -16,7 +16,7 @@
 //! BAR pages themselves are device memory, never RAM, and no wipe stage
 //! touches or depends on them ([`map`] refuses ranges overlapping
 //! `Usable`/`Bootloader` RAM). The window is used only up to stage 3
-//! (`DmaStopped`: bus-master clear, later the xHCI halt of Task 19);
+//! (`DmaStopped`: the xHCI halt, `crate::xhci::halt_for_wipe`);
 //! from stage 4 on the wipe runs on the kernel L4 and uses only the island,
 //! code and the physical-memory mapping, whose tables are not `Usable`.
 
