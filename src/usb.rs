@@ -19,9 +19,24 @@
 //!
 //! Runs in thread context during boot (the xHCI driver lock is held while
 //! waiting; spec §7.2's timer-ISR polling comes later and uses `try_lock`).
+//!
+//! **Boot stick** (spec §7.1 steps 7–8, E2): [`identify_boot_stick`] talks
+//! bulk-only transport to each enumerated mass-storage device with the
+//! read-only commands of `l_core::usb_msc` only (TEST UNIT READY up to
+//! [`TUR_ATTEMPTS`] times, READ CAPACITY(10), READ(10) of LBA 0) and compares
+//! the boot marker in LBA 0 with [`crate::boot_id`]. [`storage_seal`] then
+//! closes the path for good: [`storage_read`] returns `Err(Sealed)` without
+//! a transfer. A failed command, a phase error, a stall or a malformed CSW
+//! ends the attempt for that device (no reset recovery: the endpoint is
+//! not used again); the system keeps running with "amnesisch: nein" (E8).
+//! The status inputs ([`stick_sealed`], [`stick_reads`],
+//! [`keyboard_present`]) are atomics, readable without a lock.
 
 use crate::xhci::{self, PortReady, XhciError};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use l_core::bootmark::BootId;
 use l_core::usb_desc::{self, Config, DescError, DeviceDescriptor, DeviceKind, SetupPacket};
+use l_core::usb_msc::{self, Cbw, CswStatus, MscError};
 use l_core::xhci_ctx::Speed;
 use spin::Mutex;
 
@@ -108,6 +123,9 @@ pub enum UsbError {
     ConfigTooLong(u16),
     /// Device descriptor reports no configuration.
     NoConfiguration,
+    /// `bConfigurationValue` 0: SET_CONFIGURATION(0) would unconfigure
+    /// the device (ledger Task 20).
+    ZeroConfigValue,
 }
 
 impl From<XhciError> for UsbError {
@@ -200,6 +218,9 @@ fn scan() -> UsbSummary {
         match enumerate_device(port, speed) {
             Ok(d) => {
                 crate::println!("usb: port {} {} {}", port, speed_name(speed), kind_name(&d.kind));
+                if matches!(d.kind, DeviceKind::BootKeyboard { .. }) && d.config != 0 {
+                    KEYBOARD.store(true, Ordering::Release);
+                }
                 s.push(d);
             }
             Err(e) => {
@@ -268,6 +289,7 @@ fn enumerate_device(port: u8, speed: Speed) -> Result<UsbDevice, UsbError> {
     let total = config_total_length(&cfg[..n])?;
     let n = get(slot, SetupPacket::get_descriptor(DT_CONFIG, 0, total), &mut cfg)?;
     let config: Config = usb_desc::parse_config(&cfg[..n])?;
+    check_config_value(config.value)?;
     let kind = usb_desc::classify(&config);
     dev.kind = kind;
 
@@ -292,6 +314,11 @@ fn enumerate_device(port: u8, speed: Speed) -> Result<UsbDevice, UsbError> {
     Ok(dev)
 }
 
+/// A configuration value that SET_CONFIGURATION may select (not 0).
+fn check_config_value(v: u8) -> Result<(), UsbError> {
+    if v == 0 { Err(UsbError::ZeroConfigValue) } else { Ok(()) }
+}
+
 /// `wTotalLength` from a configuration-descriptor header, checked: at least
 /// the header itself, at most [`MAX_CONFIG_LEN`].
 fn config_total_length(h: &[u8]) -> Result<u16, UsbError> {
@@ -311,9 +338,352 @@ fn config_total_length(h: &[u8]) -> Result<u16, UsbError> {
     Ok(total)
 }
 
+// ------------------------------------------------------------ boot stick
+
+/// TEST UNIT READY attempts before a device counts as not ready (spec §7.1
+/// step 7); the first one may report a unit attention after power-on.
+pub const TUR_ATTEMPTS: usize = 5;
+/// Pause between TEST UNIT READY attempts.
+const TUR_PAUSE_MS: u64 = 20;
+/// Bytes of a CBW / CSW on the wire.
+const CBW_LEN: usize = 31;
+const CSW_LEN: usize = 13;
+/// Data page of a slot ([`xhci::slot_buffer`]): one block must fit.
+const PAGE: usize = 4096;
+
+/// Why [`identify_boot_stick`] found no boot stick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StickError {
+    /// No bulk-only mass-storage device was enumerated.
+    NotFound,
+    /// Mass storage was read, but its LBA 0 carries no marker with this
+    /// kernel's boot id (another image's stick, other storage).
+    NotBootStick,
+    /// The kernel carries no boot id (not patched by the image builder): it
+    /// cannot recognize any stick.
+    NoBootId,
+    /// The storage path was sealed before a stick was recognized.
+    Sealed,
+    /// Reading LBA 0 failed (last error of the devices tried).
+    Read(StorageError),
+}
+
+/// Errors of [`storage_read`] and the bulk-only layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageError {
+    /// [`storage_seal`] was called; nothing is transferred any more.
+    Sealed,
+    /// No boot stick was identified.
+    NoStick,
+    /// The buffer is not exactly one block.
+    BadBuffer,
+    /// LBA beyond the device's last block (or beyond READ(10)).
+    OutOfRange,
+    Xhci(XhciError),
+    /// Malformed CSW or capacity data.
+    Msc(MscError),
+    /// The device reported the command as failed (CSW status 1).
+    Failed,
+    /// CSW status 2: the device needs a reset recovery, which is not done;
+    /// the device is given up.
+    PhaseError,
+    /// Fewer bytes than the command needs, or a CSW residue larger than the
+    /// requested length or inconsistent with the data received.
+    Short,
+    /// TEST UNIT READY never passed.
+    NotReady,
+}
+
+impl From<XhciError> for StorageError {
+    fn from(e: XhciError) -> Self {
+        StorageError::Xhci(e)
+    }
+}
+
+impl From<MscError> for StorageError {
+    fn from(e: MscError) -> Self {
+        StorageError::Msc(e)
+    }
+}
+
+/// A bulk-only device whose capacity is known.
+#[derive(Debug, Clone, Copy)]
+struct Msc {
+    port: u8,
+    slot: u8,
+    ep_in: u8,
+    ep_out: u8,
+    block_len: u32,
+    last_lba: u32,
+}
+
+struct Storage {
+    /// The identified boot stick.
+    stick: Option<Msc>,
+    /// Next CBW tag.
+    tag: u32,
+}
+
+/// Held across every bulk-only command and by [`storage_seal`], so a read
+/// in progress finishes before the seal and none starts after it.
+static STORAGE: Mutex<Storage> = Mutex::new(Storage { stick: None, tag: 1 });
+static SEALED: AtomicBool = AtomicBool::new(false);
+/// Root port of the identified boot stick, 0 = none.
+static STICK_PORT: AtomicU8 = AtomicU8::new(0);
+/// Bulk-only commands (CBWs) sent to mass storage since boot.
+static STICK_READS: AtomicU64 = AtomicU64::new(0);
+/// A boot keyboard was enumerated and configured.
+static KEYBOARD: AtomicBool = AtomicBool::new(false);
+
+/// Bulk-only commands (TEST UNIT READY, READ CAPACITY, READ) sent to mass
+/// storage since boot; constant after [`storage_seal`].
+pub fn stick_reads() -> u64 {
+    STICK_READS.load(Ordering::Acquire)
+}
+
+/// Root port of the identified boot stick.
+pub fn stick_port() -> Option<u8> {
+    match STICK_PORT.load(Ordering::Acquire) {
+        0 => None,
+        p => Some(p),
+    }
+}
+
+/// Block length of the identified boot stick (READ CAPACITY).
+pub fn stick_block_len() -> Option<u32> {
+    STORAGE.lock().stick.map(|m| m.block_len)
+}
+
+/// The boot stick was identified and the storage path is sealed (spec E7's
+/// first condition). Lock-free.
+pub fn stick_sealed() -> bool {
+    SEALED.load(Ordering::Acquire) && STICK_PORT.load(Ordering::Acquire) != 0
+}
+
+/// A USB boot keyboard was enumerated. Lock-free.
+pub fn keyboard_present() -> bool {
+    KEYBOARD.load(Ordering::Acquire)
+}
+
+/// Does `sector` (LBA 0 of a device) carry the marker of boot id `id`?
+/// `None` (an unpatched kernel) recognizes nothing.
+pub fn match_boot_marker(sector: &[u8], id: Option<BootId>) -> Result<(), StickError> {
+    let id = id.ok_or(StickError::NoBootId)?;
+    match l_core::bootmark::parse_lba0(sector) {
+        Some(found) if found == id => Ok(()),
+        _ => Err(StickError::NotBootStick),
+    }
+}
+
+/// Close the mass-storage path for good: afterwards [`storage_read`]
+/// returns `Err(Sealed)` and no bulk transfer is made. Idempotent.
+pub fn storage_seal() {
+    // Waits for a command in progress (spec §7.1 step 8).
+    let _g = STORAGE.lock();
+    SEALED.store(true, Ordering::Release);
+}
+
+/// Read block `lba` of the identified boot stick into `buf` (exactly one
+/// block). Refused with `Err(Sealed)` after [`storage_seal`], before
+/// anything else is looked at.
+pub fn storage_read(lba: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+    let mut st = STORAGE.lock();
+    if SEALED.load(Ordering::Acquire) {
+        return Err(StorageError::Sealed);
+    }
+    let m = st.stick.ok_or(StorageError::NoStick)?;
+    if buf.len() != m.block_len as usize {
+        return Err(StorageError::BadBuffer);
+    }
+    let lba = u32::try_from(lba).map_err(|_| StorageError::OutOfRange)?;
+    if lba > m.last_lba {
+        return Err(StorageError::OutOfRange);
+    }
+    read_block(&m, &mut st.tag, lba, buf)
+}
+
+/// Find the boot stick among the enumerated mass-storage devices (spec
+/// §7.1 step 7): the device whose LBA 0 carries this kernel's boot marker.
+/// Returns its root port. Once found, later calls return the same port
+/// without any transfer. Every other device is left alone afterwards.
+pub fn identify_boot_stick() -> Result<u8, StickError> {
+    let mut st = STORAGE.lock();
+    if let Some(m) = st.stick {
+        return Ok(m.port);
+    }
+    if SEALED.load(Ordering::Acquire) {
+        return Err(StickError::Sealed);
+    }
+    let id = crate::boot_id().ok_or(StickError::NoBootId)?;
+    let summary = enumerate();
+    let mut result = Err(StickError::NotFound);
+    for d in summary.devices() {
+        let DeviceKind::BulkOnlyStorage { ep_in, ep_out, .. } = d.kind else { continue };
+        if d.config == 0 {
+            continue;
+        }
+        let mut sector = [0u8; 32];
+        let m = Msc { port: d.port, slot: d.slot, ep_in: ep_in.address, ep_out: ep_out.address, block_len: 0, last_lba: 0 };
+        match probe(m, &mut st.tag, &mut sector) {
+            Ok(m) => match match_boot_marker(&sector, Some(id)) {
+                Ok(()) => {
+                    st.stick = Some(m);
+                    STICK_PORT.store(m.port, Ordering::Release);
+                    return Ok(m.port);
+                }
+                Err(e) => {
+                    if !matches!(result, Err(StickError::Read(_))) {
+                        result = Err(e);
+                    }
+                }
+            },
+            Err(e) => {
+                crate::println!("usb: port {} massenspeicher nicht lesbar ({:?})", d.port, e);
+                result = Err(StickError::Read(e));
+            }
+        }
+    }
+    result
+}
+
+/// TEST UNIT READY (bounded retries), READ CAPACITY(10), READ(10) of LBA 0;
+/// the first `sector.len()` bytes of LBA 0 are copied to `sector`.
+fn probe(mut m: Msc, tag: &mut u32, sector: &mut [u8; 32]) -> Result<Msc, StorageError> {
+    let mut ready = false;
+    for attempt in 0..TUR_ATTEMPTS {
+        let t = next_tag(tag);
+        match command(&m, t, Cbw::test_unit_ready(t), &mut [])? {
+            (CswStatus::Passed, _) => {
+                ready = true;
+                break;
+            }
+            // E.g. a unit attention after power-on; REQUEST SENSE is not on
+            // the whitelist, so just ask again.
+            (CswStatus::Failed, _) => {
+                if attempt + 1 < TUR_ATTEMPTS {
+                    xhci::pause_ms(TUR_PAUSE_MS);
+                }
+            }
+            (CswStatus::PhaseError, _) => return Err(StorageError::PhaseError),
+        }
+    }
+    if !ready {
+        return Err(StorageError::NotReady);
+    }
+    let t = next_tag(tag);
+    let mut cap = [0u8; 8];
+    let n = passed(command(&m, t, Cbw::read_capacity10(t), &mut cap)?)?;
+    if n < cap.len() {
+        return Err(StorageError::Short);
+    }
+    let (last_lba, block_len) = usb_msc::parse_read_capacity10(&cap)?;
+    if block_len as usize > PAGE {
+        return Err(StorageError::Msc(MscError::BadBlockLen));
+    }
+    m.block_len = block_len;
+    m.last_lba = last_lba;
+    read_block(&m, tag, 0, sector)?;
+    Ok(m)
+}
+
+/// READ(10) of one block at `lba`; the first `out.len()` bytes of it are
+/// copied to `out` (at most one block).
+fn read_block(m: &Msc, tag: &mut u32, lba: u32, out: &mut [u8]) -> Result<(), StorageError> {
+    let t = next_tag(tag);
+    let n = passed(command(m, t, Cbw::read10(t, lba, 1, m.block_len), out)?)?;
+    if n != m.block_len as usize {
+        return Err(StorageError::Short);
+    }
+    Ok(())
+}
+
+fn passed(r: (CswStatus, usize)) -> Result<usize, StorageError> {
+    match r.0 {
+        CswStatus::Passed => Ok(r.1),
+        CswStatus::Failed => Err(StorageError::Failed),
+        CswStatus::PhaseError => Err(StorageError::PhaseError),
+    }
+}
+
+fn next_tag(tag: &mut u32) -> u32 {
+    let t = *tag;
+    *tag = tag.wrapping_add(1);
+    t
+}
+
+/// One bulk-only command with tag `tag` (the tag inside `cbw`): CBW on
+/// bulk-OUT, the data stage (if any) on bulk-IN, CSW on bulk-IN, all
+/// through the slot's data page at offset 0. Of the data received, the
+/// first `out.len()` bytes are copied to `out` before the CSW stage reuses
+/// the page. Returns the CSW status and the number of data bytes received.
+/// Every device answer is checked; nothing here panics on device data.
+fn command(m: &Msc, tag: u32, cbw: Cbw, out: &mut [u8]) -> Result<(CswStatus, usize), StorageError> {
+    let buf = xhci::slot_buffer(m.slot).ok_or(StorageError::Xhci(XhciError::BadSlot))?;
+    let len = cbw.data_len() as usize;
+    if len > PAGE || out.len() > len {
+        return Err(StorageError::BadBuffer);
+    }
+    STICK_READS.fetch_add(1, Ordering::AcqRel);
+    xhci::write_slot_buffer(m.slot, 0, &cbw.encode())?;
+    if xhci::bulk(m.slot, m.ep_out, buf, CBW_LEN)? != CBW_LEN {
+        return Err(StorageError::Short);
+    }
+    let mut got = 0;
+    let mut csw = [0u8; CSW_LEN];
+    let mut csw_in_data = false;
+    if len > 0 {
+        got = xhci::bulk(m.slot, m.ep_in, buf, len)?.min(len);
+        // A device that fails a command may skip the data stage and send
+        // the CSW right away (QEMU's usb-storage does): accept exactly that,
+        // a 13-byte answer that is a valid CSW for this tag.
+        if got == CSW_LEN && len != CSW_LEN {
+            xhci::read_slot_buffer(m.slot, 0, &mut csw)?;
+            if usb_msc::parse_csw(&csw, tag).is_ok() {
+                csw_in_data = true;
+                got = 0;
+            }
+        }
+        let k = got.min(out.len());
+        xhci::read_slot_buffer(m.slot, 0, &mut out[..k])?;
+    }
+    let n = if csw_in_data {
+        CSW_LEN
+    } else {
+        let n = xhci::bulk(m.slot, m.ep_in, buf, CSW_LEN)?.min(CSW_LEN);
+        xhci::read_slot_buffer(m.slot, 0, &mut csw[..n])?;
+        n
+    };
+    let (status, residue) = usb_msc::parse_csw(&csw[..n], tag)?;
+    // BOT 6.7.3: the residue never exceeds the requested length (ledger
+    // Task 16: the caller checks it). The callers check the bytes received.
+    if residue as usize > len {
+        return Err(StorageError::Short);
+    }
+    Ok((status, got))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test_case]
+    fn zero_config_value_refused() {
+        assert_eq!(check_config_value(0), Err(UsbError::ZeroConfigValue));
+        assert_eq!(check_config_value(1), Ok(()));
+        assert_eq!(check_config_value(255), Ok(()));
+    }
+
+    #[test_case]
+    fn storage_without_stick() {
+        // The default test machine has no xHCI: nothing found, no traffic.
+        let reads = stick_reads();
+        let want = if crate::boot_id().is_some() { StickError::NotFound } else { StickError::NoBootId };
+        assert_eq!(identify_boot_stick(), Err(want));
+        assert_eq!(storage_read(0, &mut [0u8; 512]), Err(StorageError::NoStick));
+        assert!(!stick_sealed());
+        assert_eq!(stick_port(), None);
+        assert_eq!(stick_reads(), reads);
+    }
 
     #[test_case]
     fn config_header_bounds() {

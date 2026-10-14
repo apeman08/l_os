@@ -114,7 +114,7 @@ impl Default for WipeState {
 }
 
 /// Preconditions for the "amnesisch" status.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Amnesia {
     pub stick_sealed: bool,
     pub plan_ready: bool,

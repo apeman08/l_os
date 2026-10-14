@@ -354,7 +354,13 @@ def main():
     screen = "\n".join(snaps)
     print("\n".join(snaps[-25:]))
     expected = ["l_os> echo hi", "\nhi\n", "unknown command: bogus", "help: unexpected arguments",
-                "ticks (~", "denied by default", "ring 3", "SMEP on, SMAP on", "hello from ring 3",
+                "ticks (~", "denied by default", "ring 3", "SMEP on, SMAP on",
+                # Spec E7: a mirror build is never amnesic and says why; this
+                # machine boots from IDE without xHCI, so no stick is sealed.
+                "  amnesisch: nein (Serial-Spiegel an)",
+                "  usb: tastatur nein, stick: fehlt, stick-lesezugriffe 0",
+                "  acpi-poweroff: ja",
+                "hello from ring 3",
                 "[process exited with code 18]", "hello from Rust in ring 3", "[process exited with code 0]",
                 "shell running in ring 3", "illegal memory access",
                 "exceeded its time budget", "unknown program 'nope'",

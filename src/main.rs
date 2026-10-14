@@ -39,6 +39,18 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     #[cfg(not(test))]
     let _ = l_os::usb::enumerate();
 
+    // Spec §7.1 steps 7–8: recognize the boot stick by the marker in its
+    // LBA 0, then seal the storage path for good. Without a stick the
+    // system keeps running and shows "amnesisch: nein" (E8).
+    #[cfg(not(test))]
+    {
+        match l_os::usb::identify_boot_stick() {
+            Ok(port) => l_os::println!("usb: boot-stick an port {} erkannt", port),
+            Err(e) => l_os::println!("usb: kein boot-stick ({:?})", e),
+        }
+        l_os::usb::storage_seal();
+    }
+
     // Aurora chrome (status bar, hint bar) with its boot fade-in, before the
     // shell starts; opt-in, so test kernels keep the plain console.
     #[cfg(not(test))]

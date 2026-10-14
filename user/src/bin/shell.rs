@@ -157,12 +157,33 @@ fn security(t: &mut Term) {
     println!(t.out, "  network:    denied by default; a connection needs your confirmation ('net request')");
     println!(t.out, "              and then exact host:port (and, for names, the DNS resolver) is allowed;");
     println!(t.out, "              the NIC stays off until the first allowed connection");
-    println!(t.out, "  storage:    no storage driver exists; nothing is read or written");
+    println!(t.out, "  storage:    only LBA 0 of the boot stick is read (to recognize it), then the");
+    println!(t.out, "              storage path is sealed; nothing is ever written");
     println!(t.out, "  isolation:  this shell and its programs run in ring 3, each in its own");
     println!(t.out, "              address space with only the handles it was given;");
     println!(t.out, "              the kernel, network stack and drivers still run in ring 0");
     println!(t.out, "  cpu:        SMEP {}, SMAP {}", on(CPU_SMEP), on(CPU_SMAP));
     println!(t.out, "  telemetry:  none");
+    amnesia_lines(t);
+}
+
+/// Spec E7: "amnesisch: ja" only when the kernel reports every condition.
+fn amnesia_lines(t: &mut Term) {
+    let raw = sysinfo(h::SYSTEM, SYSINFO_AMNESIA);
+    if raw < 0 {
+        println!(t.out, "  amnesisch: nein (Status nicht lesbar)");
+        return;
+    }
+    let s = unpack_amnesia(raw as u64);
+    if s.amnesia.armed() {
+        println!(t.out, "  {}", s.amnesia.label());
+    } else {
+        println!(t.out, "  {} ({})", s.amnesia.label(), s.amnesia.reason());
+    }
+    let yn = |b: bool| if b { "ja" } else { "nein" };
+    let stick = if s.amnesia.stick_sealed { "versiegelt" } else { "fehlt" };
+    println!(t.out, "  usb: tastatur {}, stick: {}, stick-lesezugriffe {}", yn(s.keyboard), stick, s.stick_reads);
+    println!(t.out, "  acpi-poweroff: {}", yn(s.acpi_poweroff));
 }
 
 // ------------------------------------------------------------------- run

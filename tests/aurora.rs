@@ -65,7 +65,7 @@ fn blank_grid(cols: usize) -> Grid {
 fn expected_bar(info: &FbInfo, cols: usize, bar: Bar, theme: &Theme) -> Vec<u8> {
     let mut grid = blank_grid(cols);
     match bar {
-        Bar::Status => status_bar(&mut grid, 0, aurora::STATUS_LEFT, aurora::STATUS_RIGHT, theme),
+        Bar::Status => status_bar(&mut grid, 0, aurora::STATUS_LEFT, aurora::status_right(), theme),
         Bar::Hints => aurora::hint_bar().draw(&mut grid, 0, theme),
     }
     row_pixels(info, &grid)
@@ -122,7 +122,8 @@ fn a_boot_fade_ends_in_the_final_aurora_colours() {
     // Opt-in: without the call the console uses every row (tests/framebuffer.rs).
     assert_eq!(fb_console::region(), Some(0..rows));
     assert_eq!(aurora::STATUS_LEFT, "Larp OS");
-    assert_eq!(aurora::STATUS_RIGHT, "amnesisch: nein");
+    // No USB stick in this test machine: never "ja" (spec E7).
+    assert_eq!(aurora::status_right(), "amnesisch: nein");
     print!("old text");
     let rendered_before = fb_console::rendered_rows();
     let start = time::ticks();

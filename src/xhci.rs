@@ -33,8 +33,9 @@
 //! resets a connected root port if it is not enabled and acknowledges its
 //! change bits (never writing PED), [`address_device`] enables a slot and
 //! addresses the device, [`control_in`]/[`control_out_nodata`] run control
-//! transfers on EP0 and [`configure_endpoints`] adds interrupt/bulk
-//! endpoints. Every device has a fixed table entry ([`MAX_DEVICES`]) with
+//! transfers on EP0, [`configure_endpoints`] adds interrupt/bulk
+//! endpoints and [`bulk`] runs one bulk TD (Task 21, counted by
+//! [`bulk_transfers`]). Every device has a fixed table entry ([`MAX_DEVICES`]) with
 //! its own zeroed DMA frames (input and output context, EP0 ring, two
 //! endpoint rings, one data page), kept for the kernel's lifetime and reused
 //! after a controller reset. A transfer ring never has more than one control
@@ -123,6 +124,9 @@ const PG_BUF: u64 = 5;
 pub const MAX_ENDPOINTS: usize = 2;
 /// Endpoint Context EP Type (xHCI 1.2 table 6-9).
 const EP_TYPE_CONTROL: u8 = 4;
+/// Bound of one bulk transfer (a stick may need a moment for its first
+/// command after power-on; QEMU answers at once).
+pub const BULK_TIMEOUT_MS: u64 = 3000;
 /// CErr: three retries on transaction errors (section 4.10.2.7).
 const CERR: u8 = 3;
 /// Command TRB types (xHCI 1.2 table 6-91): Enable Slot (9) .. No Op (23).
@@ -382,6 +386,11 @@ struct Device {
     ep0_broken: bool,
     /// Configured endpoints: DCI and ring ([`configure_endpoints`]).
     eps: [Option<(u8, ProducerRing)>; MAX_ENDPOINTS],
+    /// Endpoint `eps[k]` is not used again (a bulk transfer timed out,
+    /// stalled or failed; no Reset Endpoint recovery exists).
+    eps_broken: [bool; MAX_ENDPOINTS],
+    /// Endpoint `eps[k]` is a bulk endpoint (else interrupt).
+    bulk: [bool; MAX_ENDPOINTS],
 }
 
 impl Device {
@@ -430,6 +439,9 @@ static OP_VIRT: AtomicU64 = AtomicU64::new(0);
 /// Lock-free copy of `MaxPorts` (published with [`OP_VIRT`], checked
 /// against the mapping in `probe`), for [`portsc_unlocked`].
 static MAX_PORTS: AtomicU8 = AtomicU8::new(0);
+/// Bulk TDs ever enqueued (rung doorbells on bulk endpoints), for the
+/// "no transfer after the seal" checks of `usb::storage_seal`.
+static BULK_TDS: AtomicU64 = AtomicU64::new(0);
 
 /// Volatile 32-bit read of a register through the lock-free mirror.
 ///
@@ -1080,6 +1092,54 @@ pub fn read_slot_buffer(slot: u8, off: usize, out: &mut [u8]) -> Result<(), Xhci
     })
 }
 
+/// Copy `data` to offset `off` of the slot's data page (e.g. a CBW before
+/// [`bulk`] sends it).
+pub fn write_slot_buffer(slot: u8, off: usize, data: &[u8]) -> Result<(), XhciError> {
+    with_driver(|d| {
+        let (_, dev) = d.device(slot)?;
+        let end = off.checked_add(data.len()).ok_or(XhciError::BadBuffer)?;
+        if end > PAGE as usize {
+            return Err(XhciError::BadBuffer);
+        }
+        let base = dma_virt(dev.page(PG_BUF) + off as u64) as *mut u8;
+        for (i, &b) in data.iter().enumerate() {
+            // SAFETY: `off + i < PAGE`: a byte of the slot's data page, a
+            // frame this driver owns and no Rust reference points into. No
+            // transfer is in flight (every transfer is waited for under the
+            // lock we hold; a broken endpoint's ring is never rung again).
+            unsafe { core::ptr::write_volatile(base.add(i), b) };
+        }
+        Ok(())
+    })
+}
+
+/// One bulk TD (a single Normal TRB with ISP and IOC) of `len` bytes on the
+/// configured bulk endpoint `ep_address` (bit 7 = IN) of `slot`, using
+/// `buf_phys`, which must lie in the slot's data page ([`slot_buffer`]).
+/// Returns the bytes transferred (fewer on a short packet, code 13, which
+/// is not an error). Exactly one TD is in flight on the ring (ledger
+/// Task 12). Waits at most [`BULK_TIMEOUT_MS`]; a timeout or an error
+/// completion (e.g. a stall, code 6) leaves the endpoint unused from then
+/// on (there is no Reset Endpoint recovery).
+pub fn bulk(slot: u8, ep_address: u8, buf_phys: u64, len: usize) -> Result<usize, XhciError> {
+    with_driver(|d| {
+        let (_, dev) = d.device(slot)?;
+        let page = dev.page(PG_BUF);
+        let fits = buf_phys >= page && buf_phys.checked_add(len as u64).is_some_and(|end| end <= page + PAGE);
+        // Endpoint first: an unknown endpoint is BadEndpoint whatever the buffer.
+        d.bulk_ring(&dev, ep_address)?;
+        if len == 0 || !fits {
+            return Err(XhciError::BadBuffer);
+        }
+        d.bulk(slot, ep_address, buf_phys, len as u32)
+    })
+}
+
+/// Bulk TDs enqueued since boot (every one rang a doorbell).
+pub fn bulk_transfers() -> u64 {
+    BULK_TDS.load(Ordering::Acquire)
+}
+
 /// Control transfer with an IN data stage of `len` bytes into `buf_phys`,
 /// which must lie in the slot's data page ([`slot_buffer`]); `len` must
 /// equal `packet.length`. Returns the bytes received (fewer on a short
@@ -1169,7 +1229,7 @@ unsafe fn zero_frame(phys: u64) {
 }
 
 /// Spin at most `ms` milliseconds (tick and TSC bounded).
-fn pause_ms(ms: u64) {
+pub(crate) fn pause_ms(ms: u64) {
     let dl = Deadline::new(ms);
     while !dl.expired() {
         core::hint::spin_loop();
@@ -1343,6 +1403,8 @@ impl Driver {
             ep0: ProducerRing::new(frames + PG_EP0 * PAGE, TRANSFER_TRBS),
             ep0_broken: false,
             eps: [None; MAX_ENDPOINTS],
+            eps_broken: [false; MAX_ENDPOINTS],
+            bulk: [false; MAX_ENDPOINTS],
         };
         let csz = self.caps.csz64;
         let input = dev.page(PG_INPUT);
@@ -1457,9 +1519,87 @@ impl Driver {
         self.command_ok(Trb::configure_endpoint(input, slot))?;
         for (k, &(dci, _)) in plan[..eps.len()].iter().enumerate() {
             dev.eps[k] = Some((dci, ProducerRing::new(dev.page(PG_EPS + k as u64), TRANSFER_TRBS)));
+            dev.bulk[k] = eps[k].0.attributes & 3 == 2;
         }
         self.devices[i] = Some(dev);
         Ok(())
+    }
+
+    /// Index into `dev.eps` of the configured *bulk* endpoint `ep_address`
+    /// (an interrupt endpoint, EP0 or an unconfigured address is
+    /// `BadEndpoint`). Read from the driver's software copy of the input
+    /// context it wrote, never from controller memory.
+    fn bulk_ring(&self, dev: &Device, ep_address: u8) -> Result<usize, XhciError> {
+        let dci = ctx::dci(ep_address);
+        let k = dev
+            .eps
+            .iter()
+            .position(|e| e.is_some_and(|(d, _)| d == dci && dci >= 2))
+            .ok_or(XhciError::BadEndpoint)?;
+        if !dev.bulk[k] {
+            return Err(XhciError::BadEndpoint);
+        }
+        Ok(k)
+    }
+
+    fn bulk(&mut self, slot: u8, ep_address: u8, buf: u64, len: u32) -> Result<usize, XhciError> {
+        let (i, mut dev) = self.device(slot)?;
+        let k = self.bulk_ring(&dev, ep_address)?;
+        if dev.eps_broken[k] {
+            return Err(XhciError::EndpointBroken);
+        }
+        let Some((dci, mut ring)) = dev.eps[k] else { return Err(XhciError::BadEndpoint) };
+        let dma = self.idle()?;
+        let ring_base = dev.page(PG_EPS + k as u64);
+        let e = ring.enqueue(Trb::normal(buf, len, true));
+        let at = ring_base + e.index as u64 * 16;
+        // SAFETY: `e.index` and the link index are < TRANSFER_TRBS: TRB
+        // slots of this endpoint's ring frame. The previous TD on the ring
+        // completed (or the ring is broken and never rung again).
+        unsafe {
+            write_trb(at, e.trb);
+            if let Some((li, link)) = e.link {
+                write_trb(ring_base + li as u64 * 16, link);
+            }
+        }
+        dev.eps[k] = Some((dci, ring));
+        self.devices[i] = Some(dev);
+        BULK_TDS.fetch_add(1, Ordering::AcqRel);
+        // TRB visible before the doorbell reaches the controller.
+        fence(Ordering::SeqCst);
+        self.regs.write32(self.db + 4 * u64::from(slot), u32::from(dci))?;
+
+        let want = Want::Transfer { slot, dci };
+        let dl = Deadline::new(BULK_TIMEOUT_MS);
+        let r = loop {
+            let expired = dl.expired();
+            if let Drained::Done(Event::Transfer { trb, code, residual, .. }) = self.drain_once(&dma, want)? {
+                if trb != at {
+                    // Names no TRB of this TD (hostile or stale): ignored.
+                    self.queue.dropped = self.queue.dropped.saturating_add(1);
+                } else if code == ring::SUCCESS || code == ring::SHORT_PACKET {
+                    // A residual larger than the request is hostile: 0 bytes.
+                    break Ok(len.saturating_sub(residual) as usize);
+                } else {
+                    break Err(XhciError::Transfer(code));
+                }
+            }
+            if let Err(e) = self.check_running() {
+                break Err(e);
+            }
+            if expired {
+                break Err(XhciError::Timeout);
+            }
+            core::hint::spin_loop();
+        };
+        if r.is_err() {
+            // Halted (stall) or unknown with the TD maybe still queued:
+            // never enqueue behind it.
+            if let Some(d) = self.devices[i].as_mut() {
+                d.eps_broken[k] = true;
+            }
+        }
+        r
     }
 
     /// One control TD on EP0 (Setup, optional Data, Status with IOC), then

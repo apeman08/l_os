@@ -315,6 +315,13 @@ fn sys_sysinfo(handle: u64, what: u64) -> i64 {
             (if crate::cpu::smep_enabled() { abi::CPU_SMEP } else { 0 }
                 | if crate::cpu::smap_enabled() { abi::CPU_SMAP } else { 0 }) as i64
         }
+        // Atomics only (spec §7.2): no driver lock is taken here.
+        abi::SYSINFO_AMNESIA => abi::pack_amnesia(
+            crate::wipe::amnesia(),
+            crate::usb::keyboard_present(),
+            u32::try_from(crate::usb::stick_reads()).unwrap_or(u32::MAX),
+            crate::acpi::power_off_plan_unlocked().is_some(),
+        ) as i64,
         abi::SYSINFO_WALL_CLOCK => match crate::rtc::unix_time() {
             Some(t) => t as i64,
             None => abi::ERR_NO_CLOCK,

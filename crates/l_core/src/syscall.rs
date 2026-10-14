@@ -5,6 +5,7 @@
 //! registers are preserved.
 
 use crate::policy::{Decision, DenyReason};
+use crate::wipe::Amnesia;
 
 pub const SYS_EXIT: u64 = 0;
 /// `write(console_handle, ptr, len)`: handle needs `Rights::WRITE`.
@@ -69,6 +70,9 @@ pub const SYSINFO_CPU: u64 = 1;
 /// Wall-clock seconds since the Unix epoch from the RTC, or an error if the
 /// RTC is unreadable or implausible.
 pub const SYSINFO_WALL_CLOCK: u64 = 2;
+/// The amnesia status for the shell's `security` command, packed by
+/// [`pack_amnesia`] (spec E7). Read from atomics only.
+pub const SYSINFO_AMNESIA: u64 = 3;
 pub const CPU_SMEP: u64 = 1;
 pub const CPU_SMAP: u64 = 2;
 
@@ -119,6 +123,53 @@ pub fn decision_to_ret(d: Decision) -> i64 {
         Decision::Deny(DenyReason::NoGrant) => DENIED_NO_GRANT,
         Decision::Deny(DenyReason::Expired) => DENIED_EXPIRED,
         Decision::Deny(DenyReason::InvalidDestination) => DENIED_INVALID_DESTINATION,
+    }
+}
+
+const AM_STICK_SEALED: u64 = 1;
+const AM_PLAN_READY: u64 = 1 << 1;
+const AM_SERIAL_MIRROR: u64 = 1 << 2;
+const AM_KEYBOARD: u64 = 1 << 3;
+const AM_ACPI_POWEROFF: u64 = 1 << 4;
+/// `stick_reads` occupies bits 8..40, so a packed value never has bit 63
+/// set (it is returned as a non-negative `i64`).
+const AM_READS_SHIFT: u32 = 8;
+
+/// What `sysinfo(SYSINFO_AMNESIA)` reports, unpacked by [`unpack_amnesia`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmnesiaStatus {
+    pub amnesia: Amnesia,
+    /// A USB boot keyboard was enumerated.
+    pub keyboard: bool,
+    /// Bulk-only commands sent to mass storage since boot (saturated).
+    pub stick_reads: u32,
+    /// The ACPI S5 power-off values were found.
+    pub acpi_poweroff: bool,
+}
+
+/// Bits 0..=4: stick sealed, plan ready, serial mirror, keyboard, ACPI
+/// power-off; bits 8..40: `stick_reads`. Always below `1 << 40`.
+pub fn pack_amnesia(a: Amnesia, keyboard: bool, stick_reads: u32, acpi: bool) -> u64 {
+    let flag = |b: bool, bit: u64| if b { bit } else { 0 };
+    flag(a.stick_sealed, AM_STICK_SEALED)
+        | flag(a.plan_ready, AM_PLAN_READY)
+        | flag(a.serial_mirror, AM_SERIAL_MIRROR)
+        | flag(keyboard, AM_KEYBOARD)
+        | flag(acpi, AM_ACPI_POWEROFF)
+        | u64::from(stick_reads) << AM_READS_SHIFT
+}
+
+/// Inverse of [`pack_amnesia`]; unknown bits are ignored.
+pub fn unpack_amnesia(v: u64) -> AmnesiaStatus {
+    AmnesiaStatus {
+        amnesia: Amnesia {
+            stick_sealed: v & AM_STICK_SEALED != 0,
+            plan_ready: v & AM_PLAN_READY != 0,
+            serial_mirror: v & AM_SERIAL_MIRROR != 0,
+        },
+        keyboard: v & AM_KEYBOARD != 0,
+        stick_reads: (v >> AM_READS_SHIFT) as u32,
+        acpi_poweroff: v & AM_ACPI_POWEROFF != 0,
     }
 }
 
@@ -211,6 +262,36 @@ mod tests {
         assert!(!range_in_user_space(0xffff_8000_0000_0000, 8)); // kernel half
         assert!(!range_in_user_space(u64::MAX - 4, 16)); // overflow
         assert!(!range_in_user_space(0x4444_4444_0000 | (1 << 63), 8));
+    }
+
+    #[test]
+    fn amnesia_pack_roundtrip() {
+        use crate::wipe::Amnesia;
+        for bits in 0..32u8 {
+            let a = Amnesia {
+                stick_sealed: bits & 1 != 0,
+                plan_ready: bits & 2 != 0,
+                serial_mirror: bits & 4 != 0,
+            };
+            let (kbd, acpi) = (bits & 8 != 0, bits & 16 != 0);
+            for reads in [0u32, 1, 3, 0x7fff_ffff, 0x8000_0000, u32::MAX - 1, u32::MAX] {
+                let v = pack_amnesia(a, kbd, reads, acpi);
+                // Must survive the syscall return path: never negative.
+                assert!((v as i64) >= 0, "{v:#x}");
+                let s = unpack_amnesia(v);
+                assert_eq!(s.amnesia, a);
+                assert_eq!((s.keyboard, s.stick_reads, s.acpi_poweroff), (kbd, reads, acpi));
+                assert_eq!(s.amnesia.label(), a.label());
+            }
+        }
+        // Unknown bits are ignored; garbage never yields "ja" by accident
+        // unless the three status bits say so.
+        let s = unpack_amnesia(u64::MAX);
+        assert!(s.amnesia.serial_mirror && !s.amnesia.armed());
+        let s = unpack_amnesia(0);
+        assert!(!s.amnesia.armed() && !s.keyboard && !s.acpi_poweroff && s.stick_reads == 0);
+        let s = unpack_amnesia(0b11 | 1 << 60);
+        assert!(s.amnesia.armed());
     }
 
     #[test]

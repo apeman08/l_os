@@ -154,7 +154,7 @@ fn user_frames_marked_and_cleared() {
 fn amnesia_plan_ready_after_arm() {
     let a = wipe::amnesia();
     assert!(a.plan_ready);
-    assert!(!a.stick_sealed, "no USB stick driver yet");
+    assert!(!a.stick_sealed, "no USB stick in this test machine");
     assert_eq!(a.serial_mirror, l_os::SERIAL_MIRROR);
     // Arming is one-shot; a second call is refused and keeps the plan.
     let facts = l_os::boot_facts().expect("boot facts");

@@ -272,13 +272,14 @@ pub fn island_virt() -> (u64, usize) {
     (&raw const ISLAND as u64, core::mem::size_of::<Island>())
 }
 
-/// Status inputs for "amnesisch: ja/nein" (spec E7). There is no USB stick
-/// driver yet, so `stick_sealed` is false. A build whose [`trigger`] only
-/// counts (`test-hooks`, `cfg(test)`) reports `plan_ready = false`, so it can
-/// never show "amnesisch: ja".
+/// Status inputs for "amnesisch: ja/nein" (spec E7): boot stick identified
+/// and sealed ([`crate::usb::stick_sealed`]), plan armed, serial mirror off.
+/// A build whose [`trigger`] only counts (`test-hooks`, `cfg(test)`) reports
+/// `plan_ready = false`, so it can never show "amnesisch: ja". Lock-free
+/// (atomics only), as the `security` command requires (spec §7.2).
 pub fn amnesia() -> Amnesia {
     Amnesia {
-        stick_sealed: false,
+        stick_sealed: crate::usb::stick_sealed(),
         plan_ready: PLAN_READY.load(Ordering::Acquire) && !HOOKED,
         serial_mirror: crate::SERIAL_MIRROR,
     }

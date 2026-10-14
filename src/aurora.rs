@@ -9,8 +9,13 @@ use l_core::widgets::HintBar;
 
 /// Status bar, left: the system's name.
 pub const STATUS_LEFT: &str = "Larp OS";
-/// Status bar, right: the system state. There is no amnesic mode yet.
-pub const STATUS_RIGHT: &str = "amnesisch: nein";
+/// Status bar, right: the system state, "amnesisch: ja" only when every
+/// condition of spec E7 holds ([`crate::wipe::amnesia`], `Amnesia::label`).
+/// Read when the chrome is turned on, i.e. after the boot stick was
+/// identified and sealed.
+pub fn status_right() -> &'static str {
+    crate::wipe::amnesia().label()
+}
 
 /// Hint bar: only keys the shell really handles today (`user/src/bin/shell.rs`
 /// with the `l_core::shell` line editor): Enter submits the line, Backspace
@@ -34,7 +39,7 @@ pub fn hint_bar() -> HintBar {
 /// [`BOOT_FADE_MS`] unless [`REDUCE_MOTION`]). Returns the number of frames
 /// drawn, or `None` without a console (or one too small for the bars).
 pub fn show_chrome() -> Option<u32> {
-    if !crate::fb_console::enable_chrome(STATUS_LEFT, STATUS_RIGHT, hint_bar()) {
+    if !crate::fb_console::enable_chrome(STATUS_LEFT, status_right(), hint_bar()) {
         return None;
     }
     Some(crate::fb_console::fade_in_chrome(crate::time::ticks_from_ms(BOOT_FADE_MS), REDUCE_MOTION))
