@@ -131,6 +131,9 @@ impl Amnesia {
     }
 
     /// First failing reason (serial mirror takes precedence), "" when armed.
+    /// A `test-hooks` kernel reports `plan_ready = false` (its wipe only
+    /// counts), so it shows "Wipe-Plan fehlt"; the struct has no separate
+    /// test-hooks input.
     pub fn reason(&self) -> &'static str {
         if self.serial_mirror {
             "Serial-Spiegel an"

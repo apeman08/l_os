@@ -3,8 +3,9 @@
 //! runner attaches `qemu-xhci` + `usb-storage` (this very image, read-only)
 //! + `usb-kbd` to every `usb_*` test.
 //!
-//! Tests run in name order; the `a_` test reads before anything is sealed,
-//! every other test is independent of the order (identify is idempotent).
+//! Tests run in name order; the `a_` tests run before anything is sealed,
+//! the `z_` test (controller restart) last; the others are independent of
+//! the order (identify is idempotent).
 #![no_std]
 #![no_main]
 #![feature(custom_test_frameworks)]
@@ -102,7 +103,7 @@ fn identify_rejects_foreign_markers() {
 }
 
 #[test_case]
-fn bulk_rejects_bad_arguments() {
+fn a_bulk_rejects_bad_arguments() {
     let s = usb::enumerate();
     let tds = xhci::bulk_transfers();
     for d in s.devices() {
@@ -138,6 +139,15 @@ fn reads_refused_after_seal() {
     assert_eq!(usb::storage_read(0, &mut [0u8; 3]), Err(StorageError::Sealed));
     usb::storage_seal(); // idempotent
     assert_eq!(usb::identify_boot_stick(), Ok(usb::stick_port().unwrap()), "cached, no traffic");
+    // The seal is enforced in the xHCI driver itself: a direct bulk call on
+    // the stick's endpoints (bypassing usb::storage_read) is refused.
+    let s = usb::enumerate();
+    let stick = s.devices().iter().find(|d| Some(d.port) == usb::stick_port()).expect("stick in summary");
+    let DeviceKind::BulkOnlyStorage { ep_in, ep_out, .. } = stick.kind else { panic!("stick kind {:?}", stick.kind) };
+    let buf = xhci::slot_buffer(stick.slot).expect("slot buffer");
+    assert_eq!(xhci::bulk(stick.slot, ep_out.address, buf, 31), Err(xhci::XhciError::Sealed));
+    assert_eq!(xhci::bulk(stick.slot, ep_in.address, buf, 512), Err(xhci::XhciError::Sealed));
+    assert_eq!(xhci::bulk(stick.slot, ep_in.address, buf, 13), Err(xhci::XhciError::Sealed));
     assert_eq!(usb::stick_reads(), reads, "no read after the seal");
     assert_eq!(xhci::bulk_transfers(), tds, "no bulk TD after the seal");
     assert!(sector.iter().all(|&b| b == 0), "nothing copied");
@@ -149,4 +159,31 @@ fn stick_is_identified_by_boot_marker() {
     assert_eq!(port, storage_port());
     assert_eq!(usb::stick_port(), Some(port));
     assert!(usb::keyboard_present(), "usb-kbd enumerated");
+}
+
+/// Spec §7.1 step 7 ("nie wieder angesprochen") and §2 (no hotplug
+/// enumeration): a controller restart after the seal enumerates the
+/// keyboard again but skips the stick's port entirely (no port reset, no
+/// slot, no control transfer).
+#[test_case]
+fn z_restart_after_seal_skips_storage() {
+    usb::identify_boot_stick().expect("boot stick");
+    usb::storage_seal();
+    let port = usb::stick_port().expect("stick port");
+    let before = usb::enumerate();
+    let gen0 = xhci::generation().expect("running");
+    let (reads, tds) = (usb::stick_reads(), xhci::bulk_transfers());
+    xhci::halt_for_wipe();
+    let after = usb::enumerate();
+    serial_println!("\n  before {:?}\n  after  {:?}", before.devices(), after.devices());
+    assert_eq!(xhci::generation(), Some(gen0 + 1), "controller restarted, fresh scan");
+    assert!(after.devices().iter().all(|d| d.port != port), "stick port skipped");
+    assert!(after.devices().iter().all(|d| !matches!(d.kind, DeviceKind::BulkOnlyStorage { .. })));
+    let kbd = |s: &usb::UsbSummary| s.devices().iter().filter(|d| matches!(d.kind, DeviceKind::BootKeyboard { .. })).count();
+    assert_eq!(kbd(&after), kbd(&before), "keyboard enumerated again");
+    assert_eq!(kbd(&after), 1);
+    assert_eq!(after.devices().len(), before.devices().len() - 1);
+    assert_eq!((usb::stick_reads(), xhci::bulk_transfers()), (reads, tds));
+    assert!(usb::stick_sealed(), "still identified and sealed after the restart");
+    assert!(wipe::amnesia().stick_sealed);
 }

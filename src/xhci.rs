@@ -46,7 +46,7 @@
 
 use crate::{memory, mmio, pci, time};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering, fence};
 use l_core::usb_desc::{Endpoint, SetupPacket};
 use l_core::xhci_ctx::{self as ctx, Caps, EndpointCtx, PortChange, PortSc, SlotCtx, Speed};
 use l_core::xhci_ring::{self as ring, Event, EventRing, ProducerRing, Trb};
@@ -185,6 +185,9 @@ pub enum XhciError {
     /// An earlier transfer on this endpoint timed out or failed; its ring is
     /// in an unknown state and is not used again.
     EndpointBroken,
+    /// Bulk transfers are sealed ([`seal_bulk`], spec §7.1 step 8): nothing
+    /// was enqueued.
+    Sealed,
 }
 
 /// Result of [`prepare_port`].
@@ -442,6 +445,8 @@ static MAX_PORTS: AtomicU8 = AtomicU8::new(0);
 /// Bulk TDs ever enqueued (rung doorbells on bulk endpoints), for the
 /// "no transfer after the seal" checks of `usb::storage_seal`.
 static BULK_TDS: AtomicU64 = AtomicU64::new(0);
+/// Set once by [`seal_bulk`], never cleared (also not by a re-[`init`]).
+static BULK_SEALED: AtomicBool = AtomicBool::new(false);
 
 /// Volatile 32-bit read of a register through the lock-free mirror.
 ///
@@ -1121,7 +1126,17 @@ pub fn write_slot_buffer(slot: u8, off: usize, data: &[u8]) -> Result<(), XhciEr
 /// Task 12). Waits at most [`BULK_TIMEOUT_MS`]; a timeout or an error
 /// completion (e.g. a stall, code 6) leaves the endpoint unused from then
 /// on (there is no Reset Endpoint recovery).
+///
+/// After [`seal_bulk`] every call returns [`XhciError::Sealed`] before
+/// anything else is looked at. Bulk endpoints exist only on mass storage
+/// (`usb_desc::classify`; the keyboard has an interrupt endpoint) and this
+/// is the only place that enqueues a bulk TD, so the seal here is the
+/// lowest-level guarantee that no storage device is read again, whoever
+/// the caller is.
 pub fn bulk(slot: u8, ep_address: u8, buf_phys: u64, len: usize) -> Result<usize, XhciError> {
+    if bulk_sealed() {
+        return Err(XhciError::Sealed);
+    }
     with_driver(|d| {
         let (_, dev) = d.device(slot)?;
         let page = dev.page(PG_BUF);
@@ -1133,6 +1148,22 @@ pub fn bulk(slot: u8, ep_address: u8, buf_phys: u64, len: usize) -> Result<usize
         }
         d.bulk(slot, ep_address, buf_phys, len as u32)
     })
+}
+
+/// Refuse every later bulk transfer, for good ([`bulk`] returns
+/// [`XhciError::Sealed`]; spec §7.1 step 8). Called by `usb::storage_seal`.
+/// Takes the driver lock, so a transfer in progress (which holds it while
+/// it waits) has completed when this returns, and every later one sees the
+/// flag under the lock ([`Driver::bulk`] checks it again). Thread context
+/// only, like every locked driver call.
+pub fn seal_bulk() {
+    let _g = DRIVER.lock();
+    BULK_SEALED.store(true, Ordering::Release);
+}
+
+/// [`seal_bulk`] was called (lock-free).
+pub fn bulk_sealed() -> bool {
+    BULK_SEALED.load(Ordering::Acquire)
 }
 
 /// Bulk TDs enqueued since boot (every one rang a doorbell).
@@ -1543,6 +1574,11 @@ impl Driver {
     }
 
     fn bulk(&mut self, slot: u8, ep_address: u8, buf: u64, len: u32) -> Result<usize, XhciError> {
+        // Checked again under the driver lock: a seal that came in after
+        // the lock-free check in `bulk` is still honoured.
+        if bulk_sealed() {
+            return Err(XhciError::Sealed);
+        }
         let (i, mut dev) = self.device(slot)?;
         let k = self.bulk_ring(&dev, ep_address)?;
         if dev.eps_broken[k] {

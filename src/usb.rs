@@ -26,7 +26,11 @@
 //! [`TUR_ATTEMPTS`] times, READ CAPACITY(10), READ(10) of LBA 0) and compares
 //! the boot marker in LBA 0 with [`crate::boot_id`]. [`storage_seal`] then
 //! closes the path for good: [`storage_read`] returns `Err(Sealed)` without
-//! a transfer. A failed command, a phase error, a stall or a malformed CSW
+//! a transfer, [`xhci::bulk`] itself refuses every bulk TD (whoever calls
+//! it), and a later [`enumerate`] (after a controller restart) touches only
+//! the ports of the non-storage devices known at the seal, so neither the
+//! stick nor foreign storage is addressed again (spec §7.1 step 7, "nie
+//! wieder angesprochen"; §2: no hotplug enumeration). A failed command, a phase error, a stall or a malformed CSW
 //! ends the attempt for that device (no reset recovery: the endpoint is
 //! not used again); the system keeps running with "amnesisch: nein" (E8).
 //! The status inputs ([`stick_sealed`], [`stick_reads`],
@@ -166,6 +170,16 @@ pub fn kind_name(k: &DeviceKind) -> &'static str {
 /// Bring the controller up and enumerate every connected root-port device
 /// once per controller generation; later calls return the same summary.
 /// Without an xHCI controller the summary is empty and nothing is printed.
+///
+/// After [`storage_seal`], a new generation (a re-`init` after a halt or a
+/// timed-out command) scans only the root ports that held a non-storage
+/// device (keyboard, unsupported) at the seal: the ports of mass storage,
+/// the boot stick's included, get no port reset, no slot and no control
+/// transfer, and ports that were empty or failed at the seal are left
+/// alone too (a device there could be the stick, re-plugged; spec §2 has no
+/// hotplug enumeration). Should a sealed-time keyboard port now hold mass
+/// storage, that device is addressed (it has to be, to be classified) but
+/// gets no endpoints and no configuration.
 pub fn enumerate() -> UsbSummary {
     match xhci::init() {
         Ok(()) | Err(XhciError::AlreadyInitialized) => {}
@@ -190,7 +204,13 @@ pub fn enumerate() -> UsbSummary {
 
 fn scan() -> UsbSummary {
     let mut s = UsbSummary::empty();
+    // Read under the summary lock, which `storage_seal` also takes: the
+    // seal and its port list are seen together.
+    let sealed = SEALED.load(Ordering::Acquire);
     for port in 1..=xhci::port_count() {
+        if sealed && !rescan_allowed(port) {
+            continue;
+        }
         let speed = match xhci::prepare_port(port) {
             Ok(PortReady::Empty) => continue,
             Ok(PortReady::Ready(speed)) => speed,
@@ -296,6 +316,10 @@ fn enumerate_device(port: u8, speed: Speed) -> Result<UsbDevice, UsbError> {
     // xHCI 1.2 §4.3.5: Configure Endpoint first, then SET_CONFIGURATION.
     match kind {
         DeviceKind::Unsupported => return Ok(dev),
+        // Mass storage found after the seal (see `enumerate`): addressed to
+        // be classified, then left unconfigured (`config` 0, no bulk
+        // endpoints); `identify_boot_stick` skips it.
+        DeviceKind::BulkOnlyStorage { .. } if SEALED.load(Ordering::Acquire) => return Ok(dev),
         DeviceKind::BootKeyboard { ep_in, .. } => xhci::configure_endpoints(slot, &[(ep_in, speed)])?,
         DeviceKind::BulkOnlyStorage { ep_in, ep_out, .. } => {
             xhci::configure_endpoints(slot, &[(ep_in, speed), (ep_out, speed)])?
@@ -350,6 +374,15 @@ const CBW_LEN: usize = 31;
 const CSW_LEN: usize = 13;
 /// Data page of a slot ([`xhci::slot_buffer`]): one block must fit.
 const PAGE: usize = 4096;
+// Worst-case boot delay of `identify_boot_stick`: every bulk TD waits at
+// most `xhci::BULK_TIMEOUT_MS` (3 s), and a timeout or any other error ends
+// the probe of that device at once. A hostile device that answers each TD
+// just before the deadline still bounds it: at most 16 TDs per device
+// (TEST UNIT READY 5 x 2, READ CAPACITY 3, READ 3) = 48 s plus the TUR
+// pauses (4 x 20 ms); with `MAX_DEVICES` (8) storage devices at most about
+// 8 x 48 s = 6.4 min. A device that simply does not answer costs one
+// timeout, 3 s (8 such devices: 24 s). Typical: milliseconds (QEMU: 4
+// commands, 10 TDs).
 
 /// Why [`identify_boot_stick`] found no boot stick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,8 +420,10 @@ pub enum StorageError {
     /// CSW status 2: the device needs a reset recovery, which is not done;
     /// the device is given up.
     PhaseError,
-    /// Fewer bytes than the command needs, or a CSW residue larger than the
-    /// requested length or inconsistent with the data received.
+    /// Fewer bytes than the command needs (CBW not fully sent, capacity
+    /// data shorter than 8 bytes, READ(10) data not exactly one block), or
+    /// a CSW residue larger than the requested length. A residue that
+    /// disagrees with the bytes actually received is not checked.
     Short,
     /// TEST UNIT READY never passed.
     NotReady,
@@ -430,13 +465,24 @@ static STORAGE: Mutex<Storage> = Mutex::new(Storage { stick: None, tag: 1 });
 static SEALED: AtomicBool = AtomicBool::new(false);
 /// Root port of the identified boot stick, 0 = none.
 static STICK_PORT: AtomicU8 = AtomicU8::new(0);
-/// Bulk-only commands (CBWs) sent to mass storage since boot.
+/// Bulk-only commands attempted on mass storage since boot (counted before
+/// the CBW is submitted, whether or not it then succeeds).
 static STICK_READS: AtomicU64 = AtomicU64::new(0);
+/// Root ports (bit n of word n / 64 = port n) a scan may touch after the
+/// seal: those of the non-storage devices of the summary at the seal.
+/// Written once, by the first [`storage_seal`], before `SEALED` is set.
+static RESCAN_PORTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn rescan_allowed(port: u8) -> bool {
+    RESCAN_PORTS[usize::from(port / 64)].load(Ordering::Acquire) & (1 << (port % 64)) != 0
+}
 /// A boot keyboard was enumerated and configured.
 static KEYBOARD: AtomicBool = AtomicBool::new(false);
 
-/// Bulk-only commands (TEST UNIT READY, READ CAPACITY, READ) sent to mass
-/// storage since boot; constant after [`storage_seal`].
+/// Bulk-only commands (TEST UNIT READY, READ CAPACITY, READ) *attempted* on
+/// mass storage since boot: each is counted before its CBW is submitted,
+/// also when it then fails, so the count never understates the traffic.
+/// Constant after [`storage_seal`] (which also seals [`xhci::bulk`]).
 pub fn stick_reads() -> u64 {
     STICK_READS.load(Ordering::Acquire)
 }
@@ -475,12 +521,31 @@ pub fn match_boot_marker(sector: &[u8], id: Option<BootId>) -> Result<(), StickE
     }
 }
 
-/// Close the mass-storage path for good: afterwards [`storage_read`]
-/// returns `Err(Sealed)` and no bulk transfer is made. Idempotent.
+/// Close the mass-storage path for good (spec §7.1 step 8): afterwards
+/// [`storage_read`] returns `Err(Sealed)`, [`xhci::bulk`] refuses every
+/// transfer with `XhciError::Sealed` (enforced in the driver, whoever calls
+/// it), and a later [`enumerate`] scans only the ports of the non-storage
+/// devices of the current summary (see there). Idempotent.
 pub fn storage_seal() {
-    // Waits for a command in progress (spec §7.1 step 8).
+    // Waits for a command in progress. Lock order STORAGE, SUMMARY, DRIVER
+    // (as in `identify_boot_stick` -> `enumerate` -> `scan`).
     let _g = STORAGE.lock();
-    SEALED.store(true, Ordering::Release);
+    {
+        // A scan holds SUMMARY: it sees either no seal or the seal together
+        // with its port list.
+        let summary = SUMMARY.lock();
+        if !SEALED.load(Ordering::Acquire) {
+            if let Some((_, s)) = *summary {
+                for d in s.devices() {
+                    if !matches!(d.kind, DeviceKind::BulkOnlyStorage { .. }) {
+                        RESCAN_PORTS[usize::from(d.port / 64)].fetch_or(1 << (d.port % 64), Ordering::AcqRel);
+                    }
+                }
+            }
+            SEALED.store(true, Ordering::Release);
+        }
+    }
+    xhci::seal_bulk();
 }
 
 /// Read block `lba` of the identified boot stick into `buf` (exactly one
