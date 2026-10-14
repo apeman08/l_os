@@ -28,11 +28,26 @@
 //! cycle bit, then the link TRB (if the ring wraps), then a full fence and
 //! the doorbell (ledger Task 12). An event TRB is read control dword first
 //! (the controller writes the cycle bit last), then the body.
+//!
+//! **Ports and devices** (spec §7.1 steps 5–6, Task 20): [`prepare_port`]
+//! resets a connected root port if it is not enabled and acknowledges its
+//! change bits (never writing PED), [`address_device`] enables a slot and
+//! addresses the device, [`control_in`]/[`control_out_nodata`] run control
+//! transfers on EP0 and [`configure_endpoints`] adds interrupt/bulk
+//! endpoints. Every device has a fixed table entry ([`MAX_DEVICES`]) with
+//! its own zeroed DMA frames (input and output context, EP0 ring, two
+//! endpoint rings, one data page), kept for the kernel's lifetime and reused
+//! after a controller reset. A transfer ring never has more than one control
+//! TD in flight (the ring has no full check, ledger Task 12): every transfer
+//! is waited for, and a ring whose transfer timed out or failed is not used
+//! again. The enumeration itself (descriptors, classification) is
+//! [`crate::usb`].
 
 use crate::{memory, mmio, pci, time};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering, fence};
-use l_core::xhci_ctx::Caps;
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering, fence};
+use l_core::usb_desc::{Endpoint, SetupPacket};
+use l_core::xhci_ctx::{self as ctx, Caps, EndpointCtx, PortChange, PortSc, SlotCtx, Speed};
 use l_core::xhci_ring::{self as ring, Event, EventRing, ProducerRing, Trb};
 use spin::Mutex;
 
@@ -85,6 +100,31 @@ const HALT_WAIT_MS: u64 = 20;
 const FALLBACK_CYCLES_PER_MS: u64 = 5_000_000;
 const PAGE: u64 = 4096;
 const FOUR_GIB: u64 = 1 << 32;
+/// Devices the driver keeps state for (spec §7.1 step 6: fixed table).
+pub const MAX_DEVICES: usize = 8;
+/// TRBs per transfer ring (one page holds 256; 64 incl. the link TRB).
+pub const TRANSFER_TRBS: usize = 64;
+/// Bound of a control transfer (USB 2.0 §9.2.6.4 allows 5 s for a request
+/// with data; QEMU and real keyboards/sticks answer in milliseconds).
+pub const CONTROL_TIMEOUT_MS: u64 = 1000;
+/// Bound of the wait for PRC after setting PR (USB 2.0 reset is 10–20 ms).
+const PORT_RESET_MS: u64 = 500;
+/// Reset recovery before the first request (USB 2.0 §7.1.7.5, TRSTRCY).
+const RESET_RECOVERY_MS: u64 = 10;
+/// Frames of one device's DMA area, in this order.
+const DEV_FRAMES: usize = 6;
+const PG_INPUT: u64 = 0;
+const PG_OUTPUT: u64 = 1;
+const PG_EP0: u64 = 2;
+/// First of the two endpoint rings (`PG_EPS`, `PG_EPS + 1`).
+const PG_EPS: u64 = 3;
+const PG_BUF: u64 = 5;
+/// Endpoint rings per device besides EP0 (bulk IN + OUT, or interrupt IN).
+pub const MAX_ENDPOINTS: usize = 2;
+/// Endpoint Context EP Type (xHCI 1.2 table 6-9).
+const EP_TYPE_CONTROL: u8 = 4;
+/// CErr: three retries on transaction errors (section 4.10.2.7).
+const CERR: u8 = 3;
 /// Command TRB types (xHCI 1.2 table 6-91): Enable Slot (9) .. No Op (23).
 const COMMAND_TYPES: core::ops::RangeInclusive<u8> = ring::ENABLE_SLOT..=ring::NOOP_CMD;
 
@@ -121,6 +161,41 @@ pub enum XhciError {
     Busy,
     /// Not a command TRB (type outside 9..=23, e.g. a link TRB).
     InvalidTrb,
+    /// Port number outside `1..=MaxPorts`.
+    BadPort,
+    /// Slot not in the device table (or a slot ID the controller should not
+    /// have handed out).
+    BadSlot,
+    /// Buffer outside the slot's data page, wrong length or direction.
+    BadBuffer,
+    /// Endpoint not usable (type, address, max packet, count, duplicate or
+    /// already configured).
+    BadEndpoint,
+    /// The device table ([`MAX_DEVICES`]) is full.
+    TableFull,
+    /// A device command completed with this (non-success) code.
+    Command(u8),
+    /// A transfer completed with this (error) code; the endpoint is not used
+    /// again.
+    Transfer(u8),
+    /// An earlier transfer on this endpoint timed out or failed; its ring is
+    /// in an unknown state and is not used again.
+    EndpointBroken,
+}
+
+/// Result of [`prepare_port`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortReady {
+    /// Nothing connected (change bits acknowledged).
+    Empty,
+    /// Connected and enabled at this speed, change bits acknowledged.
+    Ready(Speed),
+    /// Connected and enabled, but the speed ID (raw PSIV) is not in the
+    /// default table (ledger Task 13: reported, not guessed).
+    UnknownSpeed(u8),
+    /// The device went away or reconnected during the reset, or the port
+    /// did not enable; nothing is addressed this round.
+    Lost,
 }
 
 impl From<mmio::OutOfBounds> for XhciError {
@@ -267,18 +342,52 @@ fn drain<E>(
     Ok(Drained::Limit)
 }
 
-/// Route one event: `Some(event)` if it completes the command at `want`;
-/// the completion of the `stale` (timed-out) command clears it; any other
-/// completion (of nothing we know) is counted as dropped; every
-/// non-command event is queued for [`pop_event`].
-fn route(queue: &mut EventQueue, stale: &mut Option<u64>, e: Event, want: Option<u64>) -> Option<Event> {
+/// What a waiter is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Want {
+    /// Nothing: every event is routed elsewhere.
+    Nothing,
+    /// The completion of the command TRB at this physical address.
+    Command(u64),
+    /// Any transfer event of this slot and endpoint (DCI); the waiter checks
+    /// which TRB it names.
+    Transfer { slot: u8, dci: u8 },
+}
+
+/// Route one event: `Some(event)` if it is what `want` waits for; the
+/// completion of the `stale` (timed-out) command clears it; any other
+/// completion (of nothing we know) is counted as dropped; every other
+/// event is queued for [`pop_event`].
+fn route(queue: &mut EventQueue, stale: &mut Option<u64>, e: Event, want: Want) -> Option<Event> {
     match e {
-        Event::CommandCompletion { trb, .. } if Some(trb) == want => return Some(e),
+        Event::CommandCompletion { trb, .. } if want == Want::Command(trb) => return Some(e),
         Event::CommandCompletion { trb, .. } if Some(trb) == *stale => *stale = None,
         Event::CommandCompletion { .. } => queue.dropped = queue.dropped.saturating_add(1),
+        Event::Transfer { slot, endpoint, .. } if want == (Want::Transfer { slot, dci: endpoint }) => return Some(e),
         other => queue.push(other),
     }
     None
+}
+
+/// One addressed device (spec §7.1 step 6).
+#[derive(Debug, Clone, Copy)]
+struct Device {
+    slot: u8,
+    port: u8,
+    speed: Speed,
+    /// Physical address of its [`DEV_FRAMES`] contiguous frames.
+    frames: u64,
+    ep0: ProducerRing,
+    /// EP0 is not used again (a transfer timed out or failed).
+    ep0_broken: bool,
+    /// Configured endpoints: DCI and ring ([`configure_endpoints`]).
+    eps: [Option<(u8, ProducerRing)>; MAX_ENDPOINTS],
+}
+
+impl Device {
+    fn page(&self, n: u64) -> u64 {
+        self.frames + n * PAGE
+    }
 }
 
 struct Driver {
@@ -300,6 +409,14 @@ struct Driver {
     queue: EventQueue,
     /// Physical addresses of the scratchpad buffer pages.
     scratch: Vec<u64>,
+    /// Device table; reset by every `start` (the controller reset disabled
+    /// every slot).
+    devices: [Option<Device>; MAX_DEVICES],
+    /// DMA area of table entry `i` (0 = not allocated yet). Allocated on
+    /// first use, kept for the kernel's lifetime, re-zeroed on reuse.
+    dev_frames: [u64; MAX_DEVICES],
+    /// Number of successful `start`s; device state belongs to one.
+    generation: u64,
 }
 
 static DRIVER: Mutex<Option<Driver>> = Mutex::new(None);
@@ -310,6 +427,9 @@ static DRIVER: Mutex<Option<Driver>> = Mutex::new(None);
 /// once in `probe`, after the mapping exists and the offsets were checked;
 /// the window's mappings are never removed.
 static OP_VIRT: AtomicU64 = AtomicU64::new(0);
+/// Lock-free copy of `MaxPorts` (published with [`OP_VIRT`], checked
+/// against the mapping in `probe`), for [`portsc_unlocked`].
+static MAX_PORTS: AtomicU8 = AtomicU8::new(0);
 
 /// Volatile 32-bit read of a register through the lock-free mirror.
 ///
@@ -494,8 +614,9 @@ fn dma_virt(phys: u64) -> u64 {
 /// Write one 32-bit word of DMA memory.
 ///
 /// # Safety
-/// `phys..phys+4` must lie in a frame of this driver's [`Dma`] (allocated
-/// by `alloc_frames`, never freed), 4-byte aligned.
+/// `phys..phys+4` must lie in a frame this driver allocated and owns for
+/// the kernel's lifetime (its [`Dma`] structures or a device area in
+/// `Driver::dev_frames`), 4-byte aligned.
 unsafe fn dma_write32(phys: u64, v: u32) {
     // SAFETY: caller contract; the frame is RAM mapped at the physical
     // offset and owned by the driver (no Rust reference to it exists), so a
@@ -514,10 +635,12 @@ unsafe fn dma_read32(phys: u64) -> u32 {
 /// dword carrying the cycle bit.
 ///
 /// # Safety
-/// `phys` must be a TRB slot (16 bytes) of the driver's command ring.
+/// `phys` must be a TRB slot (16 bytes) of one of the driver's rings
+/// (command ring or a transfer ring in a device area).
 unsafe fn write_trb(phys: u64, t: Trb) {
     let w = t.to_words();
-    // SAFETY: caller contract: the 16 bytes at `phys` are a slot of our ring.
+    // SAFETY: caller contract: the 16 bytes at `phys` are a slot of one of
+    // our rings, inside a driver-owned frame.
     unsafe {
         dma_write32(phys, w[0]);
         dma_write32(phys + 4, w[1]);
@@ -560,6 +683,7 @@ impl Driver {
             return Err(XhciError::BadRegisters);
         }
         pci::enable_bus_mastering(&dev);
+        MAX_PORTS.store(caps.max_ports, Ordering::Release);
         OP_VIRT.store(regs.virt() + op, Ordering::Release);
         Ok(Driver {
             regs,
@@ -574,6 +698,9 @@ impl Driver {
             stale: None,
             queue: EventQueue::new(),
             scratch: Vec::new(),
+            devices: [None; MAX_DEVICES],
+            dev_frames: [0; MAX_DEVICES],
+            generation: 0,
         })
     }
 
@@ -662,6 +789,9 @@ impl Driver {
         self.stale = None;
         self.queue = EventQueue::new();
         self.dma = Some(dma);
+        // HCRST disabled every slot and the DCBAA was re-zeroed: no device
+        // state survives (the frames stay in `dev_frames` for reuse).
+        self.devices = [None; MAX_DEVICES];
 
         // All DMA structures are written before the controller may run.
         fence(Ordering::SeqCst);
@@ -669,6 +799,7 @@ impl Driver {
         self.write_op(USBCMD, c & !(CMD_INTE | CMD_HCRST) | CMD_RS)?;
         self.wait(t, |d| Ok(d.sts()? & STS_HCH == 0))?;
         self.started = true;
+        self.generation = self.generation.wrapping_add(1);
 
         // Step 4: self-test.
         match self.submit(Trb::noop_cmd(), t)? {
@@ -789,7 +920,7 @@ impl Driver {
     /// One bounded pass over the event ring (at most [`EVENT_TRBS`] events,
     /// so a controller that keeps producing events cannot keep the caller
     /// from checking its deadline).
-    fn drain_once(&mut self, dma: &Dma, want: Option<u64>) -> Result<Drained, XhciError> {
+    fn drain_once(&mut self, dma: &Dma, want: Want) -> Result<Drained, XhciError> {
         let Driver { ev, regs, ir0, queue, stale, .. } = self;
         let ir0 = *ir0;
         drain(EVENT_TRBS, || Driver::next_event(ev, regs, ir0, dma), |e| route(queue, stale, e, want))
@@ -803,7 +934,7 @@ impl Driver {
         self.check_running()?;
         // At most one command in flight (the ring has no full check).
         if self.stale.is_some() {
-            self.drain_once(&dma, None)?;
+            self.drain_once(&dma, Want::Nothing)?;
             if self.stale.is_some() {
                 return Err(XhciError::Busy);
             }
@@ -825,7 +956,7 @@ impl Driver {
 
         let dl = Deadline::new(timeout_ms);
         loop {
-            if let Drained::Done(e) = self.drain_once(&dma, Some(at))? {
+            if let Drained::Done(e) = self.drain_once(&dma, Want::Command(at))? {
                 return Ok(e);
             }
             let expired = dl.expired();
@@ -839,6 +970,585 @@ impl Driver {
             }
             core::hint::spin_loop();
         }
+    }
+}
+
+/// Run `f` on the started driver (lock held: boot phase only, not for an
+/// ISR).
+fn with_driver<T>(f: impl FnOnce(&mut Driver) -> Result<T, XhciError>) -> Result<T, XhciError> {
+    let mut g = DRIVER.lock();
+    match g.as_mut() {
+        Some(d) if d.started => f(d),
+        _ => Err(XhciError::NotInitialized),
+    }
+}
+
+/// Number of successful controller starts, `None` before the first one.
+/// Device state ([`address_device`] and later) belongs to one generation:
+/// a re-[`init`] resets the controller and forgets every slot.
+pub fn generation() -> Option<u64> {
+    DRIVER.lock().as_ref().filter(|d| d.started).map(|d| d.generation)
+}
+
+/// `MaxPorts`, 0 before a controller was mapped (lock-free).
+pub fn port_count() -> u8 {
+    MAX_PORTS.load(Ordering::Acquire)
+}
+
+/// Raw PORTSC of root port `port` (1-based).
+pub fn portsc(port: u8) -> Result<PortSc, XhciError> {
+    with_driver(|d| d.read_port(d.port_off(port)?))
+}
+
+/// PORTSC of root port `port` without the driver lock (for the timer-ISR
+/// polling of Tasks 21–23, which must not spin on [`DRIVER`]); `None`
+/// before a controller was mapped or for a port outside `1..=MaxPorts`.
+/// An all-ones value means the controller is gone; the caller checks
+/// [`PortSc::is_all_ones`] before acting on it.
+pub fn portsc_unlocked(port: u8) -> Option<PortSc> {
+    let op = OP_VIRT.load(Ordering::Acquire);
+    if op == 0 || port == 0 || port > MAX_PORTS.load(Ordering::Acquire) {
+        return None;
+    }
+    let off = PORT_REGS + 0x10 * u64::from(port - 1);
+    // SAFETY: `op` was published by `probe` after it checked that the port
+    // registers of all `MaxPorts` ports lie inside the BAR mapping (which is
+    // never unmapped); `port` is in `1..=MaxPorts`, so `op + off` is the
+    // 4-byte aligned PORTSC of that port.
+    Some(PortSc(unsafe { op_read(op, off) }))
+}
+
+/// Spec §7.1 step 5 for one root port: a connected port that is not enabled
+/// (USB2 after HCRST) or whose speed is not known is reset (PR) and PRC
+/// awaited; then the change bits are acknowledged (never PED) and the port
+/// re-read, so a disconnect or reconnect during the reset is seen
+/// ([`PortReady::Lost`]). An empty port only gets its change bits
+/// acknowledged. Errors are controller-level (gone, bad port number).
+pub fn prepare_port(port: u8) -> Result<PortReady, XhciError> {
+    with_driver(|d| d.prepare_port(port))
+}
+
+/// Acknowledge whatever change bits root port `port` has set (writing only
+/// those bits, PED as 0) and return PORTSC as read afterwards.
+pub fn ack_port(port: u8) -> Result<PortSc, XhciError> {
+    with_driver(|d| {
+        let off = d.port_off(port)?;
+        let v = d.read_port(off)?;
+        d.ack_port(off, v)?;
+        d.read_port(off)
+    })
+}
+
+/// Enable Slot, set up the slot's input/output contexts and EP0 ring
+/// (EP0 max packet from `speed`), point DCBAA at the output context and
+/// Address Device (BSR = 0). Returns the slot ID.
+pub fn address_device(port: u8, speed: Speed) -> Result<u8, XhciError> {
+    with_driver(|d| d.address_device(port, speed))
+}
+
+/// Evaluate Context: EP0 max packet size `max_packet` (after the 8-byte
+/// device-descriptor prefix showed a different `bMaxPacketSize0`).
+pub fn set_ep0_max_packet(slot: u8, max_packet: u16) -> Result<(), XhciError> {
+    with_driver(|d| d.set_ep0_max_packet(slot, max_packet))
+}
+
+/// Physical address of the slot's data page (one page, for the data stage
+/// of [`control_in`]); `None` for a slot not in the table.
+pub fn slot_buffer(slot: u8) -> Option<u64> {
+    let g = DRIVER.lock();
+    let d = g.as_ref().filter(|d| d.started)?;
+    d.device(slot).ok().map(|(_, dev)| dev.page(PG_BUF))
+}
+
+/// Copy `out.len()` bytes from offset `off` of the slot's data page.
+pub fn read_slot_buffer(slot: u8, off: usize, out: &mut [u8]) -> Result<(), XhciError> {
+    with_driver(|d| {
+        let (_, dev) = d.device(slot)?;
+        let end = off.checked_add(out.len()).ok_or(XhciError::BadBuffer)?;
+        if end > PAGE as usize {
+            return Err(XhciError::BadBuffer);
+        }
+        let base = dma_virt(dev.page(PG_BUF) + off as u64) as *const u8;
+        for (i, b) in out.iter_mut().enumerate() {
+            // SAFETY: `off + i < PAGE`: a byte of the slot's data page, a
+            // frame this driver owns. No transfer is in flight (they are
+            // waited for under the lock we hold), and a device write would
+            // only change the value, so a volatile read of a `u8` is sound.
+            *b = unsafe { core::ptr::read_volatile(base.add(i)) };
+        }
+        Ok(())
+    })
+}
+
+/// Control transfer with an IN data stage of `len` bytes into `buf_phys`,
+/// which must lie in the slot's data page ([`slot_buffer`]); `len` must
+/// equal `packet.length`. Returns the bytes received (fewer on a short
+/// packet). Waits at most [`CONTROL_TIMEOUT_MS`]; a timeout or an error
+/// completion leaves EP0 unused from then on.
+pub fn control_in(slot: u8, packet: SetupPacket, buf_phys: u64, len: usize) -> Result<usize, XhciError> {
+    with_driver(|d| {
+        let (_, dev) = d.device(slot)?;
+        let page = dev.page(PG_BUF);
+        let fits = buf_phys >= page && buf_phys.checked_add(len as u64).is_some_and(|end| end <= page + PAGE);
+        if !packet.dir_in() || len == 0 || len != usize::from(packet.length) || !fits {
+            return Err(XhciError::BadBuffer);
+        }
+        d.control(slot, packet, Some((buf_phys, len as u32)))
+    })
+}
+
+/// Control transfer without a data stage (`packet` must be host-to-device
+/// with `wLength == 0`), e.g. SET_CONFIGURATION, SET_PROTOCOL, SET_IDLE.
+pub fn control_out_nodata(slot: u8, packet: SetupPacket) -> Result<(), XhciError> {
+    with_driver(|d| {
+        d.device(slot)?;
+        if packet.dir_in() || packet.length != 0 {
+            return Err(XhciError::BadBuffer);
+        }
+        d.control(slot, packet, None).map(|_| ())
+    })
+}
+
+/// Configure Endpoint: add up to [`MAX_ENDPOINTS`] interrupt or bulk
+/// endpoints, each with a fresh transfer ring (link TRB back to its start,
+/// dequeue pointer = ring start, DCS = 1) and, for interrupt endpoints, the
+/// interval from `ep_interval(speed, bInterval)`. Once per device.
+pub fn configure_endpoints(slot: u8, eps: &[(Endpoint, Speed)]) -> Result<(), XhciError> {
+    with_driver(|d| d.configure_endpoints(slot, eps))
+}
+
+/// Slot State from the output Slot Context (0 disabled/enabled,
+/// 1 default, 2 addressed, 3 configured); `None` for an unknown slot.
+pub fn slot_state(slot: u8) -> Option<u8> {
+    with_driver(|d| {
+        let (_, dev) = d.device(slot)?;
+        // SAFETY: DW3 of the slot context, inside the slot's output-context
+        // frame (owned by the driver), 4-byte aligned.
+        Ok((unsafe { dma_read32(dev.page(PG_OUTPUT) + 12) } >> 27) as u8)
+    })
+    .ok()
+}
+
+/// EP State of endpoint `dci` (1..=31) from the output context
+/// (0 disabled, 1 running, 2 halted, 3 stopped, 4 error).
+pub fn endpoint_state(slot: u8, dci: u8) -> Option<u8> {
+    if !(1..=31).contains(&dci) {
+        return None;
+    }
+    with_driver(|d| {
+        let (_, dev) = d.device(slot)?;
+        let at = dev.page(PG_OUTPUT) + ctx::ctx_offset(usize::from(dci), d.caps.csz64) as u64;
+        // SAFETY: `dci <= 31`, so the context lies inside the 2 KiB (64-byte
+        // contexts) output context in the slot's own frame; 4-byte aligned.
+        Ok((unsafe { dma_read32(at) } & 7) as u8)
+    })
+    .ok()
+}
+
+/// Write one context (8 dwords) of a device area.
+///
+/// # Safety
+/// `phys..phys+32` must lie in a frame of a device area of this driver.
+unsafe fn write_ctx(phys: u64, words: [u32; 8]) {
+    for (i, w) in words.into_iter().enumerate() {
+        // SAFETY: caller contract; `i < 8`.
+        unsafe { dma_write32(phys + 4 * i as u64, w) };
+    }
+}
+
+/// Zero one frame of a device area.
+///
+/// # Safety
+/// `phys` must be a frame of a device area of this driver that the
+/// controller does not use right now (no command or transfer naming it is
+/// in flight).
+unsafe fn zero_frame(phys: u64) {
+    // SAFETY: caller contract; the frame is RAM mapped at the offset and no
+    // Rust reference to it exists.
+    unsafe { core::ptr::write_bytes(dma_virt(phys) as *mut u8, 0, PAGE as usize) };
+}
+
+/// Spin at most `ms` milliseconds (tick and TSC bounded).
+fn pause_ms(ms: u64) {
+    let dl = Deadline::new(ms);
+    while !dl.expired() {
+        core::hint::spin_loop();
+    }
+}
+
+impl Driver {
+    fn port_off(&self, port: u8) -> Result<u64, XhciError> {
+        if port == 0 || port > self.caps.max_ports {
+            return Err(XhciError::BadPort);
+        }
+        Ok(self.op + PORT_REGS + 0x10 * u64::from(port - 1))
+    }
+
+    /// PORTSC at `off`; all-ones (controller gone) is an error, checked
+    /// before anything acts on the value (ledger Task 13).
+    fn read_port(&self, off: u64) -> Result<PortSc, XhciError> {
+        let v = PortSc(self.regs.read32(off)?);
+        if v.is_all_ones() {
+            return Err(XhciError::ControllerGone);
+        }
+        Ok(v)
+    }
+
+    /// Write the acknowledgement for the change bits set in `v` (only those;
+    /// PED as 0). No write if none is set.
+    fn ack_port(&self, off: u64, v: PortSc) -> Result<(), XhciError> {
+        let w = v.ack_changes();
+        if w & 0x00FE_0000 != 0 {
+            self.regs.write32(off, w)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_port(&mut self, port: u8) -> Result<PortReady, XhciError> {
+        let off = self.port_off(port)?;
+        let v = self.read_port(off)?;
+        if !v.ccs() {
+            self.ack_port(off, v)?;
+            return Ok(PortReady::Empty);
+        }
+        // USB3 ports are enabled by link training (spec §7.1 step 5); a
+        // USB2 port after HCRST is not. A connected port with an unknown
+        // speed ID is reset too instead of acking its CSC blindly (ledger
+        // Task 13): the reset is how the speed is learned.
+        if !v.ped() || Speed::from_psi(v.speed()).is_none() {
+            self.regs.write32(off, v.reset_request())?;
+            let mut last = v;
+            let r = self.wait(PORT_RESET_MS, |d| {
+                last = d.read_port(off)?;
+                Ok(last.prc() || !last.ccs())
+            });
+            match r {
+                Ok(()) => {}
+                Err(XhciError::Timeout) => {
+                    self.ack_port(off, last)?;
+                    return Ok(PortReady::Lost);
+                }
+                Err(e) => return Err(e),
+            }
+            match ctx::classify(true, last) {
+                PortChange::ResetDone => {}
+                PortChange::ControllerGone => return Err(XhciError::ControllerGone),
+                _ => {
+                    self.ack_port(off, last)?;
+                    return Ok(PortReady::Lost);
+                }
+            }
+            pause_ms(RESET_RECOVERY_MS);
+        }
+        let v = self.read_port(off)?;
+        self.ack_port(off, v)?;
+        // Re-read after the acknowledgement: a disconnect or a reconnect
+        // (new CSC) during the reset means the device we reset is not the
+        // one there now; leave it for the port-change handling.
+        let w = self.read_port(off)?;
+        if !w.ccs() || !w.ped() || w.csc() {
+            return Ok(PortReady::Lost);
+        }
+        Ok(match Speed::from_psi(w.speed()) {
+            Some(s) => PortReady::Ready(s),
+            None => PortReady::UnknownSpeed(w.speed()),
+        })
+    }
+
+    /// Table entry and copy of the device in `slot`.
+    fn device(&self, slot: u8) -> Result<(usize, Device), XhciError> {
+        self.devices
+            .iter()
+            .enumerate()
+            .find_map(|(i, d)| d.filter(|d| d.slot == slot && slot != 0).map(|d| (i, d)))
+            .ok_or(XhciError::BadSlot)
+    }
+
+    /// No timed-out command may still be pending before a device structure
+    /// is rewritten (the controller could still be reading it).
+    fn idle(&mut self) -> Result<Dma, XhciError> {
+        let dma = self.dma.ok_or(XhciError::NotInitialized)?;
+        self.check_running()?;
+        if self.stale.is_some() {
+            self.drain_once(&dma, Want::Nothing)?;
+            if self.stale.is_some() {
+                return Err(XhciError::Busy);
+            }
+        }
+        Ok(dma)
+    }
+
+    /// The DMA area of table entry `i`: allocated on first use, re-zeroed
+    /// when reused (the entry is free, so no slot of this generation and,
+    /// after HCRST, no earlier one points at it).
+    fn device_frames(&mut self, i: usize) -> Result<u64, XhciError> {
+        let phys = self.dev_frames[i];
+        if phys != 0 {
+            for n in 0..DEV_FRAMES as u64 {
+                // SAFETY: frame `n` of entry `i`'s area, owned by the
+                // driver; the entry is free (see above), so the controller
+                // does not use it.
+                unsafe { zero_frame(phys + n * PAGE) };
+            }
+            return Ok(phys);
+        }
+        let mut frames = Frames(Vec::new());
+        match frames.take(DEV_FRAMES, self.caps.ac64) {
+            Ok(phys) => {
+                self.dev_frames[i] = phys;
+                Ok(phys)
+            }
+            Err(e) => {
+                frames.free();
+                Err(e)
+            }
+        }
+    }
+
+    fn command_ok(&mut self, trb: Trb) -> Result<u8, XhciError> {
+        match self.submit(trb, DEFAULT_TIMEOUT_MS)? {
+            Event::CommandCompletion { code: ring::SUCCESS, slot, .. } => Ok(slot),
+            Event::CommandCompletion { code, .. } => Err(XhciError::Command(code)),
+            _ => Err(XhciError::Command(0)),
+        }
+    }
+
+    fn ep0_ctx(ring: u64, max_packet: u16) -> [u32; 8] {
+        EndpointCtx {
+            ep_type: EP_TYPE_CONTROL,
+            max_packet,
+            interval: 0,
+            cerr: CERR,
+            dequeue: ring,
+            dcs: true,
+            avg_trb_len: 8,
+        }
+        .encode()
+    }
+
+    fn address_device(&mut self, port: u8, speed: Speed) -> Result<u8, XhciError> {
+        self.port_off(port)?;
+        let dma = self.idle()?;
+        let i = self.devices.iter().position(Option::is_none).ok_or(XhciError::TableFull)?;
+        let frames = self.device_frames(i)?;
+        let slot = self.command_ok(Trb::enable_slot())?;
+        if slot == 0 || slot > self.caps.max_slots || self.devices.iter().flatten().any(|d| d.slot == slot) {
+            return Err(XhciError::BadSlot);
+        }
+        let dev = Device {
+            slot,
+            port,
+            speed,
+            frames,
+            ep0: ProducerRing::new(frames + PG_EP0 * PAGE, TRANSFER_TRBS),
+            ep0_broken: false,
+            eps: [None; MAX_ENDPOINTS],
+        };
+        let csz = self.caps.csz64;
+        let input = dev.page(PG_INPUT);
+        let off = |n: usize| ctx::ctx_offset(n, csz) as u64;
+        // SAFETY: input control, slot and EP0 context (indices 0..=2, at
+        // most 3 * 64 bytes) lie in the entry's input-context frame; the
+        // DCBAA entry `slot <= MaxSlots <= 255` (8 bytes each) lies in the
+        // DCBAA frame. The area was zeroed by `device_frames` and no command
+        // naming it is in flight (`idle`).
+        unsafe {
+            write_ctx(input + off(0), ctx::input_control(0b11, 0));
+            write_ctx(input + off(1), SlotCtx { route: 0, speed, context_entries: 1, root_port: port }.encode());
+            write_ctx(input + off(2), Driver::ep0_ctx(dev.ep0.enqueue_ptr(), speed.ep0_max_packet()));
+            let out = dev.page(PG_OUTPUT);
+            let e = dma.dcbaa + 8 * u64::from(slot);
+            dma_write32(e, out as u32);
+            dma_write32(e + 4, (out >> 32) as u32);
+        }
+        // From here the controller may write the output context: the entry
+        // is taken (and its frames never reused in this generation) even if
+        // Address Device fails.
+        self.devices[i] = Some(dev);
+        fence(Ordering::SeqCst);
+        self.command_ok(Trb::address_device(input, slot, false))?;
+        Ok(slot)
+    }
+
+    fn set_ep0_max_packet(&mut self, slot: u8, max_packet: u16) -> Result<(), XhciError> {
+        let (_, dev) = self.device(slot)?;
+        if max_packet == 0 {
+            return Err(XhciError::BadEndpoint);
+        }
+        self.idle()?;
+        let input = dev.page(PG_INPUT);
+        let off = |n: usize| ctx::ctx_offset(n, self.caps.csz64) as u64;
+        // SAFETY: the input-context frame of this device, not in use (no
+        // command in flight: `idle`); contexts 0 and 2 lie inside it.
+        unsafe {
+            zero_frame(input);
+            write_ctx(input + off(0), ctx::input_control(0b10, 0));
+            write_ctx(input + off(2), Driver::ep0_ctx(dev.ep0.enqueue_ptr(), max_packet));
+        }
+        fence(Ordering::SeqCst);
+        self.command_ok(Trb::evaluate_context(input, slot)).map(|_| ())
+    }
+
+    fn configure_endpoints(&mut self, slot: u8, eps: &[(Endpoint, Speed)]) -> Result<(), XhciError> {
+        let (i, mut dev) = self.device(slot)?;
+        if eps.is_empty() || eps.len() > MAX_ENDPOINTS || dev.eps.iter().any(Option::is_some) {
+            return Err(XhciError::BadEndpoint);
+        }
+        // Validate everything before touching DMA memory.
+        let mut plan = [(0u8, [0u32; 8]); MAX_ENDPOINTS];
+        for (k, &(ep, speed)) in eps.iter().enumerate() {
+            let dci = ctx::dci(ep.address);
+            let dir_in = ep.address & 0x80 != 0;
+            let ep_type = match (ep.attributes & 3, dir_in) {
+                (2, false) => 2,
+                (3, false) => 3,
+                (2, true) => 6,
+                (3, true) => 7,
+                _ => return Err(XhciError::BadEndpoint),
+            };
+            let max_packet = ep.max_packet & 0x7FF;
+            if dci < 2 || max_packet == 0 || plan[..k].iter().any(|p| p.0 == dci) {
+                return Err(XhciError::BadEndpoint);
+            }
+            let interrupt = ep.attributes & 3 == 3;
+            let ring = dev.page(PG_EPS + k as u64);
+            let mut w = EndpointCtx {
+                ep_type,
+                max_packet,
+                interval: if interrupt { ctx::ep_interval(speed, ep.interval) } else { 0 },
+                cerr: CERR,
+                dequeue: ring,
+                dcs: true,
+                avg_trb_len: max_packet,
+            }
+            .encode();
+            if interrupt {
+                // HS high-bandwidth: additional transactions per microframe
+                // (wMaxPacketSize 12:11) as Max Burst; Max ESIT Payload Lo
+                // (DW4 31:16) = bytes per service interval (section 6.2.3).
+                let mult = if speed == Speed::High { u32::from(ep.max_packet >> 11 & 3) } else { 0 };
+                w[1] |= mult << 8;
+                w[4] |= (u32::from(max_packet) * (mult + 1)) << 16;
+            }
+            plan[k] = (dci, w);
+        }
+        self.idle()?;
+        let csz = self.caps.csz64;
+        let input = dev.page(PG_INPUT);
+        let off = |n: usize| ctx::ctx_offset(n, csz) as u64;
+        let max_dci = plan[..eps.len()].iter().map(|p| p.0).max().unwrap_or(1);
+        let add = plan[..eps.len()].iter().fold(1u32, |a, p| a | 1 << p.0);
+        // SAFETY: the input-context frame and the endpoint-ring frames of
+        // this device; no command names them right now (`idle`) and the
+        // endpoints do not exist yet, so the controller does not read the
+        // rings. Context index `dci + 1 <= 32` lies inside the input
+        // context (33 contexts of at most 64 bytes = 2112 bytes < 4 KiB).
+        unsafe {
+            zero_frame(input);
+            write_ctx(input + off(0), ctx::input_control(add, 0));
+            let sc = SlotCtx { route: 0, speed: dev.speed, context_entries: max_dci, root_port: dev.port };
+            write_ctx(input + off(1), sc.encode());
+            for (k, &(dci, w)) in plan[..eps.len()].iter().enumerate() {
+                zero_frame(dev.page(PG_EPS + k as u64));
+                write_ctx(input + off(usize::from(dci) + 1), w);
+            }
+        }
+        fence(Ordering::SeqCst);
+        self.command_ok(Trb::configure_endpoint(input, slot))?;
+        for (k, &(dci, _)) in plan[..eps.len()].iter().enumerate() {
+            dev.eps[k] = Some((dci, ProducerRing::new(dev.page(PG_EPS + k as u64), TRANSFER_TRBS)));
+        }
+        self.devices[i] = Some(dev);
+        Ok(())
+    }
+
+    /// One control TD on EP0 (Setup, optional Data, Status with IOC), then
+    /// wait for the Status stage's transfer event. Exactly one TD is in
+    /// flight on the ring (ledger Task 12); a short packet (code 13, ISP set
+    /// on the IN data stage) is not an error.
+    fn control(&mut self, slot: u8, packet: SetupPacket, data: Option<(u64, u32)>) -> Result<usize, XhciError> {
+        let (i, mut dev) = self.device(slot)?;
+        if dev.ep0_broken {
+            return Err(XhciError::EndpointBroken);
+        }
+        let dma = self.idle()?;
+        let dir_in = packet.dir_in();
+        // Transfer Type: 0 no data, 2 OUT data, 3 IN data (table 6-26).
+        let trt = match data {
+            None => 0,
+            Some(_) if dir_in => 3,
+            Some(_) => 2,
+        };
+        let mut tds = [Trb::default(); 3];
+        let mut n = 0;
+        tds[n] = Trb::setup(packet.to_u64(), trt);
+        n += 1;
+        if let Some((buf, len)) = data {
+            tds[n] = Trb::data(buf, len, dir_in);
+            n += 1;
+        }
+        // Status stage in the opposite direction of the data (IN if none).
+        tds[n] = Trb::status(!(data.is_some() && dir_in));
+        n += 1;
+        let ring_base = dev.page(PG_EP0);
+        let mut at = [0u64; 3];
+        for k in 0..n {
+            let e = dev.ep0.enqueue(tds[k]);
+            at[k] = ring_base + e.index as u64 * 16;
+            // SAFETY: `e.index` and the link index are < TRANSFER_TRBS: TRB
+            // slots of this device's EP0 ring frame. The previous TD on the
+            // ring completed (or the ring is broken and not used).
+            unsafe {
+                write_trb(at[k], e.trb);
+                if let Some((li, link)) = e.link {
+                    write_trb(ring_base + li as u64 * 16, link);
+                }
+            }
+        }
+        self.devices[i] = Some(dev);
+        let data_at = data.map(|_| at[1]);
+        let status_at = at[n - 1];
+        // TRBs visible before the doorbell reaches the controller.
+        fence(Ordering::SeqCst);
+        self.regs.write32(self.db + 4 * u64::from(slot), 1)?;
+
+        let want = Want::Transfer { slot, dci: 1 };
+        let len = data.map_or(0, |(_, l)| l);
+        let mut residual = 0u32;
+        let dl = Deadline::new(CONTROL_TIMEOUT_MS);
+        let r = loop {
+            // Every pass checks the deadline, even while (hostile) events
+            // for this endpoint keep coming.
+            let expired = dl.expired();
+            if let Drained::Done(Event::Transfer { trb, code, residual: res, .. }) = self.drain_once(&dma, want)? {
+                if !at[..n].contains(&trb) {
+                    // Names no TRB of this TD (hostile or stale): ignored.
+                    self.queue.dropped = self.queue.dropped.saturating_add(1);
+                } else if code != ring::SUCCESS && code != ring::SHORT_PACKET {
+                    break Err(XhciError::Transfer(code));
+                } else if trb == status_at {
+                    // A residual larger than the request is hostile: 0 bytes.
+                    break Ok(len.saturating_sub(residual) as usize);
+                } else if Some(trb) == data_at {
+                    residual = res;
+                }
+            }
+            if let Err(e) = self.check_running() {
+                break Err(e);
+            }
+            if expired {
+                break Err(XhciError::Timeout);
+            }
+            core::hint::spin_loop();
+        };
+        if r.is_err() {
+            // Halted, or in an unknown state with the TD maybe still queued:
+            // never enqueue behind it.
+            if let Some(d) = self.devices[i].as_mut() {
+                d.ep0_broken = true;
+            }
+        }
+        r
     }
 }
 
@@ -879,7 +1589,7 @@ mod tests {
                 produced += 1;
                 Ok(Some(Event::PortStatusChange { port: produced as u8 }))
             },
-            |e| route(&mut q, &mut stale, e, Some(0x1000)),
+            |e| route(&mut q, &mut stale, e, Want::Command(0x1000)),
         );
         assert_eq!(r, Ok(Drained::Limit));
         assert_eq!(produced, EVENT_TRBS);
@@ -911,7 +1621,7 @@ mod tests {
             i += 1;
             Ok(e)
         };
-        let r = drain(EVENT_TRBS, &mut next, |e| route(&mut q, &mut stale, e, Some(0x3000)));
+        let r = drain(EVENT_TRBS, &mut next, |e| route(&mut q, &mut stale, e, Want::Command(0x3000)));
         assert_eq!(r, Ok(Drained::Done(script[4])));
         assert_eq!(stale, None);
         assert_eq!(q.dropped, 1);
@@ -919,9 +1629,31 @@ mod tests {
         assert_eq!(q.pop(), Some(script[3]));
         assert_eq!(q.pop(), None);
         // The rest stays for the next pass; then the source is empty.
-        let r = drain(EVENT_TRBS, &mut next, |e| route(&mut q, &mut stale, e, None));
+        let r = drain(EVENT_TRBS, &mut next, |e| route(&mut q, &mut stale, e, Want::Nothing));
         assert_eq!(r, Ok(Drained::Empty));
         assert_eq!(q.pop(), Some(script[5]));
+    }
+
+    /// Transfer events go to a waiter for exactly that slot and endpoint;
+    /// those of other endpoints are queued; a command waiter never takes them.
+    #[test_case]
+    fn transfer_events_route_by_slot_and_endpoint() {
+        let mut q = EventQueue::new();
+        let mut stale = None;
+        let ev = |slot, endpoint| Event::Transfer { trb: 0x5000, code: 1, residual: 0, slot, endpoint };
+        let want = Want::Transfer { slot: 2, dci: 1 };
+        assert_eq!(route(&mut q, &mut stale, ev(2, 1), want), Some(ev(2, 1)));
+        assert_eq!(route(&mut q, &mut stale, ev(2, 3), want), None);
+        assert_eq!(route(&mut q, &mut stale, ev(1, 1), want), None);
+        assert_eq!(route(&mut q, &mut stale, ev(2, 1), Want::Command(0x5000)), None);
+        assert_eq!(route(&mut q, &mut stale, ev(2, 1), Want::Nothing), None);
+        let cc = Event::CommandCompletion { trb: 0x5000, code: 1, slot: 2 };
+        assert_eq!(route(&mut q, &mut stale, cc, want), None, "completion is no transfer");
+        assert_eq!(q.dropped, 1);
+        for e in [ev(2, 3), ev(1, 1), ev(2, 1), ev(2, 1)] {
+            assert_eq!(q.pop(), Some(e));
+        }
+        assert_eq!(q.pop(), None);
     }
 
     #[test_case]
@@ -946,5 +1678,12 @@ mod tests {
         assert_eq!(command(Trb::noop_cmd(), 1), Err(XhciError::NotInitialized));
         assert_eq!(init(), Err(XhciError::NotFound));
         assert_eq!(caps(), None);
+        assert_eq!(generation(), None);
+        assert_eq!(port_count(), 0);
+        assert_eq!(portsc(1), Err(XhciError::NotInitialized));
+        assert_eq!(portsc_unlocked(1), None);
+        assert_eq!(prepare_port(1), Err(XhciError::NotInitialized));
+        assert_eq!(slot_buffer(1), None);
+        assert_eq!(slot_state(1), None);
     }
 }

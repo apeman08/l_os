@@ -77,6 +77,19 @@ impl Speed {
             Speed::Super => 512,
         }
     }
+
+    /// EP0 max packet size from a device descriptor's `bMaxPacketSize0`
+    /// (USB 2.0 §9.6.1: 8, 16, 32 or 64 bytes; USB 3.x §9.6.1: an exponent,
+    /// only 9 = 512 bytes is valid at SuperSpeed). Untrusted device data:
+    /// any other value (0 included) is `None` and the device is refused.
+    pub fn ep0_max_from_descriptor(self, b_max_packet_size0: u8) -> Option<u16> {
+        match (self, b_max_packet_size0) {
+            (Speed::Super, 9) => Some(512),
+            (Speed::Super, _) => None,
+            (_, v @ (8 | 16 | 32 | 64)) => Some(u16::from(v)),
+            _ => None,
+        }
+    }
 }
 
 // PORTSC layout (section 5.4.8).
@@ -462,6 +475,24 @@ mod tests {
         assert_eq!(Speed::Full.ep0_max_packet(), 8);
         assert_eq!(Speed::High.ep0_max_packet(), 64);
         assert_eq!(Speed::Super.ep0_max_packet(), 512);
+    }
+
+    #[test]
+    fn ep0_max_from_descriptor_validates() {
+        // USB 2.0: only 8, 16, 32, 64 (9.6.1); anything else is refused.
+        for s in [Speed::Low, Speed::Full, Speed::High] {
+            for v in [8u8, 16, 32, 64] {
+                assert_eq!(s.ep0_max_from_descriptor(v), Some(u16::from(v)), "{s:?} {v}");
+            }
+            for v in [0u8, 1, 7, 9, 12, 63, 65, 128, 255] {
+                assert_eq!(s.ep0_max_from_descriptor(v), None, "{s:?} {v}");
+            }
+        }
+        // USB 3.x: exponent, only 9 (2^9 = 512) is valid.
+        assert_eq!(Speed::Super.ep0_max_from_descriptor(9), Some(512));
+        for v in [0u8, 8, 64, 10, 255] {
+            assert_eq!(Speed::Super.ep0_max_from_descriptor(v), None, "{v}");
+        }
     }
 
     #[test]

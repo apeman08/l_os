@@ -34,6 +34,11 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     #[cfg(test)]
     test_main();
 
+    // xHCI and the devices on its root ports (spec §7.1 steps 1–6); one
+    // console line per device, nothing without a controller.
+    #[cfg(not(test))]
+    let _ = l_os::usb::enumerate();
+
     // Aurora chrome (status bar, hint bar) with its boot fade-in, before the
     // shell starts; opt-in, so test kernels keep the plain console.
     #[cfg(not(test))]

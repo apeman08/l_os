@@ -28,6 +28,7 @@ pub mod secrets;
 pub mod wipe;
 pub mod virtio_net;
 pub mod xhci;
+pub mod usb;
 pub mod allocator;
 pub mod input;
 pub mod ipc;

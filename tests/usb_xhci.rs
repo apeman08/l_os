@@ -339,3 +339,173 @@ fn halt_for_wipe_stops_controller() {
     assert_eq!(ring.enqueue, ring.base + 16, "fresh ring after re-init (slot 0: init's self-test no-op)");
     noop();
 }
+
+// ---------------------------------------------------------------------------
+// Task 20: port reset and enumeration on the root ports (spec §7.1 5–6).
+
+use l_core::usb_desc::{DeviceKind, SetupPacket};
+use l_core::xhci_ctx::{PortSc, Speed};
+use l_os::usb::{self, UsbDevice, UsbSummary};
+
+/// Root ports of the runner's devices (spike note §4): `usb-storage` at the
+/// USB3 port 1 (SuperSpeed), `usb-kbd` at the USB2 port 6 (High-Speed).
+const STICK_PORT: u8 = 1;
+const KBD_PORT: u8 = 6;
+/// xHCI slot states (section 6.2.2, Slot Context DW3 31:27) and endpoint
+/// states (section 6.2.3, Endpoint Context DW0 2:0).
+const SLOT_CONFIGURED: u8 = 3;
+const EP_RUNNING: u8 = 1;
+
+fn enumerated() -> UsbSummary {
+    let s = usb::enumerate();
+    for d in s.devices() {
+        serial_println!("  {:?}", d);
+    }
+    s
+}
+
+fn by_kind(s: &UsbSummary, keyboard: bool) -> UsbDevice {
+    *s.devices()
+        .iter()
+        .find(|d| matches!(
+            (keyboard, d.kind),
+            (true, DeviceKind::BootKeyboard { .. }) | (false, DeviceKind::BulkOnlyStorage { .. })
+        ))
+        .unwrap_or_else(|| panic!("no {} in {:?}", if keyboard { "keyboard" } else { "storage" }, s))
+}
+
+#[test_case]
+fn enumerates_keyboard_and_storage() {
+    serial_println!();
+    let s = enumerated();
+    assert_eq!(s.devices().len(), 2, "two devices: {:?}", s);
+    assert_eq!(s.failed(), 0, "no device failed: {:?}", s);
+    let kbd = by_kind(&s, true);
+    let stick = by_kind(&s, false);
+    assert_eq!((kbd.port, kbd.speed), (KBD_PORT, Speed::High), "keyboard {:?}", kbd);
+    assert_eq!((stick.port, stick.speed), (STICK_PORT, Speed::Super), "stick {:?}", stick);
+    assert_ne!(kbd.slot, stick.slot);
+    assert!(kbd.slot >= 1 && stick.slot >= 1);
+    match (kbd.kind, stick.kind) {
+        (DeviceKind::BootKeyboard { ep_in, .. }, DeviceKind::BulkOnlyStorage { ep_in: bi, ep_out: bo, .. }) => {
+            assert_eq!(ep_in.address & 0x80, 0x80, "interrupt IN");
+            assert_eq!((bi.address & 0x80, bo.address & 0x80), (0x80, 0), "bulk IN + OUT");
+        }
+        k => panic!("kinds {:?}", k),
+    }
+}
+
+#[test_case]
+fn device_descriptor_vendor_matches_qemu() {
+    let s = enumerated();
+    let (kbd, stick) = (by_kind(&s, true), by_kind(&s, false));
+    // QEMU hw/usb/dev-hid.c (usb-kbd) and dev-storage.c (CRC16 of "QEMU").
+    assert_eq!((kbd.vendor, kbd.product), (0x0627, 0x0001), "usb-kbd ids");
+    assert_eq!((stick.vendor, stick.product), (0x46f4, 0x0001), "usb-storage ids");
+    // EP0 max packet after the 8-byte prefix: HS 64, SS 2^9 = 512.
+    assert_eq!(kbd.max_packet0, 64);
+    assert_eq!(stick.max_packet0, 512);
+}
+
+#[test_case]
+fn port_ack_keeps_port_enabled() {
+    let _ = enumerated();
+    for port in [STICK_PORT, KBD_PORT] {
+        let p = xhci::portsc(port).expect("PORTSC");
+        serial_println!("  PORTSC[{}] = {:#010x}", port, p.0);
+        assert!(p.ccs(), "port {} connected", port);
+        assert!(p.ped(), "port {} still enabled after every acknowledgement", port);
+        assert!(!p.pr(), "port {} reset finished", port);
+        assert!(!(p.csc() || p.prc() || p.pec() || p.plc() || p.wrc() || p.occ() || p.cec()), "port {}: change bits acked ({:#x})", port, p.0);
+    }
+    // Empty ports (CSC after HCRST) are acked too and stay disabled.
+    let p = xhci::portsc(2).expect("PORTSC[2]");
+    assert!(!p.ccs() && !p.ped() && !p.csc(), "empty port 2: {:#x}", p.0);
+    // Out-of-range ports are errors, not panics.
+    assert!(xhci::portsc(0).is_err());
+    assert!(xhci::portsc(200).is_err());
+    let _ = PortSc(0);
+}
+
+#[test_case]
+fn configuration_selected_and_endpoints_running() {
+    let s = enumerated();
+    for d in s.devices() {
+        assert_eq!(d.config, 1, "SET_CONFIGURATION(bConfigurationValue) for {:?}", d);
+        assert_eq!(xhci::slot_state(d.slot), Some(SLOT_CONFIGURED), "slot {} configured", d.slot);
+        let eps: &[u8] = match d.kind {
+            DeviceKind::BootKeyboard { ep_in, .. } => &[ep_in.address],
+            DeviceKind::BulkOnlyStorage { ep_in, ep_out, .. } => &[ep_in.address, ep_out.address],
+            DeviceKind::Unsupported => &[],
+        };
+        assert!(!eps.is_empty());
+        for &a in eps {
+            let dci = l_core::xhci_ctx::dci(a);
+            assert_eq!(xhci::endpoint_state(d.slot, dci), Some(EP_RUNNING), "slot {} ep {:#x} (dci {})", d.slot, a, dci);
+        }
+        assert_eq!(xhci::endpoint_state(d.slot, 1), Some(EP_RUNNING), "EP0 slot {}", d.slot);
+    }
+}
+
+/// A second call reuses the result (no new slots), and EP0 still works:
+/// re-reading the device descriptor through `control_in` gives the same ids.
+#[test_case]
+fn enumerate_is_idempotent_and_ep0_still_works() {
+    let a = enumerated();
+    let b = usb::enumerate();
+    assert_eq!(a, b);
+    let stick = by_kind(&a, false);
+    let buf = xhci::slot_buffer(stick.slot).expect("buffer of an enumerated slot");
+    let got = xhci::control_in(stick.slot, SetupPacket::get_descriptor(1, 0, 18), buf, 18).expect("GET_DESCRIPTOR");
+    assert_eq!(got, 18);
+    let mut d = [0u8; 18];
+    xhci::read_slot_buffer(stick.slot, 0, &mut d).expect("read buffer");
+    assert_eq!(u16::from_le_bytes([d[8], d[9]]), stick.vendor);
+}
+
+/// Misuse of the transfer interface fails cleanly, without touching a ring.
+#[test_case]
+fn control_transfer_rejects_bad_arguments() {
+    let s = enumerated();
+    let kbd = by_kind(&s, true);
+    let buf = xhci::slot_buffer(kbd.slot).unwrap();
+    let dev = SetupPacket::get_descriptor(1, 0, 18);
+    // Unknown slots.
+    assert!(xhci::control_in(0, dev, buf, 18).is_err());
+    assert!(xhci::control_in(63, dev, buf, 18).is_err());
+    assert_eq!(xhci::slot_buffer(63), None);
+    // Buffer outside the slot's own DMA page, or past its end.
+    assert_eq!(xhci::control_in(kbd.slot, dev, 0x1000, 18), Err(XhciError::BadBuffer));
+    assert_eq!(xhci::control_in(kbd.slot, SetupPacket::get_descriptor(2, 0, 4096), buf + 8, 4096), Err(XhciError::BadBuffer));
+    // Length must match wLength; direction must match.
+    assert_eq!(xhci::control_in(kbd.slot, dev, buf, 8), Err(XhciError::BadBuffer));
+    assert_eq!(xhci::control_in(kbd.slot, SetupPacket::set_configuration(1), buf, 0), Err(XhciError::BadBuffer));
+    assert_eq!(xhci::control_out_nodata(kbd.slot, dev), Err(XhciError::BadBuffer));
+    assert!(xhci::read_slot_buffer(kbd.slot, 4090, &mut [0u8; 18]).is_err());
+    // Endpoint configuration refuses more than the table holds.
+    let (e, sp) = match kbd.kind {
+        DeviceKind::BootKeyboard { ep_in, .. } => (ep_in, kbd.speed),
+        _ => unreachable!(),
+    };
+    assert!(xhci::configure_endpoints(kbd.slot, &[(e, sp), (e, sp), (e, sp)]).is_err());
+    assert!(xhci::configure_endpoints(0, &[(e, sp)]).is_err());
+    // The device still answers afterwards.
+    assert_eq!(xhci::control_in(kbd.slot, dev, buf, 18), Ok(18));
+}
+
+/// Evaluate Context (the path for a `bMaxPacketSize0` that differs from the
+/// speed default; QEMU's devices never need it): change the keyboard's EP0
+/// max packet to 8 and back to 64, EP0 keeps working; 0 is refused.
+#[test_case]
+fn evaluate_context_changes_ep0_max_packet() {
+    let s = enumerated();
+    let kbd = by_kind(&s, true);
+    let buf = xhci::slot_buffer(kbd.slot).unwrap();
+    let dev = SetupPacket::get_descriptor(1, 0, 18);
+    assert_eq!(xhci::set_ep0_max_packet(kbd.slot, 0), Err(XhciError::BadEndpoint));
+    xhci::set_ep0_max_packet(kbd.slot, 8).expect("Evaluate Context 8");
+    assert_eq!(xhci::control_in(kbd.slot, dev, buf, 18), Ok(18));
+    xhci::set_ep0_max_packet(kbd.slot, 64).expect("Evaluate Context 64");
+    assert_eq!(xhci::control_in(kbd.slot, dev, buf, 18), Ok(18));
+    assert_eq!(xhci::set_ep0_max_packet(0, 64), Err(XhciError::BadSlot));
+}
