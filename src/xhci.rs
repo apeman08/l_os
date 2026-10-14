@@ -43,11 +43,30 @@
 //! is waited for, and a ring whose transfer timed out or failed is not used
 //! again. The enumeration itself (descriptors, classification) is
 //! [`crate::usb`].
+//!
+//! **Keyboard and polling** (spec §7.1 step 6, §7.2, Task 22):
+//! [`start_keyboard`] queues [`KEYBOARD_TRBS`] Normal TRBs (8-byte report
+//! buffers in the device's data page, at [`KBD_BUF_OFF`]) on the boot
+//! keyboard's interrupt-IN ring and [`enable_polling`] lets the timer ISR
+//! run [`poll_tick`]. That ring is the one exception to "one TD in flight":
+//! it holds exactly [`KEYBOARD_TRBS`] TDs (far below its 63 slots, so the
+//! missing full check cannot bite), and each completion re-arms exactly one
+//! (same buffer). [`poll_tick`] takes the driver lock only with `try_lock`
+//! (a boot-phase call holding it means: skip this tick), handles at most
+//! [`POLL_EVENTS_MAX`] events (first those that boot-phase waits queued,
+//! then the event ring), feeds decoded set-1 bytes to [`crate::input::feed`]
+//! (lock-free; a hotkey wipe started there never returns and never needs
+//! this lock: [`halt_for_wipe`] is lock-free) and stops once a wipe began.
+//! A transfer error (e.g. a stall) or a disconnect/reconnect on the
+//! keyboard's port stops the keyboard for good (no re-arm, no panic, no
+//! wipe: ledger Task 13). Port changes on other ports and controller loss
+//! are left to Task 23.
 
 use crate::{memory, mmio, pci, time};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering, fence};
 use l_core::usb_desc::{Endpoint, SetupPacket};
+use l_core::usb_hid::KeyboardState;
 use l_core::xhci_ctx::{self as ctx, Caps, EndpointCtx, PortChange, PortSc, SlotCtx, Speed};
 use l_core::xhci_ring::{self as ring, Event, EventRing, ProducerRing, Trb};
 use spin::Mutex;
@@ -129,6 +148,17 @@ const EP_TYPE_CONTROL: u8 = 4;
 pub const BULK_TIMEOUT_MS: u64 = 3000;
 /// CErr: three retries on transaction errors (section 4.10.2.7).
 const CERR: u8 = 3;
+/// Normal TRBs (one 8-byte report each) kept queued on the keyboard's
+/// interrupt-IN ring (spec §7.1 step 6).
+pub const KEYBOARD_TRBS: usize = 8;
+/// Events [`poll_tick`] handles per call at most (spec §7.2).
+pub const POLL_EVENTS_MAX: usize = 16;
+/// Offset of the keyboard's report buffers in its data page: above every
+/// control-transfer buffer (descriptors are read at offset 0, at most
+/// `usb::MAX_CONFIG_LEN` = 512 bytes).
+pub const KBD_BUF_OFF: u64 = 2048;
+/// Bytes of a boot keyboard report.
+const REPORT_LEN: u32 = 8;
 /// Command TRB types (xHCI 1.2 table 6-91): Enable Slot (9) .. No Op (23).
 const COMMAND_TYPES: core::ops::RangeInclusive<u8> = ring::ENABLE_SLOT..=ring::NOOP_CMD;
 
@@ -402,6 +432,25 @@ impl Device {
     }
 }
 
+/// The running boot keyboard ([`start_keyboard`]).
+#[derive(Debug, Clone, Copy)]
+struct Kbd {
+    slot: u8,
+    port: u8,
+    dci: u8,
+    /// Index of its interrupt-IN endpoint in `Device::eps`.
+    k: usize,
+    /// For each slot of the ring: report buffer number + 1 of the TD queued
+    /// there and not yet completed (0: none). A completion that names a
+    /// slot without one is not ours (hostile or stale) and is ignored.
+    pending: [u8; TRANSFER_TRBS],
+    in_flight: usize,
+    hid: KeyboardState,
+    /// A transfer failed or the device left its port: never re-armed,
+    /// nothing is fed any more.
+    stopped: bool,
+}
+
 struct Driver {
     regs: mmio::Mmio,
     caps: Caps,
@@ -429,6 +478,8 @@ struct Driver {
     dev_frames: [u64; MAX_DEVICES],
     /// Number of successful `start`s; device state belongs to one.
     generation: u64,
+    /// The keyboard started in this generation, if any.
+    kbd: Option<Kbd>,
 }
 
 static DRIVER: Mutex<Option<Driver>> = Mutex::new(None);
@@ -447,6 +498,14 @@ static MAX_PORTS: AtomicU8 = AtomicU8::new(0);
 static BULK_TDS: AtomicU64 = AtomicU64::new(0);
 /// Set once by [`seal_bulk`], never cleared (also not by a re-[`init`]).
 static BULK_SEALED: AtomicBool = AtomicBool::new(false);
+/// [`poll_tick`] may run (set by [`enable_polling`] at the end of the boot
+/// phase).
+static POLLING: AtomicBool = AtomicBool::new(false);
+/// Keyboard reports received (successful completions on the keyboard's
+/// interrupt-IN endpoint) since boot.
+static KBD_REPORTS: AtomicU64 = AtomicU64::new(0);
+/// The started keyboard was stopped (transfer error, disconnect).
+static KBD_LOST: AtomicBool = AtomicBool::new(false);
 
 /// Volatile 32-bit read of a register through the lock-free mirror.
 ///
@@ -718,6 +777,7 @@ impl Driver {
             devices: [None; MAX_DEVICES],
             dev_frames: [0; MAX_DEVICES],
             generation: 0,
+            kbd: None,
         })
     }
 
@@ -809,6 +869,7 @@ impl Driver {
         // HCRST disabled every slot and the DCBAA was re-zeroed: no device
         // state survives (the frames stay in `dev_frames` for reuse).
         self.devices = [None; MAX_DEVICES];
+        self.kbd = None;
 
         // All DMA structures are written before the controller may run.
         fence(Ordering::SeqCst);
@@ -1725,6 +1786,257 @@ impl Driver {
             }
         }
         r
+    }
+}
+
+// ------------------------------------------------------------ keyboard
+
+/// Start the boot keyboard on `slot` (root port `port`): queue
+/// [`KEYBOARD_TRBS`] Normal TRBs with ISP and IOC on its configured
+/// interrupt-IN endpoint `ep_address` (bit 7 set), each with its own
+/// 8-byte buffer at [`KBD_BUF_OFF`] of the slot's data page, then ring its
+/// doorbell once. Not a bulk endpoint, so [`seal_bulk`] does not affect it.
+/// Idempotent while the keyboard runs. Thread context (takes the lock).
+pub fn start_keyboard(slot: u8, port: u8, ep_address: u8) -> Result<(), XhciError> {
+    with_driver(|d| {
+        if let Some(k) = d.kbd {
+            return if k.slot == slot && !k.stopped { Ok(()) } else { Err(XhciError::BadEndpoint) };
+        }
+        let (_, dev) = d.device(slot)?;
+        let dci = ctx::dci(ep_address);
+        let k = dev
+            .eps
+            .iter()
+            .position(|e| e.is_some_and(|(x, _)| x == dci && dci >= 2))
+            .ok_or(XhciError::BadEndpoint)?;
+        if ep_address & 0x80 == 0 || dev.bulk[k] {
+            return Err(XhciError::BadEndpoint);
+        }
+        if dev.eps_broken[k] {
+            return Err(XhciError::EndpointBroken);
+        }
+        d.idle()?;
+        let mut kbd = Kbd {
+            slot,
+            port,
+            dci,
+            k,
+            pending: [0; TRANSFER_TRBS],
+            in_flight: 0,
+            hid: KeyboardState::new(),
+            stopped: false,
+        };
+        for b in 0..KEYBOARD_TRBS as u8 {
+            d.kbd_arm(&mut kbd, b)?;
+        }
+        d.kbd = Some(kbd);
+        KBD_LOST.store(false, Ordering::Release);
+        d.kbd_doorbell(&kbd)
+    })
+}
+
+/// Let the timer ISR run [`poll_tick`] from now on (end of the boot phase:
+/// after enumeration, the stick seal and [`start_keyboard`]). Before, the
+/// boot-phase waits own the event ring.
+pub fn enable_polling() {
+    POLLING.store(true, Ordering::Release);
+}
+
+/// Report TDs queued on the keyboard ring and not yet completed; `None`
+/// before [`start_keyboard`] (in this controller generation). Takes the lock.
+pub fn keyboard_in_flight() -> Option<usize> {
+    DRIVER.lock().as_ref().filter(|d| d.started)?.kbd.map(|k| k.in_flight)
+}
+
+/// Keyboard reports received since boot (lock-free).
+pub fn keyboard_reports() -> u64 {
+    KBD_REPORTS.load(Ordering::Acquire)
+}
+
+/// The started keyboard was stopped: a transfer failed or it left its port
+/// (lock-free).
+pub fn keyboard_lost() -> bool {
+    KBD_LOST.load(Ordering::Acquire)
+}
+
+/// Timer-ISR polling (spec §7.2; called after EOI, before `sched::on_tick`,
+/// with IF=0). Returns at once (0) before [`enable_polling`], once a wipe
+/// has started, if the driver lock is held (a boot-phase call is waiting:
+/// skip this tick, never spin) or the controller is not running. Otherwise
+/// handles at most [`POLL_EVENTS_MAX`] events: keyboard completions are
+/// decoded and fed to [`crate::input::feed`] and re-armed, a change on the
+/// keyboard's port is checked. Returns the number of events handled.
+pub fn poll_tick() -> usize {
+    if !POLLING.load(Ordering::Acquire) || crate::wipe::wiping() {
+        return 0;
+    }
+    let (n, fed) = {
+        let Some(mut g) = DRIVER.try_lock() else { return 0 };
+        match g.as_mut() {
+            Some(d) if d.started => d.poll(POLL_EVENTS_MAX),
+            _ => return 0,
+        }
+    };
+    if fed {
+        // A process may sleep in read_key(); the scheduler lock is only
+        // held with interrupts off, so taking it here cannot deadlock.
+        crate::sched::wake_keyboard();
+    }
+    n
+}
+
+impl Driver {
+    /// Queue one report TD (buffer `b`) on the keyboard ring, written body
+    /// first, then the cycle bit, then the link TRB (ledger Task 12). No
+    /// doorbell ([`Driver::kbd_doorbell`]).
+    fn kbd_arm(&mut self, kbd: &mut Kbd, b: u8) -> Result<(), XhciError> {
+        let (i, mut dev) = self.device(kbd.slot)?;
+        let Some((dci, mut ring)) = dev.eps[kbd.k] else { return Err(XhciError::BadEndpoint) };
+        if kbd.in_flight >= KEYBOARD_TRBS || usize::from(b) >= KEYBOARD_TRBS {
+            return Err(XhciError::BadBuffer);
+        }
+        let ring_base = dev.page(PG_EPS + kbd.k as u64);
+        let buf = dev.page(PG_BUF) + KBD_BUF_OFF + u64::from(b) * u64::from(REPORT_LEN);
+        let e = ring.enqueue(Trb::normal(buf, REPORT_LEN, true));
+        // SAFETY: `e.index` and the link index are < TRANSFER_TRBS: TRB slots
+        // of this endpoint's ring frame. At most KEYBOARD_TRBS (8) TDs are
+        // queued on its 63 usable slots, so the slot written here was
+        // completed (or never used) and the controller does not own it.
+        unsafe {
+            write_trb(ring_base + e.index as u64 * 16, e.trb);
+            if let Some((li, link)) = e.link {
+                write_trb(ring_base + li as u64 * 16, link);
+            }
+        }
+        kbd.pending[e.index] = b + 1;
+        kbd.in_flight += 1;
+        dev.eps[kbd.k] = Some((dci, ring));
+        self.devices[i] = Some(dev);
+        Ok(())
+    }
+
+    fn kbd_doorbell(&self, kbd: &Kbd) -> Result<(), XhciError> {
+        // TRBs visible before the doorbell reaches the controller.
+        fence(Ordering::SeqCst);
+        Ok(self.regs.write32(self.db + 4 * u64::from(kbd.slot), u32::from(kbd.dci))?)
+    }
+
+    /// Up to `max` events: queued ones first, then the event ring. Returns
+    /// the number handled and whether bytes were fed to the input queue.
+    fn poll(&mut self, max: usize) -> (usize, bool) {
+        let Some(dma) = self.dma else { return (0, false) };
+        // Halted or broken: nothing to poll (controller loss is Task 23's).
+        if self.check_running().is_err() {
+            return (0, false);
+        }
+        let (mut n, mut fed) = (0, false);
+        while n < max {
+            let e = match self.queue.pop() {
+                Some(e) => e,
+                None => match Driver::next_event(&mut self.ev, &self.regs, self.ir0, &dma) {
+                    Ok(Some(e)) => e,
+                    _ => break,
+                },
+            };
+            n += 1;
+            match e {
+                Event::Transfer { trb, code, residual, slot, endpoint } => {
+                    fed |= self.kbd_transfer(trb, code, residual, slot, endpoint);
+                }
+                Event::PortStatusChange { port } => self.kbd_port_change(port),
+                Event::CommandCompletion { trb, .. } if Some(trb) == self.stale => self.stale = None,
+                Event::CommandCompletion { .. } => self.queue.dropped = self.queue.dropped.saturating_add(1),
+                // Host controller events: USBSTS is Task 23's.
+                Event::HostController { .. } | Event::Other(_) => {}
+            }
+        }
+        (n, fed)
+    }
+
+    /// One transfer event. Only a completion of a TD we queued on the
+    /// running keyboard's ring counts; anything else is dropped. Returns
+    /// whether set-1 bytes were fed.
+    fn kbd_transfer(&mut self, trb: u64, code: u8, residual: u32, slot: u8, endpoint: u8) -> bool {
+        let drop = |d: &mut Driver| d.queue.dropped = d.queue.dropped.saturating_add(1);
+        let Some(mut kbd) = self.kbd.filter(|k| k.slot == slot && k.dci == endpoint && !k.stopped) else {
+            drop(self);
+            return false;
+        };
+        let Ok((i, dev)) = self.device(slot) else {
+            drop(self);
+            return false;
+        };
+        // The event's TRB pointer is untrusted: only compared, never used.
+        let ring_base = dev.page(PG_EPS + kbd.k as u64);
+        let off = trb.wrapping_sub(ring_base);
+        let idx = (off / 16) as usize;
+        if trb < ring_base || off % 16 != 0 || idx >= TRANSFER_TRBS - 1 || kbd.pending[idx] == 0 {
+            drop(self);
+            return false;
+        }
+        let b = kbd.pending[idx] - 1;
+        kbd.pending[idx] = 0;
+        kbd.in_flight -= 1;
+        if code != ring::SUCCESS && code != ring::SHORT_PACKET {
+            // Stall or error: the endpoint is halted with the other TDs
+            // still queued; no Reset Endpoint recovery exists (M5), so the
+            // keyboard stops here: no re-arm, no panic.
+            kbd.stopped = true;
+            self.kbd = Some(kbd);
+            if let Some(d) = self.devices[i].as_mut() {
+                d.eps_broken[kbd.k] = true;
+            }
+            KBD_LOST.store(true, Ordering::Release);
+            return false;
+        }
+        // A residual larger than the request is hostile: 0 bytes.
+        let len = REPORT_LEN.saturating_sub(residual) as usize;
+        let buf = dev.page(PG_BUF) + KBD_BUF_OFF + u64::from(b) * u64::from(REPORT_LEN);
+        let mut report = [0u8; REPORT_LEN as usize];
+        for (j, x) in report.iter_mut().enumerate() {
+            // SAFETY: `buf + j` (j < 8) lies in buffer `b` (< KEYBOARD_TRBS)
+            // at KBD_BUF_OFF + 64 <= 4096 of the slot's data page, a frame
+            // this driver owns; its TD has completed (the event was read
+            // with an acquire fence after its cycle bit), so the controller
+            // is done with it. A volatile read of a `u8` is sound whatever
+            // the device wrote.
+            *x = unsafe { core::ptr::read_volatile((dma_virt(buf) as *const u8).add(j)) };
+        }
+        KBD_REPORTS.fetch_add(1, Ordering::AcqRel);
+        let mut fed = false;
+        kbd.hid.on_report(&report[..len], |byte| {
+            fed = true;
+            crate::input::feed(byte);
+        });
+        // Re-arm the same buffer (it is free now).
+        let r = self.kbd_arm(&mut kbd, b).and_then(|()| self.kbd_doorbell(&kbd));
+        if r.is_err() {
+            kbd.stopped = true;
+            KBD_LOST.store(true, Ordering::Release);
+        }
+        self.kbd = Some(kbd);
+        fed
+    }
+
+    /// Port Status Change. Only the keyboard's port is handled here: a
+    /// disconnect, or a new connection (the configured device must have
+    /// left in between; no hotplug enumeration, spec §2), stops the keyboard
+    /// and nothing else (no wipe, ledger Task 13). Its change bits are
+    /// acknowledged without writing PED. Other ports (the stick's) and an
+    /// all-ones PORTSC are left to Task 23.
+    fn kbd_port_change(&mut self, port: u8) {
+        let Some(mut kbd) = self.kbd.filter(|k| k.port == port) else { return };
+        let Ok(off) = self.port_off(port) else { return };
+        let Ok(v) = self.read_port(off) else { return };
+        match ctx::classify(!kbd.stopped, v) {
+            PortChange::Disconnected | PortChange::Connected(_) => {
+                kbd.stopped = true;
+                self.kbd = Some(kbd);
+                KBD_LOST.store(true, Ordering::Release);
+            }
+            PortChange::ResetDone | PortChange::Nothing | PortChange::ControllerGone => {}
+        }
+        let _ = self.ack_port(off, v);
     }
 }
 

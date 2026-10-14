@@ -34,7 +34,12 @@
 //! ends the attempt for that device (no reset recovery: the endpoint is
 //! not used again); the system keeps running with "amnesisch: nein" (E8).
 //! The status inputs ([`stick_sealed`], [`stick_reads`],
-//! [`keyboard_present`]) are atomics, readable without a lock.
+//! [`keyboard_present`], [`keyboard_reports`]) are atomics, readable
+//! without a lock.
+//!
+//! **Keyboard** (Task 22): [`start_keyboard`] ends the boot phase: it starts
+//! the boot keyboard's interrupt-IN reports and the timer-ISR polling
+//! ([`xhci::poll_tick`]).
 
 use crate::xhci::{self, PortReady, XhciError};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -130,6 +135,8 @@ pub enum UsbError {
     /// `bConfigurationValue` 0: SET_CONFIGURATION(0) would unconfigure
     /// the device (ledger Task 20).
     ZeroConfigValue,
+    /// [`start_keyboard`]: no configured boot keyboard was enumerated.
+    NoKeyboard,
 }
 
 impl From<XhciError> for UsbError {
@@ -506,9 +513,37 @@ pub fn stick_sealed() -> bool {
     SEALED.load(Ordering::Acquire) && STICK_PORT.load(Ordering::Acquire) != 0
 }
 
-/// A USB boot keyboard was enumerated. Lock-free.
+/// A USB boot keyboard was enumerated and has not been stopped since (by a
+/// disconnect or a transfer error, [`xhci::keyboard_lost`]). Lock-free.
 pub fn keyboard_present() -> bool {
-    KEYBOARD.load(Ordering::Acquire)
+    KEYBOARD.load(Ordering::Acquire) && !xhci::keyboard_lost()
+}
+
+/// USB keyboard reports received since boot. Lock-free.
+pub fn keyboard_reports() -> u64 {
+    xhci::keyboard_reports()
+}
+
+/// End of the USB boot phase (spec §7.1 step 6, §7.2; after [`enumerate`],
+/// [`identify_boot_stick`] and [`storage_seal`]): start the enumerated boot
+/// keyboard's interrupt-IN transfers ([`xhci::start_keyboard`]: 8 report
+/// TDs) and let the timer ISR poll ([`xhci::enable_polling`]; also without
+/// a keyboard, for the port handling of Task 23). From then on the keyboard
+/// feeds [`crate::input::feed`] like the PS/2 ISR. Idempotent.
+pub fn start_keyboard() -> Result<(), UsbError> {
+    let summary = SUMMARY.lock().filter(|(g, _)| Some(*g) == xhci::generation()).map(|(_, s)| s);
+    let kbd = summary.and_then(|s| {
+        s.devices().iter().find_map(|d| match d.kind {
+            DeviceKind::BootKeyboard { ep_in, .. } if d.config != 0 => Some((d.slot, d.port, ep_in.address)),
+            _ => None,
+        })
+    });
+    let r = match kbd {
+        Some((slot, port, ep)) => xhci::start_keyboard(slot, port, ep).map_err(UsbError::from),
+        None => Err(UsbError::NoKeyboard),
+    };
+    xhci::enable_polling();
+    r
 }
 
 /// Does `sector` (LBA 0 of a device) carry the marker of boot id `id`?

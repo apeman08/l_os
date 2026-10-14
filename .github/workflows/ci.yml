@@ -38,5 +38,8 @@ jobs:
           qemu-system-x86_64 --version | head -1
           python3 -I scripts/qemu_wipe_test.py --trigger hotkey
 
+      - name: USB smoke (xHCI, boot stick, USB keyboard typing into the shell via QMP send-key, keyboard unplug)
+        run: python3 -I scripts/qemu_usb_smoke.py
+
       - name: Network and TLS tests (host test servers, QEMU packet capture)
         run: scripts/net_tests.sh

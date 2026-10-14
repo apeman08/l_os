@@ -182,7 +182,14 @@ fn amnesia_lines(t: &mut Term) {
     }
     let yn = |b: bool| if b { "ja" } else { "nein" };
     let stick = if s.amnesia.stick_sealed { "versiegelt" } else { "fehlt" };
-    println!(t.out, "  usb: tastatur {}, stick: {}, stick-lesezugriffe {}", yn(s.keyboard), stick, s.stick_reads);
+    println!(
+        t.out,
+        "  usb: tastatur {}, stick: {}, stick-lesezugriffe {}, tastatur-berichte {}",
+        yn(s.keyboard),
+        stick,
+        s.stick_reads,
+        s.keyboard_reports
+    );
     println!(t.out, "  acpi-poweroff: {}", yn(s.acpi_poweroff));
 }
 

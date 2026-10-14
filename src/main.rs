@@ -49,6 +49,12 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
             Err(e) => l_os::println!("usb: kein boot-stick ({:?})", e),
         }
         l_os::usb::storage_seal();
+        // Then the USB keyboard joins the input path (spec §7.2: the timer
+        // ISR polls from here on).
+        match l_os::usb::start_keyboard() {
+            Ok(()) | Err(l_os::usb::UsbError::NoKeyboard) => {}
+            Err(e) => l_os::println!("usb: tastatur nicht gestartet ({:?})", e),
+        }
     }
 
     // Aurora chrome (status bar, hint bar) with its boot fade-in, before the

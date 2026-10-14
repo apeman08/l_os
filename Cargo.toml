@@ -31,6 +31,10 @@ name = "usb_storage"
 harness = true
 
 [[test]]
+name = "usb_keyboard"
+harness = true
+
+[[test]]
 name = "usermode"
 harness = true
 

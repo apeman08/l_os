@@ -179,6 +179,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
+    // Spec §7.2: USB polling after EOI, before `on_tick` (which may switch
+    // away). IF=0 here; it only try-locks the driver and skips if busy.
+    crate::xhci::poll_tick();
     // After EOI and with no locks held: a runaway user process may be killed.
     crate::sched::wake_net();
     crate::sched::on_tick(from_user(&stack_frame));

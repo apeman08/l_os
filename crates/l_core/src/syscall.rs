@@ -131,9 +131,14 @@ const AM_PLAN_READY: u64 = 1 << 1;
 const AM_SERIAL_MIRROR: u64 = 1 << 2;
 const AM_KEYBOARD: u64 = 1 << 3;
 const AM_ACPI_POWEROFF: u64 = 1 << 4;
-/// `stick_reads` occupies bits 8..40, so a packed value never has bit 63
-/// set (it is returned as a non-negative `i64`).
+/// `stick_reads` occupies bits 8..40 and `keyboard_reports` bits 40..62, so
+/// a packed value never has bit 63 set (it is returned as a non-negative
+/// `i64`).
 const AM_READS_SHIFT: u32 = 8;
+const AM_REPORTS_SHIFT: u32 = 40;
+/// Largest `keyboard_reports` value that fits (22 bits); larger counts are
+/// reported as this value (saturated).
+pub const AM_REPORTS_MAX: u64 = (1 << 22) - 1;
 
 /// What `sysinfo(SYSINFO_AMNESIA)` reports, unpacked by [`unpack_amnesia`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,11 +150,15 @@ pub struct AmnesiaStatus {
     pub stick_reads: u32,
     /// The ACPI S5 power-off values were found.
     pub acpi_poweroff: bool,
+    /// USB keyboard reports received since boot (saturated at
+    /// [`AM_REPORTS_MAX`]).
+    pub keyboard_reports: u64,
 }
 
 /// Bits 0..=4: stick sealed, plan ready, serial mirror, keyboard, ACPI
-/// power-off; bits 8..40: `stick_reads`. Always below `1 << 40`.
-pub fn pack_amnesia(a: Amnesia, keyboard: bool, stick_reads: u32, acpi: bool) -> u64 {
+/// power-off; bits 8..40: `stick_reads`; bits 40..62: `keyboard_reports`
+/// (saturated at [`AM_REPORTS_MAX`]). Always below `1 << 62`.
+pub fn pack_amnesia(a: Amnesia, keyboard: bool, stick_reads: u32, acpi: bool, keyboard_reports: u64) -> u64 {
     let flag = |b: bool, bit: u64| if b { bit } else { 0 };
     flag(a.stick_sealed, AM_STICK_SEALED)
         | flag(a.plan_ready, AM_PLAN_READY)
@@ -157,6 +166,7 @@ pub fn pack_amnesia(a: Amnesia, keyboard: bool, stick_reads: u32, acpi: bool) ->
         | flag(keyboard, AM_KEYBOARD)
         | flag(acpi, AM_ACPI_POWEROFF)
         | u64::from(stick_reads) << AM_READS_SHIFT
+        | keyboard_reports.min(AM_REPORTS_MAX) << AM_REPORTS_SHIFT
 }
 
 /// Inverse of [`pack_amnesia`]; unknown bits are ignored.
@@ -170,6 +180,7 @@ pub fn unpack_amnesia(v: u64) -> AmnesiaStatus {
         keyboard: v & AM_KEYBOARD != 0,
         stick_reads: (v >> AM_READS_SHIFT) as u32,
         acpi_poweroff: v & AM_ACPI_POWEROFF != 0,
+        keyboard_reports: v >> AM_REPORTS_SHIFT & AM_REPORTS_MAX,
     }
 }
 
@@ -275,14 +286,25 @@ mod tests {
             };
             let (kbd, acpi) = (bits & 8 != 0, bits & 16 != 0);
             for reads in [0u32, 1, 3, 0x7fff_ffff, 0x8000_0000, u32::MAX - 1, u32::MAX] {
-                let v = pack_amnesia(a, kbd, reads, acpi);
-                // Must survive the syscall return path: never negative.
-                assert!((v as i64) >= 0, "{v:#x}");
-                let s = unpack_amnesia(v);
-                assert_eq!(s.amnesia, a);
-                assert_eq!((s.keyboard, s.stick_reads, s.acpi_poweroff), (kbd, reads, acpi));
-                assert_eq!(s.amnesia.label(), a.label());
+                for reports in [0u64, 1, 4711, AM_REPORTS_MAX - 1, AM_REPORTS_MAX] {
+                    let v = pack_amnesia(a, kbd, reads, acpi, reports);
+                    // Must survive the syscall return path: never negative.
+                    assert!((v as i64) >= 0, "{v:#x}");
+                    let s = unpack_amnesia(v);
+                    assert_eq!(s.amnesia, a);
+                    assert_eq!((s.keyboard, s.stick_reads, s.acpi_poweroff), (kbd, reads, acpi));
+                    assert_eq!(s.keyboard_reports, reports);
+                    assert_eq!(s.amnesia.label(), a.label());
+                }
             }
+        }
+        // The report counter saturates instead of spilling into bit 63.
+        for big in [AM_REPORTS_MAX + 1, u64::MAX >> 1, u64::MAX] {
+            let v = pack_amnesia(Amnesia { stick_sealed: true, plan_ready: true, serial_mirror: false }, true, u32::MAX, true, big);
+            assert!((v as i64) >= 0, "{v:#x}");
+            let s = unpack_amnesia(v);
+            assert_eq!(s.keyboard_reports, AM_REPORTS_MAX);
+            assert_eq!(s.stick_reads, u32::MAX, "no spill into the read counter");
         }
         // Unknown bits are ignored; garbage never yields "ja" by accident
         // unless the three status bits say so.

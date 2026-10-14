@@ -158,6 +158,51 @@ pub fn report_to_set1(prev: &BootReport, now: &BootReport, mut push: impl FnMut(
     }
 }
 
+/// The decoder state of one boot keyboard: owns `prev`, the last *good*
+/// report (ledger Task 15), so a caller cannot diff against a rejected one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyboardState {
+    prev: BootReport,
+}
+
+impl KeyboardState {
+    /// Upper bound of the bytes [`KeyboardState::on_report`] emits for one
+    /// report: 8 modifier and 6 + 6 key changes, each at most `E0` + code.
+    pub const MAX_BYTES_PER_REPORT: usize = (8 + 6 + 6) * 2;
+
+    /// No key held.
+    pub const fn new() -> KeyboardState {
+        KeyboardState { prev: BootReport([0; 8]) }
+    }
+
+    /// The last good report.
+    pub fn prev(&self) -> BootReport {
+        self.prev
+    }
+
+    /// Handle one report as received from the device (any length, untrusted):
+    /// exactly 8 bytes that are not a rollover error are diffed against the
+    /// last good report ([`report_to_set1`], bytes to `push`) and become the
+    /// new last good report; `true`. Anything else (wrong length, rollover
+    /// error) emits nothing, keeps the state and returns `false`.
+    pub fn on_report(&mut self, data: &[u8], push: impl FnMut(u8)) -> bool {
+        let Ok(bytes) = <[u8; 8]>::try_from(data) else { return false };
+        let now = BootReport(bytes);
+        if now.is_rollover_error() {
+            return false;
+        }
+        report_to_set1(&self.prev, &now, push);
+        self.prev = now;
+        true
+    }
+}
+
+impl Default for KeyboardState {
+    fn default() -> Self {
+        KeyboardState::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +221,75 @@ mod tests {
         let mut v = Vec::new();
         report_to_set1(prev, now, |b| v.push(b));
         v
+    }
+
+    fn feed(k: &mut KeyboardState, data: &[u8]) -> (bool, Vec<u8>) {
+        let mut v = Vec::new();
+        let ok = k.on_report(data, |b| v.push(b));
+        (ok, v)
+    }
+
+    #[test]
+    fn keyboard_state_diffs_against_last_good_report() {
+        let mut k = KeyboardState::new();
+        assert_eq!(k.prev(), EMPTY);
+        assert_eq!(feed(&mut k, &rep(0, &[0x04]).0), (true, vec![0x1E]));
+        assert_eq!(k.prev(), rep(0, &[0x04]));
+        // Held key: no repeat.
+        assert_eq!(feed(&mut k, &rep(0, &[0x04]).0), (true, vec![]));
+        assert_eq!(feed(&mut k, &EMPTY.0), (true, vec![0x9E]));
+        assert_eq!(k.prev(), EMPTY);
+    }
+
+    /// Ledger Task 15: a rollover-error report emits nothing and does not
+    /// replace `prev`; the next good report is diffed against the last good one.
+    #[test]
+    fn keyboard_state_rollover_error_keeps_prev() {
+        let mut k = KeyboardState::new();
+        let a = rep(0x02, &[0x04]);
+        assert_eq!(feed(&mut k, &a.0), (true, vec![0x2A, 0x1E]));
+        let err = rep(0x02, &[1, 1, 1, 1, 1, 1]);
+        assert_eq!(feed(&mut k, &err.0), (false, vec![]));
+        assert_eq!(k.prev(), a, "prev is still the last good report");
+        // `a` still held: nothing new; then releasing gives the releases.
+        assert_eq!(feed(&mut k, &a.0), (true, vec![]));
+        assert_eq!(feed(&mut k, &EMPTY.0), (true, vec![0x9E, 0xAA]));
+    }
+
+    /// Hostile lengths: anything but exactly 8 bytes is ignored, state kept.
+    #[test]
+    fn keyboard_state_ignores_wrong_lengths() {
+        let mut k = KeyboardState::new();
+        assert!(feed(&mut k, &rep(0, &[0x04]).0).0);
+        for n in [0usize, 1, 2, 3, 7, 9, 64] {
+            let data = vec![0x05u8; n];
+            assert_eq!(feed(&mut k, &data), (false, vec![]), "len {n}");
+            assert_eq!(k.prev(), rep(0, &[0x04]));
+        }
+    }
+
+    #[test]
+    fn keyboard_state_hotkey_bytes_reach_detector() {
+        let mut k = KeyboardState::new();
+        let mut d = HotkeyDetector::new();
+        let mut fired = false;
+        for r in [rep(0x01, &[]), rep(0x05, &[]), rep(0x05, &[0x2A])] {
+            k.on_report(&r.0, |b| fired |= d.feed(b));
+        }
+        assert!(fired);
+    }
+
+    #[test]
+    fn keyboard_state_max_bytes_bound() {
+        // Worst case for one report: every modifier and six keys change.
+        let mut k = KeyboardState::new();
+        let full = BootReport([0xFF, 0, 0x46, 0x49, 0x4A, 0x4B, 0x4C, 0x4D]);
+        let (_, a) = feed(&mut k, &full.0);
+        let (_, b) = feed(&mut k, &BootReport([0, 0, 0x4E, 0x4F, 0x50, 0x51, 0x52, 0x54]).0);
+        assert!(a.len() <= KeyboardState::MAX_BYTES_PER_REPORT && b.len() <= KeyboardState::MAX_BYTES_PER_REPORT);
+        // 8 modifier releases (4 plain, 4 with E0), 6 + 6 E0 keys.
+        assert_eq!(b.len(), (4 + 8) + 12 + 12);
+        assert_eq!(KeyboardState::MAX_BYTES_PER_REPORT, 40);
     }
 
     #[test]
