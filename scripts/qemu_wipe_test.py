@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
 """Memory-dump acceptance test for the emergency wipe (M2, spec §7/§8.6).
 
-Boots the real kernel (`cargo build --features wipe-test`) in QEMU/UEFI, lets
-it arm the wipe (`wipe-test: armed`), types a random sentinel into the shell,
-triggers the hotkey (Ctrl+Alt+Backspace via QMP send-key; no usb-kbd, so the
-key goes to PS/2), waits for the QMP SHUTDOWN event and then inspects the
-guest: an ELF core from `dump-guest-memory`, a `screendump` and the serial log.
+Boots the real kernel (`cargo build --features wipe-test`) in QEMU/UEFI from
+the image attached as a read-only USB stick (`qemu-xhci`, `usb-storage`
+id=stick0, bootindex=0; `--boot ide` boots the same image from IDE instead
+and keeps the stick attached, the spec §7.3 fallback, not needed per the
+spike), lets it arm the wipe (`wipe-test: armed`) and the stick watch
+(`wipe-test: watch armed port=N`), types a random sentinel into the shell
+over PS/2 (no usb-kbd is attached, so QMP send-key goes to PS/2), triggers
+the wipe, waits for the QMP SHUTDOWN event and then inspects the guest: an
+ELF core from `dump-guest-memory`, a `screendump` and the serial log.
+
+Triggers: `hotkey` = Ctrl+Alt+Backspace via send-key; `unplug` = QMP
+`device_del stick0` (the boot stick leaves its root port).
 
 Checks (all are evaluated, every failure is listed):
+  unplug_triggers_wipe       (--trigger unplug only) the stick watch was
+                             armed, and after device_del stick0 a SHUTDOWN
+                             event came within 60 s and the WIPE-REPORT says
+                             trigger=unplug (the only end-to-end proof that
+                             StickRemoved fires on the real stick port)
   wipe_report_present        exactly one WIPE-REPORT line, trigger=<--trigger>, plan
                              ready (`wipe-test: armed` seen), total_us > 0, all
                              stage times present and non-decreasing, and
@@ -31,11 +43,16 @@ Positive controls (INFRA failure, exit 2, if they do not hold, so that an
 absent sentinel is not just a typing failure): before the trigger the sentinel
 is in a pre-trigger dump, the key slot is non-zero and the screen is not black.
 
+Durations: WIPE-REPORT total_us runs up to KernelZeroed only (a lower bound
+of the wipe); the host time QMP command -> SHUTDOWN event is printed too.
+`--measure 256M,1G,4G` runs both triggers at each size (one build) and prints
+a table with the host CPU, QEMU version and accelerator.
+
 Usage: python3 -I scripts/qemu_wipe_test.py --trigger hotkey|unplug
-           [--mem 256M] [--boot ide|usb] [--keep-dump]
+           [--mem 256M] [--boot usb|ide] [--keep-dump]
+       python3 -I scripts/qemu_wipe_test.py --measure 256M,1G,4G [--boot usb|ide]
 Exit codes: 0 all checks pass, 1 a check failed, 2 infrastructure error
-(build, QEMU, timeout, positive control), 3 --trigger unplug / --boot usb
-(not implemented until Task 24).
+(build, QEMU, timeout, positive control).
 """
 import argparse, importlib.util, json, mmap, os, re, secrets, shutil, socket, string
 import struct, subprocess, sys, tempfile, time
@@ -176,43 +193,94 @@ def check_report(reports, armed, usable, want="hotkey"):
         return False, f"bytes={v['bytes']} outside [{total}, {2 * total}] (sum of usable ranges {total}): " + line, f
     return True, line, f
 
+UNPLUG_TIMEOUT = 60  # s, device_del stick0 -> SHUTDOWN (plan Task 24)
+
+def host_env():
+    """Host CPU model, QEMU version line, accelerator (for the measurements)."""
+    cpu = "?"
+    try:
+        for l in open("/proc/cpuinfo"):
+            if l.startswith("model name"): cpu = l.split(":", 1)[1].strip(); break
+    except OSError: pass
+    try: ver = subprocess.run([_load_smoke().tool("--print-qemu"), "--version"], stdout=subprocess.PIPE, text=True).stdout.splitlines()[0]
+    except (OSError, IndexError, subprocess.SubprocessError): ver = "?"
+    return cpu, ver
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--trigger", choices=["hotkey", "unplug"], required=True)
+    ap.add_argument("--trigger", choices=["hotkey", "unplug"])
     ap.add_argument("--mem", type=parse_size, default=parse_size("256M"))
-    ap.add_argument("--boot", choices=["ide", "usb"], default="ide")
+    ap.add_argument("--boot", choices=["usb", "ide"], default="usb")
     ap.add_argument("--keep-dump", action="store_true")
+    ap.add_argument("--measure", metavar="SIZES", help="comma-separated sizes, e.g. 256M,1G,4G: both triggers each")
     args = ap.parse_args()
-    if args.trigger == "unplug" or args.boot == "usb":
-        print("not implemented until Task 24: --trigger unplug and --boot usb need the xHCI driver")
-        return 3
-    tmp = tempfile.mkdtemp(prefix="wipe-test-")
-    q = None
+    if args.measure:
+        try: sizes = [parse_size(x) for x in args.measure.split(",")]
+        except argparse.ArgumentTypeError as e: ap.error(str(e))
+        runs = [(m, t) for m in sizes for t in ("hotkey", "unplug")]
+    elif args.trigger:
+        runs = [(args.mem, args.trigger)]
+    else:
+        ap.error("--trigger or --measure is required")
     try:
-        return run(args, tmp)
+        _load_smoke().build_image("wipe-test")
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"INFRA FAIL: build: {type(e).__name__}: {e}")
+        return 2
+    codes, rows = [], []
+    for mem, trigger in runs:
+        if len(runs) > 1: print(f"=== --trigger {trigger} --mem {mem >> 20}M --boot {args.boot} ===", flush=True)
+        code, row = run_one(args, mem, trigger)
+        codes.append(code); rows.append((mem, trigger, code, row))
+    if len(runs) > 1:
+        cpu, ver = host_env()
+        print(f"\nhost CPU: {cpu}; {os.cpu_count()} logical CPUs; {ver}; accelerator TCG (no -accel/-enable-kvm)")
+        print("| RAM | trigger | result | total_us | keys_us | user_us | usable_us | bytes | host command->SHUTDOWN |")
+        print("|---|---|---|---|---|---|---|---|---|")
+        for mem, trigger, code, r in rows:
+            host = f"{r['host_s']:.3f} s" if r.get("host_s") is not None else "-"
+            print(f"| {mem >> 20} MiB | {trigger} | {['PASS', 'FAIL', 'INFRA'][code]} | " + " | ".join(
+                str(r.get(k, "-")) for k in ("total_us", "keys_us", "user_us", "usable_us", "bytes")) + f" | {host} |")
+    return max(codes)
+
+def run_one(args, mem, trigger):
+    """(exit code, measurement fields) of one boot + trigger."""
+    tmp = tempfile.mkdtemp(prefix="wipe-test-")
+    row = {}
+    try:
+        return run(args, mem, trigger, tmp, row), row
     except Infra as e:
         print(f"INFRA FAIL: {e}")
-        return 2
+        return 2, row
     except (OSError, subprocess.SubprocessError, socket.timeout, ValueError) as e:
         print(f"INFRA FAIL: {type(e).__name__}: {e}")
-        return 2
+        return 2, row
     finally:
         if args.keep_dump: print(f"kept temp dir {tmp}")
         else: shutil.rmtree(tmp, ignore_errors=True)
 
-def run(args, tmp):
+def qemu_cmd(sm, args, mem, serial, sock):
+    img = sm.IMG.replace(",", ",,")
+    # The same image as a read-only USB stick on the xHCI (tools/image
+    # usb_test_args, without usb-kbd: send-key must reach PS/2). OVMF boots
+    # from it (spike note, question 2); --boot ide boots from an IDE copy
+    # (snapshot=on: ide-hd refuses readonly=on) and keeps the stick attached.
+    stick = ["-device", "qemu-xhci,id=xhci",
+             "-drive", f"if=none,id=stick,format=raw,readonly=on,file={img}",
+             "-device", "usb-storage,bus=xhci.0,drive=stick,id=stick0" + (",bootindex=0" if args.boot == "usb" else "")]
+    disk = [] if args.boot == "usb" else [
+        "-drive", f"if=none,id=disk0,format=raw,file={img},snapshot=on", "-device", "ide-hd,drive=disk0,bootindex=0"]
+    return [sm.tool("--print-qemu"), *disk, *stick, *sm.tool("--print-qemu-firmware-args").splitlines(),
+        "-m", f"{mem >> 20}M", "-cpu", "max", "-vga", "none", "-device", "VGA,xres=1024,yres=768",
+        "-display", "none", "-serial", f"file:{serial}", "-qmp", f"unix:{sock},server=on,wait=off",
+        "-action", "reboot=shutdown,shutdown=pause"]
+
+def run(args, mem, trigger, tmp, row):
     sm = _load_smoke()
-    sm.build_image("wipe-test")
     sock, serial = os.path.join(tmp, "qmp.sock"), os.path.join(tmp, "serial.log")
     keyfile, pre_dump, dump = (os.path.join(tmp, n) for n in ("key.bin", "pre.core", "post.core"))
     pre_ppm, post_ppm = os.path.join(tmp, "pre.ppm"), os.path.join(tmp, "post.ppm")
-    mem_arg = f"{args.mem >> 20}M"
-    q = subprocess.Popen([sm.tool("--print-qemu"),
-        "-drive", f"if=none,id=disk0,format=raw,file={sm.IMG},snapshot=on",
-        "-device", "ide-hd,drive=disk0,bootindex=0", *sm.tool("--print-qemu-firmware-args").splitlines(),
-        "-m", mem_arg, "-cpu", "max", "-vga", "none", "-device", "VGA,xres=1024,yres=768",
-        "-display", "none", "-serial", f"file:{serial}", "-qmp", f"unix:{sock},server=on,wait=off",
-        "-action", "reboot=shutdown,shutdown=pause"], stdin=subprocess.DEVNULL)
+    q = subprocess.Popen(qemu_cmd(sm, args, mem, serial, sock), stdin=subprocess.DEVNULL)
     try:
         for _ in range(100):
             if os.path.exists(sock): break
@@ -224,7 +292,18 @@ def run(args, tmp):
         armed = "wipe-test: armed" in text
         if not armed: raise Infra("kernel did not arm the wipe: " + text[-300:])
         if not usable or slot is None: raise Infra("missing wipe-test: usable / key-slot lines")
-        print(f"boot ok: {len(usable)} usable ranges, {sum(e - s for s, e in usable)} bytes, key slot at {slot[0]:#x}")
+        print(f"boot ok ({args.boot}, {mem >> 20} MiB): {len(usable)} usable ranges, {sum(e - s for s, e in usable)} bytes, "
+              f"max {max(e for _, e in usable):#x}, key slot at {slot[0]:#x}")
+        # The stick watch arms after USB enumeration, identification and seal
+        # (src/main.rs). Wait for it before typing, too: keys typed during the
+        # enumeration are not lost (PS/2), but the shell is not up yet.
+        deadline = time.monotonic() + 120
+        while "wipe-test: watch armed" not in (text := serial_text(serial)) and time.monotonic() < deadline:
+            if q.poll() is not None: raise Infra("QEMU exited early")
+            time.sleep(0.2)
+        m = re.search(r"wipe-test: watch armed port=(\d+)", text)
+        watch_port = int(m.group(1)) if m else None
+        print(f"stick watch: {'armed on root port %d' % watch_port if m else 'NOT armed (no marker within 120 s)'}")
 
         # Positive controls before the trigger.
         qmp.cmd("pmemsave", val=slot[0], size=slot[1], filename=keyfile)
@@ -251,14 +330,20 @@ def run(args, tmp):
         if px.count(0) == len(px): raise Infra("positive control failed: screen is black before the trigger")
         print(f"positive controls ok (sentinel {sentinel.decode()} in guest memory, key slot non-zero, screen not black)")
 
-        # Trigger.
-        t0 = time.monotonic()
-        send(["ctrl", "alt", "backspace"], hold=100)
-        ev = qmp.wait_event("SHUTDOWN", 120 + 30 * (args.mem >> 30))
         results = []
         def result(name, ok, msg=""):
-            results.append((name, ok, msg)); show = msg and (not ok or name in ("poweroff_not_reset", "wipe_report_present"))
+            results.append((name, ok, msg)); show = msg and (not ok or name in ("poweroff_not_reset", "wipe_report_present", "unplug_triggers_wipe"))
             print(f"check {name}: {'OK' if ok else 'FAIL'}" + (f" ({msg})" if show else ""))
+
+        # Trigger.
+        if trigger == "hotkey":
+            t0 = time.monotonic()
+            send(["ctrl", "alt", "backspace"], hold=100)
+            ev = qmp.wait_event("SHUTDOWN", 120 + 30 * (mem >> 30))
+        else:
+            t0 = time.monotonic()
+            qmp.cmd("device_del", id="stick0")
+            ev = qmp.wait_event("SHUTDOWN", UNPLUG_TIMEOUT)
         if ev is None:
             result("poweroff_not_reset", False, "no SHUTDOWN event (wipe did not finish)")
             host_s = None
@@ -270,7 +355,15 @@ def run(args, tmp):
                    f"SHUTDOWN reasons {reasons}, RESET events {len(resets)}")
         sert = serial_text(serial)
         _, _, reports = parse_serial(sert)
-        ok, msg, fields = check_report(reports, armed, usable, REPORT_TRIGGER[args.trigger])
+        ok, msg, fields = check_report(reports, armed, usable, REPORT_TRIGGER[trigger])
+        if trigger == "unplug":
+            deleted = any(n == "DEVICE_DELETED" and d.get("device") == "stick0" for _, n, d in qmp.events)
+            why = []
+            if watch_port is None: why.append("stick watch never armed")
+            if ev is None: why.append(f"no SHUTDOWN within {UNPLUG_TIMEOUT} s of device_del stick0")
+            if fields.get("trigger") != "unplug": why.append(f"WIPE-REPORT trigger={fields.get('trigger')!r}")
+            result("unplug_triggers_wipe", not why, "; ".join(why) if why else
+                   f"port {watch_port}, DEVICE_DELETED {'seen' if deleted else 'not seen'}, SHUTDOWN after {host_s:.3f} s")
         result("wipe_report_present", ok, msg)
 
         have_dump = False
@@ -292,16 +385,21 @@ def run(args, tmp):
                 result("usable_ram_zero_after_wipe", not bad, "; ".join(bad))
                 found = [n for n, needle in (("sentinel", sentinel), ("key prefix", key[:32])) if mm.find(needle) >= 0]
                 result("sentinel_absent_from_dump", not found, "found in dump: " + ", ".join(found))
+            os.unlink(dump)  # up to ~4.3 GB at 4G; free it before the next run
         else:
             for n in ("screen_black_after_wipe", "key_slot_zero_after_wipe", "usable_ram_zero_after_wipe", "sentinel_absent_from_dump"):
                 result(n, False, "no dump (no SHUTDOWN)")
         leaks = [n for n, needle in (("sentinel", sentinel), ("key prefix", key[:32])) if needle in sert.encode("latin-1")]
         result("serial_log_has_no_sentinel", not leaks, "in serial log: " + ", ".join(leaks))
 
+        row.update({k: fields[k] for k in REPORT_KEYS if k in fields})
+        row["host_s"] = host_s
         if fields.get("total_us"):
-            print(f"wipe duration: WIPE-REPORT total_us={fields.get('total_us')} (lower bound, up to KernelZeroed), usable_us={fields.get('usable_us')}")
+            print(f"wipe duration: WIPE-REPORT total_us={fields.get('total_us')} (lower bound, up to KernelZeroed), "
+                  f"keys_us={fields.get('keys_us')} user_us={fields.get('user_us')} usable_us={fields.get('usable_us')}")
         if host_s is not None:
-            print(f"wipe duration: host time QMP send-key -> SHUTDOWN = {host_s:.2f} s")
+            what = "send-key" if trigger == "hotkey" else "device_del stick0"
+            print(f"wipe duration: host time QMP {what} -> SHUTDOWN = {host_s:.3f} s")
         failed = [n for n, ok, _ in results if not ok]
         print("PASS" if not failed else "FAIL: " + ", ".join(failed))
         return 0 if not failed else 1

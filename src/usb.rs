@@ -578,6 +578,10 @@ pub fn arm_stick_watch() -> Result<u8, WatchError> {
         return Err(WatchError::NotSealed);
     }
     xhci::arm_stick_watch(port).map_err(WatchError::Xhci)?;
+    // Feature `wipe-test` only (COM1): scripts/qemu_wipe_test.py waits for
+    // this line before it pulls the stick (`--trigger unplug`).
+    #[cfg(feature = "wipe-test")]
+    crate::serial_println!("wipe-test: watch armed port={}", port);
     Ok(port)
 }
 

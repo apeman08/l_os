@@ -38,6 +38,9 @@ jobs:
           qemu-system-x86_64 --version | head -1
           python3 -I scripts/qemu_wipe_test.py --trigger hotkey
 
+      - name: Wipe test (unplug; QMP device_del of the boot stick, memory-dump acceptance, 256M)
+        run: python3 -I scripts/qemu_wipe_test.py --trigger unplug --mem 256M
+
       - name: USB smoke (xHCI, boot stick, USB keyboard typing into the shell via QMP send-key, keyboard unplug)
         run: python3 -I scripts/qemu_usb_smoke.py
 
