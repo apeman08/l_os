@@ -67,3 +67,8 @@ Task 23: minor (deferred): no kernel test drives StickRemoved through poll_tick 
 Task 23: complete (commits 786b776..318088c, review clean)
 Task 24: minors (deferred to Task 25 docs): soften "hotkey/unplug differences within noise" (only supported at 256M; 1G/4G single runs), mark design assertions in measurements doc as not measured, ROADMAP/spec still say "[assumed] replaced" without pointer to docs/superpowers/notes/2026-10-14-m2-wipe-measurements.md; UNPLUG_TIMEOUT comment. Measured (TCG, host time cmd->SHUTDOWN): 256M hotkey 1.20 s/unplug 1.11 s; 1G 3.14/3.94 s; 4G 6.85/7.01 s; highest usable range ends 0x140000000 zero. Default --boot usb for hotkey flow too.
 Task 24: complete (commits 318088c..f835d02, review clean)
+Task 25: complete (commit 290c68a; docs; reviewed in final whole-branch review)
+Final: Ruling: panic outside a wipe now triggers the wipe (Trigger::Panic), also degraded (no plan: screen+DMA+keys+poweroff, RAM not zeroed) — fail-closed; panic on an "amnesisch: nein" system powers off; message survives on COM1 only. Cost if wrong: panics power off instead of freezing with visible text (debuggability).
+Final: Ruling: "amnesisch: ja" requires stick_sealed && watched_port armed; test kernels for usb_storage can't arm (would really wipe) so that test expects "nein"; no end-to-end boot test shows "ja" (gap, docs claim only unit-level evidence).
+Final: Ruling: xhci::bulk/write_slot_buffer pub(crate) with bulk_for_tests under test-hooks; CI timeout raised 45->90 (ceiling, not measured).
+Final review: fix wave 959c713, scoped re-review clean. Open fix-soon: USB-hotkey wipe CI test, 5 s SHUTDOWN false-pass, identify_boot_stick overall deadline, bar64 upper-half, e2e 'ja' label test, network.rs:97 flake.
