@@ -1,6 +1,6 @@
 # M2 "Amnesisches Live-System": Design
 
-Stand: 2026-10-13. Status: Entwurf zur Freigabe. Aussagen sind mit **[assumed]** markiert, wenn nichts sie belegt. Übergeordnete Spec: `docs/superpowers/specs/2026-10-12-zukunftsplan-design.md` (Abschnitte 4, 5, 7, 8). Plan: `docs/superpowers/plans/2026-10-13-m2-amnesisch.md`.
+Stand: 2026-10-13, Nachträge aus der Umsetzung 2026-10-15 (Abschnitt 11). Status: umgesetzt (Plan-Tasks 1–25). Aussagen sind mit **[assumed]** markiert, wenn nichts sie belegt. Übergeordnete Spec: `docs/superpowers/specs/2026-10-12-zukunftsplan-design.md` (Abschnitte 4, 5, 7, 8). Plan: `docs/superpowers/plans/2026-10-13-m2-amnesisch.md`.
 
 ## 1. Ziel und Abnahme
 
@@ -63,7 +63,7 @@ Damit sind in dieser Umgebung nur die reinen Host-Teile (Plan-Tasks 3–7 und 12
 | E4 | Ereignisse des xHCI | Polling des Event-Rings im Timer-Interrupt (100 Hz), höchstens 16 Ereignisse pro Tick; während `xhci::init` pollt die Init selbst | Kein MSI/APIC nötig; PIC-Leitungen 9–11 bleiben maskiert wie heute; Erkennungslatenz ≤ 10 ms plus Abarbeitung |
 | E5 | MMIO | Eigenes Kernel-Fenster (L4-Slot 144) mit `NO_CACHE | WRITE_THROUGH | NO_EXECUTE`, nicht über das Physical-Memory-Offset-Mapping | Korrekte Caching-Attribute (M5), funktioniert auch für 64-Bit-BARs oberhalb der vom Bootloader gemappten Grenze |
 | E6 | Notfall-Hotkey | `Strg+Alt+Rücktaste` (links oder rechts, AltGr zählt als Alt), ohne Rückfrage, im Kernel erkannt (Tastatur-ISR und HID-Pfad, gemeinsamer Detektor auf Set-1-Scancodes) | Unabhängig von der Ring-3-Shell (die hängen oder kompromittiert sein kann); unwahrscheinliche Fehlbedienung; in QEMU per `sendkey ctrl-alt-backspace` testbar |
-| E7 | Wann "amnesisch: ja" | Nur wenn Boot-Stick erkannt und versiegelt, Wipe-Plan gebaut, `serial-console` aus und `test-hooks` aus. Sonst "amnesisch: nein"; Grund im Befehl `security` | Die Statusleiste behauptet nichts, was nicht gilt; ein Spiegel-Build kann nie "ja" zeigen |
+| E7 | Wann "amnesisch: ja" | Nur wenn Boot-Stick erkannt und versiegelt, Wipe-Plan gebaut, `serial-console` aus und `test-hooks` aus. Sonst "amnesisch: nein"; Grund im Befehl `security`. Nachtrag: berechnet aus `stick_sealed`, `plan_ready`, Spiegel aus (und `test-hooks` aus über `plan_ready`); die scharf geschaltete Stick-Wache ist **kein** Eingang (Abschnitt 11) | Die Statusleiste behauptet nichts, was nicht gilt; ein Spiegel-Build kann nie "ja" zeigen |
 | E8 | Stick fehlt beim Boot | Kein Halt: System läuft mit "amnesisch: nein"; Hotkey-Wipe bleibt scharf | Abweichung von Zukunftsplan §5 letzter Satz: ohne erkannten Stick existiert noch kein Nutzerzustand, und der Kernel kann "nie gesteckt" (IDE-Boot, alle Kernel-Tests) nicht von "vor der Erkennung gezogen" unterscheiden. Wird der Stick nach der Erkennung gezogen, wird gewipt |
 | E9 | Bildschirm beim Wipe | Sofort schwarz (Framebuffer mit Nullen), keine Animation | Sicherheit vor Optik; Animation ist nach M2 optional als Nachlauf denkbar, nie davor |
 | E10 | Laufzeitkontext des Wipes | Läuft im Kontext, der den Auslöser erkennt (Tastatur- oder Timer-ISR), kehrt nie zurück, nimmt keine Locks, nutzt keinen Heap | Interrupts sind dort schon aus; unterbrochener Code läuft nie weiter, also kann er keine Sperre mehr freigeben |
@@ -118,15 +118,15 @@ Nicht belegt und nicht behauptet: dass der RAM-Inhalt bitgleich zum Stick ist (d
 3. **Datenstrukturen** (alle aus `allocate_contiguous`, also unter 4 GiB und genullt): DCBAA (`MaxSlots+1` Einträge), Scratchpad-Array und -Seiten falls `MaxScratchpadBufs > 0`, Command-Ring (1 Segment, 64 TRBs inkl. Link-TRB mit Toggle-Cycle), Event-Ring (1 Segment, 64 TRBs), ERST mit einem Eintrag; `CONFIG.MaxSlotsEn`, `DCBAAP`, `CRCR` (mit RCS=1), `ERSTSZ`, `ERDP`, `ERSTBA` (in dieser Reihenfolge); `USBCMD.RS=1`. Interrupts bleiben aus (`IMAN.IE=0`, `USBCMD.INTE=0`).
 4. **Selbsttest:** No-Op-Command, Command-Completion mit Code Success erwarten.
 5. **Ports:** Für jeden Root-Port mit `CCS=1`: auf USB2-Ports Port-Reset (`PR`) und `PRC` abwarten; USB3-Ports sind nach Link-Training freigegeben. Change-Bits quittieren, ohne `PED` zu schreiben (PED ist RW1C: eine 1 schaltet den Port ab).
-6. **Enumeration je Gerät:** Enable Slot → Slot-ID; Input-Kontext (Slot: Root-Port, Speed, Route 0, Context Entries 1; EP0: Control, Max Packet nach Speed 8/8/64/512); Address Device; `GET_DESCRIPTOR(Device, 8)`, ggf. EP0-Max-Packet per Evaluate Context korrigieren, dann 18 Byte; `GET_DESCRIPTOR(Configuration)` 9 Byte, dann `wTotalLength` (max. 512 Byte); Klassifikation; `SET_CONFIGURATION`; Configure Endpoint für die benötigten Endpunkte. Kontextgröße 32 oder 64 Byte nach `HCCPARAMS1.CSZ`.
+6. **Enumeration je Gerät:** Enable Slot → Slot-ID; Input-Kontext (Slot: Root-Port, Speed, Route 0, Context Entries 1; EP0: Control, Max Packet nach Speed 8/8/64/512); Address Device; `GET_DESCRIPTOR(Device, 8)`, ggf. EP0-Max-Packet per Evaluate Context korrigieren, dann 18 Byte; `GET_DESCRIPTOR(Configuration)` 9 Byte, dann `wTotalLength` (max. 512 Byte); Klassifikation; Configure Endpoint für die benötigten Endpunkte, **danach** `SET_CONFIGURATION` (Nachtrag: umgekehrt zur ersten Fassung, weil xHCI §4.3.5 Configure Endpoint vor dem Standard-Request verlangt; Task 20). Kontextgröße 32 oder 64 Byte nach `HCCPARAMS1.CSZ`.
 7. **Klassen:**
    - *Tastatur* (Interface-Klasse 3, Subklasse 1, Protokoll 1): `SET_PROTOCOL(Boot)`, `SET_IDLE(0)`, Interrupt-IN-Endpunkt, 8 Normal-TRBs à 8 Byte vorab eingereiht. Jede Transfer-Completion: Report mit vorigem vergleichen, Änderungen als Set-1-Scancodes in `input::feed` (gleicher Weg wie PS/2, inklusive Hotkey-Detektor), TRB neu einreihen, Doorbell.
    - *Massenspeicher* (Klasse 8, Subklasse 6, Protokoll 0x50): Bulk-IN/-OUT. CBW/CSW nur für die Whitelist `TEST UNIT READY` (bis zu 5 Versuche), `READ CAPACITY(10)`, `READ(10)`; LUN 0. LBA 0 lesen, Boot-Marker prüfen. Treffer ⇒ dieses Gerät ist der Boot-Stick, sein Root-Port wird gemerkt; danach versiegeln. Kein Treffer ⇒ Gerät wird ignoriert (nie wieder angesprochen).
    - Alles andere: Slot bleibt adressiert, sonst nichts.
-8. **Scharf schalten:** ISR-Polling einschalten; danach einmal `PORTSC` des Stick-Ports lesen: `CCS=0` ⇒ Wipe (schließt das Fenster zwischen Erkennung und Polling).
+8. **Scharf schalten:** ISR-Polling einschalten; danach einmal `PORTSC` des Stick-Ports lesen: `CCS=0` ⇒ Wipe (schließt das Fenster zwischen Erkennung und Polling). Nachtrag (Task 23): ab dem Scharfschalten prüft die Stick-Wache (`watch_check`) in **jedem** Tick lockfrei (Atomics + volatiles `USBSTS`/`PORTSC`, vor `DRIVER.try_lock`), sodass ein belegter Treiber-Lock die Wache nie überspringt.
 
 ### 7.2 Laufzeit (Timer-ISR, nach EOI, vor `sched::on_tick`)
-- `USBSTS` lesen: `HCE` oder `HSE` gesetzt oder Lesewert `0xFFFF_FFFF` ⇒ Wipe mit Auslöser `ControllerLost` (fail-closed: wer den Stick nicht mehr beobachten kann, wipt).
+- `USBSTS` lesen: `HCE` oder `HSE` gesetzt oder Lesewert `0xFFFF_FFFF` ⇒ Wipe mit Auslöser `ControllerLost` (fail-closed: wer den Stick nicht mehr beobachten kann, wipt). Nachtrag (Task 23, fail-closed): auch `USBSTS.HCH` nach dem Scharfschalten ⇒ `ControllerLost` (ein angehaltener Controller meldet kein Abziehen mehr); `CSC=1` am Stick-Port ⇒ `StickRemoved` auch bei `CCS=1` (schnelles Ab- und Wiederanstecken), unabhängig von Port-Status-Change-Ereignissen (Pegel statt Flanke). Belege: Host `xhci_ctx::watch_controller_loss_wins_and_is_fail_closed`, `watch_stick_disconnect_is_stick_removed_at_first_reading`; Kernel `tests/usb_wipe_hooks.rs`.
 - Bis zu 16 Event-TRBs: Port Status Change ⇒ `PORTSC` des Ports lesen, klassifizieren; Trennung am Stick-Port ⇒ Wipe `StickRemoved`; Trennung am Tastatur-Port ⇒ Tastatur als weg markieren (kein Wipe); neue Verbindung ⇒ zählen, ignorieren. Transfer-Event der Tastatur ⇒ wie oben. Danach `ERDP` mit `EHB` schreiben.
 - Treiberzustand liegt hinter einem `spin::Mutex`, der nach dem Boot nur noch mit IF=0 genommen wird (Timer-ISR). Der Befehl `security` liest nur Atomics.
 - `input::SCANCODES` bekommt einen zweiten Produzenten (Timer-ISR). Beide Produzenten laufen mit IF=0 auf einer CPU, also nie gleichzeitig; der Doc-Kommentar der Queue wird entsprechend geändert.
@@ -214,3 +214,15 @@ Das Abnahmeskript startet QEMU mit `-action reboot=shutdown,shutdown=pause` (QEM
 | Speicher > 4 GiB | nicht genullt | Stufe 8 nach Speicherkarte, nicht nach Bitmap; manuelle Messung mit `-m 4G` |
 | TCG-Zeiten nicht übertragbar | falsche Erwartung | Messwerte immer mit Umgebung angeben; M5 misst real |
 | Umfang des xHCI | M2 zieht sich | Abbruchkriterien 7.3; Hotkey-Wipe vorher eigenständig lieferbar |
+
+## 11. Nachträge aus der Umsetzung (Task 25)
+
+Belege und Grenzen im Einzelnen: `docs/ROADMAP.md` (M2), `docs/THREAT_MODEL.md` ("Amnesic wipe"), Protokoll `docs/superpowers/notes/2026-10-14-m2-sdd-ledger.md`.
+
+- **§7.1 Schritt 6:** Configure Endpoint vor `SET_CONFIGURATION` (siehe dort; Task 20).
+- **§7.1 Schritt 8 / §7.2:** fail-closed-Erweiterungen der Stick-Wache: `USBSTS.HCH` nach dem Scharfschalten ⇒ `ControllerLost`; `CSC=1` bei `CCS=1` am Stick-Port ⇒ `StickRemoved`; `watch_check` lockfrei in jedem Tick (Task 23).
+- **E7:** "amnesisch: ja" setzt die scharf geschaltete Stick-Wache nicht voraus. Heute folgt das Scharfschalten in `src/main.rs` direkt auf das Versiegeln und kann unter QEMU nicht scheitern; scheitert es doch, zeigt die Statusleiste trotzdem "ja", obwohl nur der Hotkey wipt. Vorschlag für einen späteren Task: Eingang `armed` in `l_core::wipe::Amnesia` (oder Scheitern des Scharfschaltens ⇒ "nein").
+- **§1 Abnahme 3 / §8.6:** Messwerte in `docs/superpowers/notes/2026-10-14-m2-wipe-measurements.md` (TCG); übernommen in Zukunftsplan §5 und `docs/THREAT_MODEL.md`.
+- **§7.3:** kein Abbruchkriterium ausgelöst: OVMF bootet von `usb-storage` (Spike, Frage 2), `send-key` erreicht `usb-kbd`, Enumeration stabil.
+- **§8.2 Stufe 6:** `UserZeroed` ist für die Abbild-Prüfungen redundant zu `AllocatedZeroed` (Nutzer-Frames sind belegte Frames); ihr Zweck (Nutzerdaten zuerst) ist nicht getestet (Task 11).
+- **Wipe ohne Plan** nullt keinen RAM (nur Schlüssel-Slots, Bildschirm, DMA-Stopp, Poweroff); **Panik während des Wipes** schaltet sofort ab, RAM kann teilweise ungenullt bleiben (Task 10).

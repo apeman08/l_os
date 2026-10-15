@@ -193,7 +193,8 @@ def check_report(reports, armed, usable, want="hotkey"):
         return False, f"bytes={v['bytes']} outside [{total}, {2 * total}] (sum of usable ranges {total}): " + line, f
     return True, line, f
 
-UNPLUG_TIMEOUT = 60  # s, device_del stick0 -> SHUTDOWN (plan Task 24)
+UNPLUG_TIMEOUT = 60  # s, device_del stick0 -> SHUTDOWN (plan Task 24). Measured under TCG
+# on a 2.1 GHz Xeon: 1.1 s at 256M, 7.0 s at 4G; a much slower host or larger -m may need more.
 
 def host_env():
     """Host CPU model, QEMU version line, accelerator (for the measurements)."""

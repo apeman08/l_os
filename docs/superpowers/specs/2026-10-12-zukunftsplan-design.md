@@ -58,7 +58,9 @@ Abhängigkeiten: M1 und M2 sind voneinander unabhängig. M3 braucht die bestehen
 5. ACPI-Poweroff, ersatzweise Reset.
 6. Der Notfall-Hotkey löst denselben Ablauf aus.
 
-Die Dauer hängt von der RAM-Größe ab und ist **[assumed]** im Bereich einiger Sekunden; M2 misst sie. Ein Abziehen während des Boots führt zu Halt ohne Nutzerzustand.
+Die Dauer hängt von der RAM-Größe ab. **Gemessen in M2** (ersetzt das frühere **[assumed]** "einige Sekunden"; `docs/superpowers/notes/2026-10-14-m2-wipe-measurements.md`, `python3 -I scripts/qemu_wipe_test.py --measure 256M,1G,4G`): Host-Zeit vom QMP-Befehl bis zum QEMU-Ereignis `SHUTDOWN`, QEMU 8.2.2 unter **TCG** (kein KVM), Xeon 2,1 GHz: 256 MiB Hotkey 1,20 s / Abziehen 1,11 s; 1 GiB 3,14 s / 3,94 s; 4 GiB 6,85 s / 7,01 s. Streuung zwischen Läufen derselben Sitzung rund ±20 % (bei 256 MiB beobachtet); 1 GiB und 4 GiB sind Einzelläufe. Eine Wiederholung bei 256 MiB am 2026-10-15 (gleicher Host-Typ, gleiches QEMU) ergab 0,58 s (Hotkey) und 0,35 s (Abziehen): die Werte hängen stark von der Host-Last ab. TCG-Zahlen sind nicht auf echte Hardware übertragbar; echte Messung in M5.
+
+Abweichung (M2-Spec E8): Ein Abziehen während des Boots, bevor der Kernel den Stick erkannt und versiegelt hat, führt nicht zu Halt, sondern das System läuft mit "amnesisch: nein" weiter (nur der Hotkey-Wipe ist scharf); ein Nutzerzustand existiert zu dem Zeitpunkt noch nicht. Wird der Stick nach der Erkennung gezogen, wird gewipt. Zu Punkt 1: Das Image wird nicht vom Kernel kopiert, sondern liegt durch den Bootloader schon vollständig im RAM (M2-Spec §6). Zu Punkt 2: Der Treiber pollt den Stick-Port in jedem Timer-Tick, statt auf ein Ereignis zu warten (M2-Spec E4, §7.2).
 
 ## 6. Bedienung und Optik
 
