@@ -12,7 +12,9 @@ the wipe, waits for the QMP SHUTDOWN event and then inspects the guest: an
 ELF core from `dump-guest-memory`, a `screendump` and the serial log.
 
 Triggers: `hotkey` = Ctrl+Alt+Backspace via send-key; `unplug` = QMP
-`device_del stick0` (the boot stick leaves its root port).
+`device_del stick0` (the boot stick leaves its root port); `panic` = F12 via
+send-key, which only a `wipe-test` build turns into a kernel panic in the
+keyboard ISR (src/input.rs): the panic handler must wipe (`Trigger::Panic`).
 
 Checks (all are evaluated, every failure is listed):
   unplug_triggers_wipe       (--trigger unplug only) the stick watch was
@@ -20,6 +22,10 @@ Checks (all are evaluated, every failure is listed):
                              event came within 60 s and the WIPE-REPORT says
                              trigger=unplug (the only end-to-end proof that
                              StickRemoved fires on the real stick port)
+  panic_triggers_wipe        (--trigger panic only) the serial log has the
+                             KERNEL PANIC line of the deliberate F12 panic,
+                             a SHUTDOWN event came and the WIPE-REPORT says
+                             trigger=panic (a panic outside a wipe wipes)
   wipe_report_present        exactly one WIPE-REPORT line, trigger=<--trigger>, plan
                              ready (`wipe-test: armed` seen), total_us > 0, all
                              stage times present and non-decreasing, and
@@ -48,7 +54,7 @@ of the wipe); the host time QMP command -> SHUTDOWN event is printed too.
 `--measure 256M,1G,4G` runs both triggers at each size (one build) and prints
 a table with the host CPU, QEMU version and accelerator.
 
-Usage: python3 -I scripts/qemu_wipe_test.py --trigger hotkey|unplug
+Usage: python3 -I scripts/qemu_wipe_test.py --trigger hotkey|unplug|panic
            [--mem 256M] [--boot usb|ide] [--keep-dump]
        python3 -I scripts/qemu_wipe_test.py --measure 256M,1G,4G [--boot usb|ide]
 Exit codes: 0 all checks pass, 1 a check failed, 2 infrastructure error
@@ -174,7 +180,9 @@ def parse_serial(text):
 
 # --trigger value -> WIPE-REPORT trigger= value (l_core::wipe::Trigger::as_str;
 # "controller" = ControllerLost has no QEMU trigger here).
-REPORT_TRIGGER = {"hotkey": "hotkey", "unplug": "unplug"}
+REPORT_TRIGGER = {"hotkey": "hotkey", "unplug": "unplug", "panic": "panic"}
+PANIC_MARKER = "KERNEL PANIC: panicked at"
+PANIC_TEXT = "wipe-test: deliberate panic"  # src/input.rs, feature wipe-test
 
 def check_report(reports, armed, usable, want="hotkey"):
     """Returns (ok, message, fields)."""
@@ -209,7 +217,7 @@ def host_env():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--trigger", choices=["hotkey", "unplug"])
+    ap.add_argument("--trigger", choices=["hotkey", "unplug", "panic"])
     ap.add_argument("--mem", type=parse_size, default=parse_size("256M"))
     ap.add_argument("--boot", choices=["usb", "ide"], default="usb")
     ap.add_argument("--keep-dump", action="store_true")
@@ -333,13 +341,18 @@ def run(args, mem, trigger, tmp, row):
 
         results = []
         def result(name, ok, msg=""):
-            results.append((name, ok, msg)); show = msg and (not ok or name in ("poweroff_not_reset", "wipe_report_present", "unplug_triggers_wipe"))
+            results.append((name, ok, msg)); show = msg and (not ok or name in ("poweroff_not_reset", "wipe_report_present", "unplug_triggers_wipe", "panic_triggers_wipe"))
             print(f"check {name}: {'OK' if ok else 'FAIL'}" + (f" ({msg})" if show else ""))
 
         # Trigger.
         if trigger == "hotkey":
             t0 = time.monotonic()
             send(["ctrl", "alt", "backspace"], hold=100)
+            ev = qmp.wait_event("SHUTDOWN", 120 + 30 * (mem >> 30))
+        elif trigger == "panic":
+            if PANIC_MARKER in serial_text(serial): raise Infra("KERNEL PANIC on COM1 before the trigger")
+            t0 = time.monotonic()
+            send(["f12"])
             ev = qmp.wait_event("SHUTDOWN", 120 + 30 * (mem >> 30))
         else:
             t0 = time.monotonic()
@@ -365,6 +378,14 @@ def run(args, mem, trigger, tmp, row):
             if fields.get("trigger") != "unplug": why.append(f"WIPE-REPORT trigger={fields.get('trigger')!r}")
             result("unplug_triggers_wipe", not why, "; ".join(why) if why else
                    f"port {watch_port}, DEVICE_DELETED {'seen' if deleted else 'not seen'}, SHUTDOWN after {host_s:.3f} s")
+        if trigger == "panic":
+            why = []
+            pl = [l.strip() for l in sert.splitlines() if PANIC_MARKER in l]
+            if len(pl) != 1 or PANIC_TEXT not in sert: why.append(f"{len(pl)} KERNEL PANIC lines / deliberate-panic text {'present' if PANIC_TEXT in sert else 'missing'}")
+            if ev is None: why.append("no SHUTDOWN after the panic (panic handler halted instead of wiping)")
+            if fields.get("trigger") != "panic": why.append(f"WIPE-REPORT trigger={fields.get('trigger')!r}")
+            result("panic_triggers_wipe", not why, "; ".join(why) if why else
+                   f"{pl[0][:80]}..., SHUTDOWN after {host_s:.3f} s")
         result("wipe_report_present", ok, msg)
 
         have_dump = False
@@ -399,7 +420,7 @@ def run(args, mem, trigger, tmp, row):
             print(f"wipe duration: WIPE-REPORT total_us={fields.get('total_us')} (lower bound, up to KernelZeroed), "
                   f"keys_us={fields.get('keys_us')} user_us={fields.get('user_us')} usable_us={fields.get('usable_us')}")
         if host_s is not None:
-            what = "send-key" if trigger == "hotkey" else "device_del stick0"
+            what = "device_del stick0" if trigger == "unplug" else "send-key"
             print(f"wipe duration: host time QMP {what} -> SHUTDOWN = {host_s:.3f} s")
         failed = [n for n, ok, _ in results if not ok]
         print("PASS" if not failed else "FAIL: " + ", ".join(failed))

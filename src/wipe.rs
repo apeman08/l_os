@@ -72,6 +72,12 @@
 //! lock or a `static` outside the island. After stage 9 the IDT is zero, so
 //! any exception is a triple fault (reset) instead.
 //!
+//! **Panic outside a wipe** (fail-closed): after printing the message, the
+//! kernel's panic handler (`src/main.rs`) calls [`trigger`] with
+//! `Trigger::Panic`, full or degraded like any other trigger; a panicked
+//! kernel would otherwise halt with interrupts off, deaf to the stick watch
+//! and the hotkey. Not in `cfg(test)` / `test-hooks` builds.
+//!
 //! In `cfg(test)` and with the feature `test-hooks`, [`trigger`] only counts
 //! ([`test_hook_count`]) and returns; such builds never show "amnesisch: ja".
 
@@ -273,13 +279,15 @@ pub fn island_virt() -> (u64, usize) {
 }
 
 /// Status inputs for "amnesisch: ja/nein" (spec E7): boot stick identified
-/// and sealed ([`crate::usb::stick_sealed`]), plan armed, serial mirror off.
+/// and sealed ([`crate::usb::stick_sealed`]) **and** its removal watch armed
+/// ([`crate::xhci::watched_port`]; without the watch, pulling the stick
+/// would not wipe), plan armed, serial mirror off.
 /// A build whose [`trigger`] only counts (`test-hooks`, `cfg(test)`) reports
 /// `plan_ready = false`, so it can never show "amnesisch: ja". Lock-free
 /// (atomics only), as the `security` command requires (spec §7.2).
 pub fn amnesia() -> Amnesia {
     Amnesia {
-        stick_sealed: crate::usb::stick_sealed(),
+        stick_sealed: crate::usb::stick_sealed() && crate::xhci::watched_port().is_some(),
         plan_ready: PLAN_READY.load(Ordering::Acquire) && !HOOKED,
         serial_mirror: crate::SERIAL_MIRROR,
     }
@@ -830,8 +838,9 @@ impl StageOps for Real {
 
 /// Start the wipe (spec §8). Called from interrupt context (the hotkey in the
 /// keyboard ISR or the USB keyboard path of the timer ISR; stick removal and
-/// controller loss in the timer ISR, `xhci::poll_tick`), or once from thread
-/// context by the arming check (`xhci::arm_stick_watch`; interrupts are
+/// controller loss in the timer ISR, `xhci::poll_tick`), once from thread
+/// context by the arming check (`xhci::arm_stick_watch`), or from the
+/// kernel's panic handler (`Trigger::Panic`, any context; interrupts are
 /// disabled first thing here).
 /// Never returns. If a wipe is already running (only reachable from an
 /// exception inside the wipe), the caller is parked in `cli; hlt`.

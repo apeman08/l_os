@@ -541,8 +541,10 @@ static SIM_ALL_ONES: AtomicBool = AtomicBool::new(false);
 /// Volatile 32-bit read of a register through the lock-free mirror.
 ///
 /// # Safety
-/// `op` must be the value published in [`OP_VIRT`] and `off` one of
-/// `USBCMD`/`USBSTS` (checked inside the BAR mapping by `probe`).
+/// `op` must be the value published in [`OP_VIRT`] and `off` either one of
+/// `USBCMD`/`USBSTS` or the PORTSC offset `PORT_REGS + 0x10 * (port - 1)` of
+/// a root port `1..=MAX_PORTS` (the range `probe` checked lies inside the
+/// BAR mapping; [`portsc_unlocked`] checks the port number first).
 unsafe fn op_read(op: u64, off: u64) -> u32 {
     #[cfg(feature = "test-hooks")]
     if SIM_ALL_ONES.load(Ordering::Acquire) {
@@ -1194,8 +1196,9 @@ pub fn read_slot_buffer(slot: u8, off: usize, out: &mut [u8]) -> Result<(), Xhci
 }
 
 /// Copy `data` to offset `off` of the slot's data page (e.g. a CBW before
-/// [`bulk`] sends it).
-pub fn write_slot_buffer(slot: u8, off: usize, data: &[u8]) -> Result<(), XhciError> {
+/// [`bulk`] sends it). Crate-private, like [`bulk`]: the only caller is
+/// `usb.rs`, which writes only the read-only CBWs of `l_core::usb_msc`.
+pub(crate) fn write_slot_buffer(slot: u8, off: usize, data: &[u8]) -> Result<(), XhciError> {
     with_driver(|d| {
         let (_, dev) = d.device(slot)?;
         let end = off.checked_add(data.len()).ok_or(XhciError::BadBuffer)?;
@@ -1229,7 +1232,13 @@ pub fn write_slot_buffer(slot: u8, off: usize, data: &[u8]) -> Result<(), XhciEr
 /// is the only place that enqueues a bulk TD, so the seal here is the
 /// lowest-level guarantee that no storage device is read again, whoever
 /// the caller is.
-pub fn bulk(slot: u8, ep_address: u8, buf_phys: u64, len: usize) -> Result<usize, XhciError> {
+///
+/// Crate-private (M2 final review): outside the kernel crate (the kernel
+/// binary, other crates) nothing can issue a bulk TD; inside, only `usb.rs`
+/// calls it, with the read-only CBW constructors of `l_core::usb_msc`.
+/// Kernel tests reach it only through [`bulk_for_tests`] (feature
+/// `test-hooks`).
+pub(crate) fn bulk(slot: u8, ep_address: u8, buf_phys: u64, len: usize) -> Result<usize, XhciError> {
     if bulk_sealed() {
         return Err(XhciError::Sealed);
     }
@@ -1244,6 +1253,15 @@ pub fn bulk(slot: u8, ep_address: u8, buf_phys: u64, len: usize) -> Result<usize
         }
         d.bulk(slot, ep_address, buf_phys, len as u32)
     })
+}
+
+/// [`bulk`] for the kernel tests (`tests/usb_storage.rs`, run with
+/// `--features test-hooks`): argument checks and the seal in the driver.
+/// Never in a production build.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn bulk_for_tests(slot: u8, ep_address: u8, buf_phys: u64, len: usize) -> Result<usize, XhciError> {
+    bulk(slot, ep_address, buf_phys, len)
 }
 
 /// Refuse every later bulk transfer, for good ([`bulk`] returns

@@ -12,7 +12,7 @@ pub const STATUS_LEFT: &str = "Larp OS";
 /// Status bar, right: the system state, "amnesisch: ja" only when every
 /// condition of spec E7 holds ([`crate::wipe::amnesia`], `Amnesia::label`).
 /// Read when the chrome is turned on, i.e. after the boot stick was
-/// identified and sealed.
+/// identified, sealed and its removal watch armed (`src/main.rs`).
 pub fn status_right() -> &'static str {
     crate::wipe::amnesia().label()
 }

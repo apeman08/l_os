@@ -7,7 +7,15 @@ on:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Raised from 45 (M2 final review): besides `cargo test` (~35 QEMU
+    # boots) the job now boots QEMU for the shell smoke, three wipe
+    # acceptance runs (each with up to two full guest-memory dumps), the USB
+    # smoke, two test-hooks kernel tests and the network tests. Most steps
+    # have their own internal timeouts of minutes each (e.g. the wipe test
+    # waits up to 180 s for boot and 120 s for SHUTDOWN); their sum can
+    # exceed 45 minutes on a slow runner. 90 is a safe ceiling, not a
+    # measured runtime.
+    timeout-minutes: 90
     env:
       # Path of the firmware from the Ubuntu `ovmf` package (the cargo runner
       # l_os_run also tries the usual paths when this is unset).
@@ -41,11 +49,14 @@ jobs:
       - name: Wipe test (unplug; QMP device_del of the boot stick, memory-dump acceptance, 256M)
         run: python3 -I scripts/qemu_wipe_test.py --trigger unplug --mem 256M
 
+      - name: Wipe test (panic; a kernel panic outside a wipe must wipe, memory-dump acceptance)
+        run: python3 -I scripts/qemu_wipe_test.py --trigger panic
+
       - name: USB smoke (xHCI, boot stick, USB keyboard typing into the shell via QMP send-key, keyboard unplug)
         run: python3 -I scripts/qemu_usb_smoke.py
 
-      - name: USB wipe triggers (stick watch and controller loss; test-hooks build counts instead of wiping)
-        run: cargo test --features test-hooks --test usb_wipe_hooks
+      - name: USB wipe triggers and raw bulk seal (stick watch, controller loss, xhci::bulk_for_tests; test-hooks build counts instead of wiping)
+        run: cargo test --features test-hooks --test usb_wipe_hooks --test usb_storage
 
       - name: Network and TLS tests (host test servers, QEMU packet capture)
         run: scripts/net_tests.sh

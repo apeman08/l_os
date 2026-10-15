@@ -510,8 +510,9 @@ pub fn stick_block_len() -> Option<u32> {
     STORAGE.lock().stick.map(|m| m.block_len)
 }
 
-/// The boot stick was identified and the storage path is sealed (spec E7's
-/// first condition). Lock-free.
+/// The boot stick was identified and the storage path is sealed. Lock-free.
+/// Spec E7's first condition additionally needs the removal watch armed
+/// ([`xhci::watched_port`]; combined in `wipe::amnesia`).
 pub fn stick_sealed() -> bool {
     SEALED.load(Ordering::Acquire) && STICK_PORT.load(Ordering::Acquire) != 0
 }

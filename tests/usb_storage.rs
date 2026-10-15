@@ -3,9 +3,16 @@
 //! runner attaches `qemu-xhci` + `usb-storage` (this very image, read-only)
 //! + `usb-kbd` to every `usb_*` test.
 //!
-//! Tests run in name order; the `a_` tests run before anything is sealed,
-//! the `z_` test (controller restart) last; the others are independent of
-//! the order (identify is idempotent).
+//! Order coupling: the custom test harness runs the `#[test_case]`s sorted
+//! by name, all in one boot. The `a_` tests rely on running before anything
+//! is sealed, the `z_` test (controller restart) on running last; renaming
+//! a test can break that. The others are independent of the order
+//! (identify is idempotent).
+//!
+//! The raw-driver checks (`xhci::bulk_for_tests`: argument checks, the seal
+//! inside `xhci::bulk`) exist only with `--features test-hooks`
+//! (`xhci::bulk` is crate-private): CI runs this file a second time as
+//! `cargo test --features test-hooks --test usb_storage`.
 #![no_std]
 #![no_main]
 #![feature(custom_test_frameworks)]
@@ -61,20 +68,34 @@ fn a_storage_read_before_seal_reads_lba0() {
     serial_println!("\n  stick port {}, reads {}, bulk TDs {}", port, usb::stick_reads(), xhci::bulk_transfers());
 }
 
+/// "amnesisch: ja" needs the stick identified, sealed **and** watched. This
+/// kernel never arms the stick watch: without `test-hooks` its
+/// `wipe::trigger` is the real wipe, and `z_restart_after_seal_skips_storage`
+/// halts the controller, which an armed watch would answer with a real
+/// wipe of the test kernel (ControllerLost). So the label here is "nein"
+/// ("kein Boot-Stick"); the remaining inputs (plan, mirror) are checked by
+/// flipping only the stick input, which yields "ja" in a build without
+/// mirror and without `test-hooks`. The armed case itself:
+/// `tests/usb_wipe_hooks.rs` (`stick_sealed` turns true on arming) and the
+/// `wipe-test` build, which arms and shows "amnesisch: ja".
 #[test_case]
 fn amnesia_label_reflects_stick_and_mirror() {
     usb::identify_boot_stick().expect("boot stick");
     usb::storage_seal();
+    assert!(usb::stick_sealed());
+    assert_eq!(xhci::watched_port(), None, "this kernel never arms the watch");
     let a = wipe::amnesia();
-    assert!(a.stick_sealed);
-    assert!(a.plan_ready, "wipe plan armed by init_memory");
+    assert!(!a.stick_sealed, "sealed but unwatched stick is not an amnesia input");
+    assert_eq!(a.plan_ready, !cfg!(feature = "test-hooks"), "plan armed by init_memory; test-hooks reports not ready");
     assert_eq!(a.serial_mirror, l_os::SERIAL_MIRROR);
-    let want = if l_os::SERIAL_MIRROR { "amnesisch: nein" } else { "amnesisch: ja" };
-    assert_eq!(a.label(), want);
-    assert_eq!(l_os::aurora::status_right(), want);
+    assert_eq!(a.label(), "amnesisch: nein");
+    assert_eq!(l_os::aurora::status_right(), "amnesisch: nein");
     if !l_os::SERIAL_MIRROR {
-        assert_eq!(a.reason(), "");
+        assert_eq!(a.reason(), "kein Boot-Stick");
     }
+    let watched = l_core::wipe::Amnesia { stick_sealed: true, ..a };
+    let want = if l_os::SERIAL_MIRROR || cfg!(feature = "test-hooks") { "amnesisch: nein" } else { "amnesisch: ja" };
+    assert_eq!(watched.label(), want);
 }
 
 #[test_case]
@@ -102,6 +123,7 @@ fn identify_rejects_foreign_markers() {
     assert_eq!(usb::match_boot_marker(&sector, None), Err(StickError::NoBootId));
 }
 
+#[cfg(feature = "test-hooks")]
 #[test_case]
 fn a_bulk_rejects_bad_arguments() {
     let s = usb::enumerate();
@@ -109,20 +131,20 @@ fn a_bulk_rejects_bad_arguments() {
     for d in s.devices() {
         let buf = xhci::slot_buffer(d.slot).expect("slot buffer");
         // EP0 / unconfigured endpoint addresses are no bulk endpoints.
-        assert_eq!(xhci::bulk(d.slot, 0x00, buf, 8), Err(xhci::XhciError::BadEndpoint));
-        assert_eq!(xhci::bulk(d.slot, 0x8f, buf, 8), Err(xhci::XhciError::BadEndpoint));
+        assert_eq!(xhci::bulk_for_tests(d.slot, 0x00, buf, 8), Err(xhci::XhciError::BadEndpoint));
+        assert_eq!(xhci::bulk_for_tests(d.slot, 0x8f, buf, 8), Err(xhci::XhciError::BadEndpoint));
         if let DeviceKind::BulkOnlyStorage { ep_in, .. } = d.kind {
             // Outside the slot's data page, empty, too long.
-            assert_eq!(xhci::bulk(d.slot, ep_in.address, buf + 4096, 8), Err(xhci::XhciError::BadBuffer));
-            assert_eq!(xhci::bulk(d.slot, ep_in.address, buf, 0), Err(xhci::XhciError::BadBuffer));
-            assert_eq!(xhci::bulk(d.slot, ep_in.address, buf + 8, 4096), Err(xhci::XhciError::BadBuffer));
+            assert_eq!(xhci::bulk_for_tests(d.slot, ep_in.address, buf + 4096, 8), Err(xhci::XhciError::BadBuffer));
+            assert_eq!(xhci::bulk_for_tests(d.slot, ep_in.address, buf, 0), Err(xhci::XhciError::BadBuffer));
+            assert_eq!(xhci::bulk_for_tests(d.slot, ep_in.address, buf + 8, 4096), Err(xhci::XhciError::BadBuffer));
         }
         if let DeviceKind::BootKeyboard { ep_in, .. } = d.kind {
             // An interrupt endpoint is not a bulk endpoint.
-            assert_eq!(xhci::bulk(d.slot, ep_in.address, buf, 8), Err(xhci::XhciError::BadEndpoint));
+            assert_eq!(xhci::bulk_for_tests(d.slot, ep_in.address, buf, 8), Err(xhci::XhciError::BadEndpoint));
         }
     }
-    assert_eq!(xhci::bulk(0, 0x81, 0, 8), Err(xhci::XhciError::BadSlot));
+    assert_eq!(xhci::bulk_for_tests(0, 0x81, 0, 8), Err(xhci::XhciError::BadSlot));
     assert_eq!(xhci::bulk_transfers(), tds, "nothing was enqueued");
 }
 
@@ -140,14 +162,19 @@ fn reads_refused_after_seal() {
     usb::storage_seal(); // idempotent
     assert_eq!(usb::identify_boot_stick(), Ok(usb::stick_port().unwrap()), "cached, no traffic");
     // The seal is enforced in the xHCI driver itself: a direct bulk call on
-    // the stick's endpoints (bypassing usb::storage_read) is refused.
-    let s = usb::enumerate();
-    let stick = s.devices().iter().find(|d| Some(d.port) == usb::stick_port()).expect("stick in summary");
-    let DeviceKind::BulkOnlyStorage { ep_in, ep_out, .. } = stick.kind else { panic!("stick kind {:?}", stick.kind) };
-    let buf = xhci::slot_buffer(stick.slot).expect("slot buffer");
-    assert_eq!(xhci::bulk(stick.slot, ep_out.address, buf, 31), Err(xhci::XhciError::Sealed));
-    assert_eq!(xhci::bulk(stick.slot, ep_in.address, buf, 512), Err(xhci::XhciError::Sealed));
-    assert_eq!(xhci::bulk(stick.slot, ep_in.address, buf, 13), Err(xhci::XhciError::Sealed));
+    // the stick's endpoints (bypassing usb::storage_read) is refused. Only
+    // with test-hooks: `xhci::bulk` is crate-private.
+    #[cfg(feature = "test-hooks")]
+    {
+        let s = usb::enumerate();
+        let stick = s.devices().iter().find(|d| Some(d.port) == usb::stick_port()).expect("stick in summary");
+        let DeviceKind::BulkOnlyStorage { ep_in, ep_out, .. } = stick.kind else { panic!("stick kind {:?}", stick.kind) };
+        let buf = xhci::slot_buffer(stick.slot).expect("slot buffer");
+        assert_eq!(xhci::bulk_for_tests(stick.slot, ep_out.address, buf, 31), Err(xhci::XhciError::Sealed));
+        assert_eq!(xhci::bulk_for_tests(stick.slot, ep_in.address, buf, 512), Err(xhci::XhciError::Sealed));
+        assert_eq!(xhci::bulk_for_tests(stick.slot, ep_in.address, buf, 13), Err(xhci::XhciError::Sealed));
+    }
+    assert!(xhci::bulk_sealed(), "driver-level seal set by storage_seal");
     assert_eq!(usb::stick_reads(), reads, "no read after the seal");
     assert_eq!(xhci::bulk_transfers(), tds, "no bulk TD after the seal");
     assert!(sector.iter().all(|&b| b == 0), "nothing copied");
@@ -185,5 +212,6 @@ fn z_restart_after_seal_skips_storage() {
     assert_eq!(after.devices().len(), before.devices().len() - 1);
     assert_eq!((usb::stick_reads(), xhci::bulk_transfers()), (reads, tds));
     assert!(usb::stick_sealed(), "still identified and sealed after the restart");
-    assert!(wipe::amnesia().stick_sealed);
+    // Never watched in this kernel (see amnesia_label_reflects_stick_and_mirror).
+    assert!(!wipe::amnesia().stick_sealed);
 }

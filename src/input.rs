@@ -93,6 +93,14 @@ pub fn feed(byte: u8) {
     let mut detector = HotkeyDetector::from_bits(HOTKEY.load(Ordering::Relaxed));
     let hit = detector.feed(byte);
     HOTKEY.store(detector.to_bits(), Ordering::Relaxed);
+    // Feature `wipe-test` only: F12 (set-1 make code 0x58) panics right
+    // here, in interrupt context with IF=0, so that
+    // `scripts/qemu_wipe_test.py --trigger panic` can check that a kernel
+    // panic outside a wipe wipes (`Trigger::Panic`, src/main.rs).
+    #[cfg(feature = "wipe-test")]
+    if byte == 0x58 {
+        panic!("wipe-test: deliberate panic (F12 in the keyboard path)");
+    }
     if hit {
         crate::wipe::trigger(Trigger::Hotkey);
     }

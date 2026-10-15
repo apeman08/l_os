@@ -2,6 +2,8 @@
 
 Stand: Phase 0–4 umgesetzt (Abweichungen und Lücken in der Tabelle unten); Phase 5–6 offen (siehe „Status“ unten); Rest offen. Grundlage ist `docs/ROADMAP.md`; dieser Plan macht daraus abarbeitbare Aufgaben.
 
+> Hinweis 2026-10-15: Dieser Plan (Phasen 0–6) ist älter als die Meilensteine M1–M6 des Zukunftsplans. Inzwischen sind M1 (Aurora-Oberfläche) und M2 (amnesisches Live-System: Boot vom USB-Stick, RAM-Wipe beim Abziehen, per Hotkey, bei Controller-Verlust und bei Kernel-Panik) fertig; den aktuellen Stand und die nächsten Schritte (M3 Tor, M4 Browser, M5 echte Hardware, M6 Härtung) führt `docs/ROADMAP.md`. Wo dieser Plan und die ROADMAP sich widersprechen, gilt die ROADMAP.
+
 > Hinweis 2026-10-13: Die Phase-0-Zeilen 0.1 und 0.3 nennen `bootimage` und `vga_buffer`; das ist historisch. Seit M1 bootet l_os per UEFI (Cargo-Runner `l_os_run` in `tools/image`; bis 2026-10-13 `scripts/qemu_runner.sh`) und nutzt die Framebuffer-Konsole `src/fb_console.rs` (siehe `docs/ROADMAP.md`).
 
 ## Leitregeln für jede Aufgabe
@@ -72,7 +74,7 @@ Risiko: Größter Unsicherheitsfaktor des Projekts. Falls `rustls` ohne `std` ni
 |---|---|---|
 | 5.1 | `Secret<T>`-Typ: Zeroisierung per `zeroize` (geprüfte Crate), kein `Clone`/`Debug`, kurzer Gültigkeitsbereich | Host-Test: Puffer ist nach Drop null; Test auf Fehlerpfade |
 | 5.2 | Speicher-Design-Dokument **vor** Code: Passwort, KDF (Argon2id), AEAD, Metadatenformat, Korruptionsverhalten, Einwilligung | Review des Dokuments |
-| 5.3 | Blockgerät-Treiber (virtio-blk) mit Gerätecapability, standardmäßig nicht gemountet | Test: ohne explizite Aktivierung wird nie geschrieben (Schreibzähler = 0) |
+| 5.3 | Blockgerät-Treiber (virtio-blk) mit Gerätecapability, standardmäßig nicht gemountet. **Hinweis (M2):** steht im Konflikt mit dem amnesischen RAM-only-Betrieb (M2: kein Schreibpfad, Speicherpfad nach dem Boot versiegelt); nur als ausdrücklich eingeschaltete, getrennte Option nach eigenem Spec (ROADMAP, Zukunftsplan), nie im amnesischen Standard-Image | Test: ohne explizite Aktivierung wird nie geschrieben (Schreibzähler = 0) |
 | 5.4 | Verschlüsseltes Volume, nur nach ausdrücklicher Nutzerzustimmung | Tests: falsches Passwort, manipulierte Blöcke, abgebrochener Schreibvorgang |
 
 ## Phase 6 – Textbrowser (erst wenn Phase 3 und 4 laufen)

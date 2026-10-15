@@ -10,7 +10,10 @@ default = []
 # default: a production image must not leak console text. `cargo run-serial`.
 serial-console = []
 # Only for scripts/qemu_wipe_test.py: fills key slot 0, prints the physical
-# ranges and the WIPE-REPORT line on COM1. Never together with test-hooks.
+# ranges (key slot, every Usable region) and the WIPE-REPORT line on COM1,
+# and makes F12 panic in the keyboard path (`--trigger panic`). Test-only by
+# design: it leaks the memory layout to COM1, yet shows "amnesisch: ja" (no
+# console mirror, real wipe), so never ship it. Never together with test-hooks.
 wipe-test = []
 # Only for tests that must not wipe the test kernel: wipe::trigger counts
 # instead of wiping; such a build never shows "amnesisch: ja". Never default.

@@ -15,6 +15,18 @@ fn panic(info: &PanicInfo) -> ! {
     l_os::serial::emergency_print(format_args!("KERNEL PANIC: {}\n", info));
     // Screen only (never blocks), so COM1 gets the message exactly once.
     l_os::fb_console::emergency_print_screen(format_args!("\nKERNEL PANIC: {}\n", info));
+    // Fail-closed (M2 final review): a panicked kernel halts with interrupts
+    // off, so neither the stick watch (timer ISR) nor the hotkey (keyboard
+    // ISR) could wipe any more while RAM still holds everything. So a panic
+    // outside a wipe starts the wipe itself: full with an armed plan,
+    // degraded (screen, DMA stop, key slots, power off; RAM not zeroed)
+    // without one, exactly like any other trigger. `trigger` is lock-free
+    // and never returns. The message above survives only on COM1 (the
+    // wipe blanks the screen). A `test-hooks` build only counts triggers,
+    // so it keeps halting here; `cfg(test)` uses the handler below.
+    #[cfg(not(feature = "test-hooks"))]
+    l_os::wipe::trigger(l_core::wipe::Trigger::Panic);
+    #[cfg(feature = "test-hooks")]
     l_os::hlt_loop();
 }
 

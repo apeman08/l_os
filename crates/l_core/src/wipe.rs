@@ -11,11 +11,15 @@ pub enum Trigger {
     /// The xHCI controller is gone, failed or stopped while the stick is
     /// watched (spec §7.2, fail-closed; `trigger=controller`).
     ControllerLost,
+    /// A kernel panic outside a wipe (fail-closed, M2 final review: a
+    /// panicked kernel runs with interrupts off, so neither the stick watch
+    /// nor the hotkey could fire any more; `trigger=panic`).
+    Panic,
 }
 
 impl Trigger {
     /// Every kind, in `repr(u8)` order.
-    pub const ALL: [Trigger; 3] = [Trigger::StickRemoved, Trigger::Hotkey, Trigger::ControllerLost];
+    pub const ALL: [Trigger; 4] = [Trigger::StickRemoved, Trigger::Hotkey, Trigger::ControllerLost, Trigger::Panic];
 
     /// Inverse of `t as u8`; `None` for any other value.
     pub fn from_u8(v: u8) -> Option<Trigger> {
@@ -28,6 +32,7 @@ impl Trigger {
             Trigger::StickRemoved => "unplug",
             Trigger::Hotkey => "hotkey",
             Trigger::ControllerLost => "controller",
+            Trigger::Panic => "panic",
         }
     }
 }
@@ -130,6 +135,11 @@ impl Default for WipeState {
 /// Preconditions for the "amnesisch" status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Amnesia {
+    /// The boot stick is identified, the storage path sealed **and** the
+    /// stick watch armed (the kernel fills it from `usb::stick_sealed()`
+    /// and `xhci::watched_port()`; M2 final review). A sealed stick whose
+    /// watch is not armed counts as "kein Boot-Stick": pulling it would not
+    /// wipe.
     pub stick_sealed: bool,
     pub plan_ready: bool,
     pub serial_mirror: bool,
@@ -215,6 +225,7 @@ mod tests {
         assert_eq!(Trigger::StickRemoved.as_str(), "unplug");
         assert_eq!(Trigger::Hotkey.as_str(), "hotkey");
         assert_eq!(Trigger::ControllerLost.as_str(), "controller");
+        assert_eq!(Trigger::Panic.as_str(), "panic");
     }
 
     /// Task 23: the WIPE-REPORT `trigger=` value is one `\w+` token per
@@ -230,14 +241,22 @@ mod tests {
             }
             assert_eq!(Trigger::from_u8(*t as u8), Some(*t));
         }
-        assert_eq!(Trigger::ALL.len(), 3);
-        assert_eq!(Trigger::from_u8(3), None);
+        assert_eq!(Trigger::ALL.len(), 4);
+        assert_eq!(Trigger::from_u8(3), Some(Trigger::Panic));
+        assert_eq!(Trigger::from_u8(4), None);
         assert_eq!(Trigger::from_u8(255), None);
         let mut w = WipeState::new();
         assert!(w.trigger(Trigger::ControllerLost));
         assert!(!w.trigger(Trigger::StickRemoved));
         assert!(!w.trigger(Trigger::Hotkey));
         assert_eq!(w.trigger_kind(), Some(Trigger::ControllerLost));
+        // A panic after another trigger does not replace it (the kernel's
+        // panic handler only reaches `trigger` outside a running wipe).
+        assert!(!w.trigger(Trigger::Panic));
+        let mut p = WipeState::new();
+        assert!(p.trigger(Trigger::Panic));
+        assert!(!p.trigger(Trigger::Hotkey));
+        assert_eq!(p.trigger_kind(), Some(Trigger::Panic));
     }
 
     #[test]

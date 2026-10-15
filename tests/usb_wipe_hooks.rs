@@ -5,7 +5,8 @@
 //! keyboard). Built only with feature `test-hooks`: `wipe::trigger` counts
 //! ([`wipe::test_hook_count`]) instead of wiping the test kernel.
 //!
-//! The test cases share one boot and the harness runs them sorted by name:
+//! Order coupling: the test cases share one boot and the custom harness
+//! runs them sorted by name (renaming a case can break the coupling below):
 //! `arming_required_before_any_trigger` sorts first and checks the state
 //! before [`usb::arm_stick_watch`] (it fails if it ever runs later); every
 //! other case arms itself (idempotent) and checks the hook count as a delta
@@ -111,6 +112,9 @@ fn disconnect_classification_from_live_portsc() {
 #[test_case]
 fn arming_required_before_any_trigger() {
     assert_eq!(xhci::watched_port(), None, "runs first (sorted by name), before any arming");
+    // Sealed but not yet watched: no "stick" input for "amnesisch: ja".
+    assert!(usb::stick_sealed());
+    assert!(!wipe::amnesia().stick_sealed, "unwatched stick is not an amnesia input");
     let before = wipe::test_hook_count();
     xhci::simulate_read_all_ones(true);
     assert_eq!(xhci::usbsts(), Some(0xFFFF_FFFF), "simulation reaches the lock-free reads");
@@ -129,6 +133,12 @@ fn stick_present_level_poll_does_not_trigger() {
     let port = stick_port();
     let before = armed();
     assert_eq!(xhci::watched_port(), Some(port));
+    // Armed: the stick input of "amnesisch: ja" holds (the label stays
+    // "nein" here only because a test-hooks build reports plan_ready=false).
+    let a = wipe::amnesia();
+    assert!(a.stick_sealed, "sealed and watched stick");
+    assert!(!a.plan_ready);
+    assert_eq!(a.label(), "amnesisch: nein");
     assert_eq!(usb::arm_stick_watch(), Ok(port), "idempotent");
     assert_eq!(xhci::arm_stick_watch(port), Ok(()));
     let other = if port == 1 { 2 } else { 1 };
